@@ -123,8 +123,11 @@ After install:
 
 ```bash
 sudo systemctl enable --now seatd.service
+sudo usermod -aG <username>
 sudo systemctl disable getty@tty1.service
 sudo systemctl enable velogin.service
+sudo reboot (You have to do this or it will NOT work and you cant login)
+
 ```
 
 ### From source
