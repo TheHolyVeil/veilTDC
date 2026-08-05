@@ -69,7 +69,24 @@ veil/
 
 ## Install
 
-### From a release (recommended)
+### Abyss — Login Manager
+
+**Abyss** (package: `velogin`) is a graphical TTY login manager for the Void ecosystem. 
+Runs on bare metal with DRM/KMS, handles PAM auth, session selection, and avatars — perfect for booting straight into Veil on a fresh system.
+
+**→ See [`veil-login/README.md`](./veil-login/README.md) for full docs.**
+
+Quick install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/viewerofall/veil/main/veil-login/dist/install.sh | sudo bash
+```
+
+---
+
+### Veil Compositor
+
+Install the main compositor:
 
 ```bash
 curl -fsSL https://viewerofall.pages.dev/install/veil/install.sh | bash
