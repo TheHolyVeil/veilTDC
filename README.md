@@ -79,7 +79,7 @@ Runs on bare metal with DRM/KMS, handles PAM auth, session selection, and avatar
 Quick install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/viewerofall/veil/main/veil-login/dist/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/TheHolyVeil/veilTDC/refs/heads/main/veil-login/dist/install.sh | sudo bash
 ```
 
 ---
@@ -89,13 +89,13 @@ curl -fsSL https://raw.githubusercontent.com/viewerofall/veil/main/veil-login/di
 Install the main compositor:
 
 ```bash
-curl -fsSL https://viewerofall.pages.dev/install/veil/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TheHolyVeil/veilTDC/refs/heads/main/install.sh | bash
 ```
 
 or with wget:
 
 ```bash
-wget -qO- https://viewerofall.pages.dev/install/veil/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/TheHolyVeil/veilTDC/refs/heads/main/install.sh | bash
 ```
 
 Installs to `/usr/local/bin/veil-host` (uses `sudo` if needed). Supports `x86_64` and `aarch64`.
