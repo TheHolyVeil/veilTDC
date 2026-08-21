@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-const STATE_DIR: &str = "/var/lib/abyss";
+const STATE_DIR: &str = "/var/lib/velogin";
+const LEGACY_STATE_DIR: &str = "/var/lib/abyss";
 
 /// AccountsService avatar convention — populated by every mainstream DE's
 /// user-settings panel, so we get avatars for free.
@@ -18,10 +19,17 @@ pub fn avatar_path(username: &str) -> Option<PathBuf> {
 /// Optional background image. First hit wins.
 pub fn wallpaper_path() -> Option<PathBuf> {
     // decoded by content, so the extension is just a courtesy
-    ["/etc/abyss/background.png", "/etc/abyss/background.jpg", "/etc/abyss/background"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
+    [
+        "/etc/velogin/background.png",
+        "/etc/velogin/background.jpg",
+        "/etc/velogin/background",
+        "/etc/abyss/background.png",
+        "/etc/abyss/background.jpg",
+        "/etc/abyss/background",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|p| p.is_file())
 }
 
 pub fn last_user() -> Option<String> {
@@ -42,7 +50,11 @@ pub fn save_last_session(name: &str) {
 }
 
 fn read_state(file: &str) -> Option<String> {
-    let s = std::fs::read_to_string(format!("{STATE_DIR}/{file}")).ok()?;
+    let path = format!("{STATE_DIR}/{file}");
+    let legacy_path = format!("{LEGACY_STATE_DIR}/{file}");
+    let s = std::fs::read_to_string(&path)
+        .or_else(|_| std::fs::read_to_string(&legacy_path))
+        .ok()?;
     let s = s.trim().to_string();
     (!s.is_empty()).then_some(s)
 }

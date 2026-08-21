@@ -28,6 +28,9 @@ pub struct TerminalOutput {
     rows: u16,
     gpu: Option<GpuEncoder>,
     stable_luma: Vec<u8>,
+    /// Pre-allocated render scratch buffer reused across frames to avoid
+    /// per-frame heap allocation in the hot render path.
+    render_buf: String,
 }
 
 impl TerminalOutput {
@@ -62,6 +65,10 @@ impl TerminalOutput {
 
         let (pw, ph) = Self::term_pixel_size().unwrap_or((cols as u32 * 8, rows as u32 * 16));
 
+        // Pre-allocate render buffer: halfblock emits ~40 bytes/cell on average
+        // (ANSI color codes + ▀ UTF-8); reserve generously to avoid reallocs.
+        let render_cap = cols as usize * rows as usize * 48;
+
         Ok(Self {
             stdout,
             mode,
@@ -71,6 +78,7 @@ impl TerminalOutput {
             rows,
             gpu,
             stable_luma: Vec::new(),
+            render_buf: String::with_capacity(render_cap),
         })
     }
 
@@ -106,13 +114,17 @@ impl TerminalOutput {
         TerminalMode::Ascii
     }
 
-    fn render_output(&mut self, rgba: &[u8]) -> String {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        self.cols = cols;
-        self.rows = rows;
+    /// Renders directly into `self.render_buf`. No return value — the caller
+    /// reads `self.render_buf` afterward. This avoids the `.to_vec()` clone
+    /// that previously threw away the whole point of the reusable buffer.
+    fn render_output(&mut self, rgba: &[u8]) {
+        let cols = self.cols;
+        let rows = self.rows;
         let usable_rows = rows.saturating_sub(1);
 
-        let mut out = String::new();
+        // Reuse the pre-allocated scratch buffer — clear without freeing.
+        self.render_buf.clear();
+        let out = &mut self.render_buf;
         let _ = write!(out, "\x1b[H");
 
         match self.mode {
@@ -125,7 +137,7 @@ impl TerminalOutput {
                 } else {
                     rgba_to_halfblocks(rgba, self.width, self.height, cols, usable_rows)
                 };
-                Self::emit_halfblocks(&mut out, &cells, cols, usable_rows);
+                Self::emit_halfblocks(out, &cells, cols, usable_rows);
             }
             TerminalMode::Ascii => {
                 let luma = if let Some(ref g) = self.gpu {
@@ -134,7 +146,7 @@ impl TerminalOutput {
                     compute_luma(rgba, self.width, self.height, cols, usable_rows)
                 };
                 let chars = luma_to_chars(&luma, cols, usable_rows);
-                Self::emit_chars_vec(&mut out, &chars, cols, usable_rows);
+                Self::emit_chars_vec(out, &chars, cols, usable_rows);
             }
             TerminalMode::AsciiEdge => {
                 let luma = if let Some(ref g) = self.gpu {
@@ -147,11 +159,9 @@ impl TerminalOutput {
                 }
                 apply_hysteresis(&mut self.stable_luma, &luma, 10);
                 let chars = luma_to_chars(&self.stable_luma, cols, usable_rows);
-                Self::emit_chars_vec(&mut out, &chars, cols, usable_rows);
+                Self::emit_chars_vec(out, &chars, cols, usable_rows);
             }
         }
-
-        out
     }
 
     fn emit_halfblocks(out: &mut String, cells: &[veil_render::ColorCell], cols: u16, rows: u16) {
@@ -177,16 +187,22 @@ impl TerminalOutput {
     }
 
     fn emit_chars_vec(out: &mut String, chars: &[char], cols: u16, rows: u16) {
+        // Encode chars into UTF-8 in batch — avoids thousands of individual
+        // format! calls and write! dispatches, each of which carries overhead
+        // for the fmt machinery. One encode_utf8 per char, one push_str per row.
+        let mut row_buf = String::with_capacity(cols as usize * 4);
         for row in 0..rows as usize {
             if row > 0 {
-                let _ = write!(out, "\r\n");
+                out.push_str("\r\n");
             }
+            row_buf.clear();
             for col in 0..cols as usize {
                 let idx = row * cols as usize + col;
                 if idx < chars.len() {
-                    let _ = write!(out, "{}", chars[idx]);
+                    row_buf.push(chars[idx]);
                 }
             }
+            out.push_str(&row_buf);
         }
     }
 }
@@ -196,8 +212,10 @@ impl OutputBackend for TerminalOutput {
         self.width = width;
         self.height = height;
 
-        let out = self.render_output(rgba);
-        self.stdout.write_all(out.as_bytes())?;
+        // render_output fills self.render_buf in place — no allocation here.
+        self.render_output(rgba);
+        // Single write_all for the entire frame — avoids many small write syscalls.
+        self.stdout.write_all(self.render_buf.as_bytes())?;
         self.stdout.flush()?;
 
         Ok(())
@@ -210,6 +228,16 @@ impl OutputBackend for TerminalOutput {
     fn on_vt_switch(&mut self, _switch_in: bool) -> io::Result<()> {
         // No-op for terminal output
         Ok(())
+    }
+
+    fn on_resize(&mut self, cols: u16, rows: u16) {
+        self.cols = cols;
+        self.rows = rows;
+        // Re-size the render scratch buffer to match the new terminal size.
+        let needed = cols as usize * rows as usize * 48;
+        if self.render_buf.capacity() < needed {
+            self.render_buf.reserve(needed - self.render_buf.capacity());
+        }
     }
 }
 

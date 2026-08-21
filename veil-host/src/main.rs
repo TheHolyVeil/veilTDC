@@ -283,6 +283,10 @@ fn main() -> std::io::Result<()> {
     let mut fps_frame_count = 0u32;
     let mut fps_last        = std::time::Instant::now();
 
+    // Track last-known terminal size so we can notify the output backend on change.
+    let mut last_term_cols = init_cols;
+    let mut last_term_rows = init_rows;
+
     while running.load(Ordering::Relaxed) {
         let mut frame = match host.frames().recv_timeout(Duration::from_millis(200)) {
             Ok(f) => f,
@@ -292,7 +296,17 @@ fn main() -> std::io::Result<()> {
         // Drain the channel — skip to latest frame if compositor is ahead.
         while let Ok(f) = host.frames().try_recv() { frame = f; }
 
-        // Render via output backend
+        // Propagate terminal resize to the output backend so it can update
+        // its cached cols/rows without a syscall on every rendered frame.
+        let cur_cols = geom.cols.load(Ordering::Relaxed);
+        let cur_rows = geom.rows.load(Ordering::Relaxed);
+        if cur_cols != last_term_cols || cur_rows != last_term_rows {
+            last_term_cols = cur_cols;
+            last_term_rows = cur_rows;
+            output.on_resize(cur_cols, cur_rows);
+        }
+
+        // Render via output backend (Arc<Vec<u8>> derefs to &[u8])
         output.render_frame(&frame.rgba, frame.width, frame.height)?;
 
         // FPS stats logging every second
@@ -339,7 +353,7 @@ fn attach(socket: &str, argv: &[String]) -> std::io::Result<()> {
 
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    cmd.env("WAYLAND_DISPLAY", socket);
+    veil_host::server::apply_wayland_env(&mut cmd, socket);
     // Detach into a new session: no controlling TTY, so closing this shell
     // won't SIGHUP the client. It's reparented to init and belongs to veil now.
     unsafe {

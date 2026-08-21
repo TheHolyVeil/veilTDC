@@ -82,15 +82,27 @@ impl InputBackend for EvdevInput {
             .map(|d| libc::pollfd { fd: d.as_raw_fd(), events: libc::POLLIN, revents: 0 })
             .collect();
 
+        let mut was_active = true;
+
         while running.load(Ordering::Relaxed) {
+            let active = crate::seat::session_active();
+            if !active && was_active {
+                eprintln!("[veil-host] evdev: session inactive -> releasing device grabs for VT switch");
+                for dev in &mut devices {
+                    let _ = dev.ungrab();
+                }
+                was_active = false;
+            } else if active && !was_active {
+                eprintln!("[veil-host] evdev: session active -> re-asserting device grabs");
+                for dev in &mut devices {
+                    let _ = dev.grab();
+                }
+                was_active = true;
+            }
+
             // 200 ms cap so we still notice `running` being cleared by another path.
             let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
             if n <= 0 { continue; } // 0 = timeout, <0 = EINTR/error → re-check running
-
-            // Always drain; only forward when our VT is foreground, else a
-            // backgrounded veil would inject keystrokes into the hosted app
-            // while the user works on another VT.
-            let active = crate::seat::session_active();
             for (i, dev) in devices.iter_mut().enumerate() {
                 let re = pfds[i].revents;
                 pfds[i].revents = 0;

@@ -309,8 +309,9 @@ fn reexec_into_session(username: &str, password: &str, entry: &session::SessionE
         libc::fcntl(rd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
     }
 
-    let exe = std::fs::read_link("/proc/self/exe")
-        .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/velogin"));
+    let exe = std::env::current_exe()
+        .or_else(|_| std::fs::read_link("/proc/self/exe"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("velogin"));
     let Ok(exe_c) = CString::new(exe.as_os_str().as_bytes()) else {
         return std::io::Error::new(std::io::ErrorKind::InvalidInput, "exe path has NUL");
     };

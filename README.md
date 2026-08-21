@@ -233,13 +233,45 @@ Set in `config.lua`'s `keybinds` table (see below) — held modifier + a single 
 
 > In terminal mode (nested under a WM), use `mod_key = "alt"` or `"ctrl"` — terminals never forward the Super/Logo key, the WM eats it first. `"super"` only works in bare-TTY (DRM/evdev) mode.
 
+#### Custom Application Keybindings
+
+You can map direct application shortcuts using your `mod_key` by adding an `apps` table inside `keybinds` in `config.lua`:
+
+```lua
+keybinds = {
+  mod_key = "alt",
+  focus_left = "h",
+  close = "q",
+
+  -- Bind <mod_key> + <key> to launch specific applications directly:
+  apps = {
+    b = "helium",        -- Alt+B launches Helium browser
+    t = "kitty",         -- Alt+T launches Kitty terminal
+    f = "thunar",        -- Alt+F launches Thunar file manager
+  }
+}
+```
+
+### Native Wayland Environment
+
+`veil-host` and `velogin` automatically export native Wayland environment variables when spawning applications and desktop sessions. Chromium/Helium, Electron, Firefox, Qt, GTK, and SDL apps run natively under Wayland without special flags:
+
+- `ELECTRON_OZONE_PLATFORM_HINT=wayland`
+- `OZONE_PLATFORM=wayland`
+- `MOZ_ENABLE_WAYLAND=1`
+- `QT_QPA_PLATFORM=wayland`
+- `GDK_BACKEND=wayland`
+- `SDL_VIDEODRIVER=wayland`
+- `XDG_SESSION_TYPE=wayland`
+- `XDG_CURRENT_DESKTOP=veil`
+
 ### App launcher
 
 `<mod_key>+d` opens a panel listing installed `.desktop` entries (scanned from standard XDG app dirs) plus a raw command box — type and run anything. Meant to get you out of a zero-window state without touching a second terminal.
 
-### VT switching (bare TTY / DRM mode)
+### VT switching & Bare-TTY DRM Auto-Detection
 
-`Ctrl+Alt+F1`–`F12` switches virtual terminals like normal — veil-host intercepts it, suspends DRM output, hands off via `libseat`, and resumes cleanly when you switch back.
+When starting on a bare TTY console (`/dev/tty1`–`6`) with GPU hardware available, `veil-host` automatically initializes native DRM/KMS graphics output without needing `VEIL_OUTPUT=drm`. `Ctrl+Alt+F1`–`F12` switches virtual terminals like normal — veil-host intercepts it, suspends DRM output, hands off via `libseat`, and resumes cleanly when you switch back.
 
 ---
 

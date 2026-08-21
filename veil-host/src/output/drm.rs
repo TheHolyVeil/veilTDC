@@ -68,7 +68,7 @@ impl CardSetup {
 }
 
 /// Enumerate `/dev/dri/card*` primary nodes, numerically sorted.
-fn list_cards() -> Vec<String> {
+pub(crate) fn list_cards() -> Vec<String> {
     let mut cards: Vec<String> = std::fs::read_dir("/dev/dri")
         .into_iter()
         .flatten()

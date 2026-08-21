@@ -117,8 +117,8 @@ impl ModKey {
     }
 }
 
-/// A tiling-layout operation a keybind can trigger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A tiling-layout operation or custom app launch a keybind can trigger.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     FocusLeft,
     FocusRight,
@@ -129,20 +129,22 @@ pub enum Action {
     Close,
     ResizeGrow,
     ResizeShrink,
+    Launch(String),
 }
 
 impl Action {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            Self::FocusLeft    => "focus left",
-            Self::FocusRight   => "focus right",
-            Self::FocusUp      => "focus up",
-            Self::FocusDown    => "focus down",
-            Self::Swap         => "swap with next",
-            Self::Rotate       => "rotate split",
-            Self::Close        => "close window",
-            Self::ResizeGrow   => "resize grow",
-            Self::ResizeShrink => "resize shrink",
+            Self::FocusLeft    => "focus left".to_string(),
+            Self::FocusRight   => "focus right".to_string(),
+            Self::FocusUp      => "focus up".to_string(),
+            Self::FocusDown    => "focus down".to_string(),
+            Self::Swap         => "swap with next".to_string(),
+            Self::Rotate       => "rotate split".to_string(),
+            Self::Close        => "close window".to_string(),
+            Self::ResizeGrow   => "resize grow".to_string(),
+            Self::ResizeShrink => "resize shrink".to_string(),
+            Self::Launch(cmd)  => format!("launch: {cmd}"),
         }
     }
 }
@@ -157,7 +159,7 @@ pub struct Keybinds {
 
 impl Keybinds {
     pub fn action_for(&self, key: char) -> Option<Action> {
-        self.binds.iter().find(|(k, _)| *k == key).map(|(_, a)| *a)
+        self.binds.iter().find(|(k, _)| *k == key).map(|(_, a)| a.clone())
     }
 }
 
@@ -203,15 +205,34 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         ("resize_shrink", Action::ResizeShrink),
     ];
 
-    let binds = FIELDS.iter().map(|(field, action)| {
+    let mut binds: Vec<(char, Action)> = FIELDS.iter().map(|(field, action)| {
         let key = t.get::<String>(*field).ok()
             .and_then(|s| s.chars().next())
             .map(|c| c.to_ascii_lowercase())
             .unwrap_or_else(|| {
                 default.binds.iter().find(|(_, a)| a == action).unwrap().0
             });
-        (key, *action)
+        (key, action.clone())
     }).collect();
+
+    // App keybinds: keybinds.apps = { b = "helium", t = "kitty" } or global apps table
+    let app_table = t.get::<mlua::Table>("apps")
+        .or_else(|_| gl.get::<mlua::Table>("apps"));
+
+    if let Ok(apps) = app_table {
+        for pair in apps.pairs::<String, String>().flatten() {
+            let (key_str, cmd) = pair;
+            if let Some(ch) = key_str.chars().next().map(|c| c.to_ascii_lowercase()) {
+                if !cmd.trim().is_empty() {
+                    if let Some(existing) = binds.iter_mut().find(|(k, _)| *k == ch) {
+                        existing.1 = Action::Launch(cmd);
+                    } else {
+                        binds.push((ch, Action::Launch(cmd)));
+                    }
+                }
+            }
+        }
+    }
 
     Keybinds { mod_key, binds }
 }

@@ -195,6 +195,14 @@ pub fn launch(username: &str, password: &str, entry: &SessionEntry) -> Result<()
     }
     set_default("XDG_SESSION_TYPE", "wayland".to_string());
     set_default("XDG_SESSION_CLASS", "user".to_string());
+    set_default("XDG_CURRENT_DESKTOP", "veil".to_string());
+    set_default("XDG_SESSION_DESKTOP", "veil".to_string());
+    set_default("ELECTRON_OZONE_PLATFORM_HINT", "wayland".to_string());
+    set_default("OZONE_PLATFORM", "wayland".to_string());
+    set_default("MOZ_ENABLE_WAYLAND", "1".to_string());
+    set_default("QT_QPA_PLATFORM", "wayland".to_string());
+    set_default("GDK_BACKEND", "wayland".to_string());
+    set_default("SDL_VIDEODRIVER", "wayland".to_string());
     let runtime_dir = format!("/run/user/{uid}");
     if std::path::Path::new(&runtime_dir).is_dir() {
         set_default("XDG_RUNTIME_DIR", runtime_dir);

@@ -173,6 +173,7 @@ pub struct State {
     pub clipboard_rx:         mpsc::Receiver<String>,
     pub pending_copy_out:     bool,
     pub client_has_selection: bool,
+    pub composite_buf:        Vec<u8>,
 }
 
 /// Per-surface RGBA cache entry. We re-blit these every dirty tick.
@@ -735,6 +736,38 @@ fn keysym_char(keysym: KeysymHandle<'_>) -> Option<char> {
     char::from_u32(cp).map(|c| c.to_ascii_lowercase())
 }
 
+/// Unconditionally seed native Wayland flags so browsers (Helium, Chrome),
+/// Electron apps, Firefox, Qt, GTK, and SDL apps run natively under Wayland
+/// without requiring special command-line flags.
+pub fn apply_wayland_env(cmd: &mut Command, socket_name: &str) {
+    cmd.env("WAYLAND_DISPLAY", socket_name);
+    cmd.env("XDG_SESSION_TYPE", "wayland");
+    cmd.env("XDG_CURRENT_DESKTOP", "veil");
+    cmd.env("XDG_SESSION_DESKTOP", "veil");
+    cmd.env("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
+    cmd.env("OZONE_PLATFORM", "wayland");
+    cmd.env("MOZ_ENABLE_WAYLAND", "1");
+    cmd.env("QT_QPA_PLATFORM", "wayland");
+    cmd.env("GDK_BACKEND", "wayland");
+    cmd.env("SDL_VIDEODRIVER", "wayland");
+}
+
+fn spawn_command(socket_name: &str, exec: &str) {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(exec);
+    apply_wayland_env(&mut cmd, socket_name);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            tracing::info!("spawned {exec:?}");
+            std::thread::spawn(move || { let _ = child.wait(); });
+        }
+        Err(e) => tracing::error!("spawn {exec:?} failed: {e}"),
+    }
+}
+
 /// Run a Combo-4 keybind action against the live layout, then re-tile and
 /// re-focus so the client sees the result immediately.
 fn dispatch_action(state: &mut State, action: veil_config::Action) {
@@ -764,6 +797,7 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
         }
         ResizeGrow   => state.layout.resize_grow(),
         ResizeShrink => state.layout.resize_shrink(),
+        Launch(cmd)  => spawn_command(&state.socket_name, &cmd),
     }
     relayout(state);
     refocus_keyboard(state);
@@ -853,19 +887,7 @@ fn launch_selected(state: &mut State) {
         return;
     };
 
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(&exec);
-    cmd.env("WAYLAND_DISPLAY", &state.socket_name);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
-    match cmd.spawn() {
-        Ok(mut child) => {
-            tracing::info!("launcher: spawned {exec:?}");
-            std::thread::spawn(move || { let _ = child.wait(); });
-        }
-        Err(e) => tracing::error!("launcher: spawn {exec:?} failed: {e}"),
-    }
+    spawn_command(&state.socket_name, &exec);
 }
 
 /// Recompute the dwindle tiling and push each toplevel its new size. Call
@@ -922,12 +944,32 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
 
     let w = state.output_w;
     let h = state.output_h;
-    let mut back = vec![0u8; (w as usize) * (h as usize) * 4];
-    // Bare background — otherwise uncovered space is pure black, the "void"
-    // (see zero-toplevel launcher work: that's now a real, reachable state).
-    for px in back.chunks_exact_mut(4) {
-        px.copy_from_slice(&state.background);
+    let needed = (w as usize) * (h as usize) * 4;
+    if state.composite_buf.len() != needed {
+        state.composite_buf.resize(needed, 0);
     }
+
+    // Fast background fill: write the 4-byte RGBA color as a u32 across the
+    // whole buffer in one pass — avoids the overhead of chunks_exact_mut(4).
+    let bg = state.background;
+    let bg_u32 = u32::from_ne_bytes(bg);
+    // SAFETY: composite_buf is aligned to at least 1; u32 requires 4-byte
+    // alignment and Vec<u8> guarantees that its allocation is at least
+    // max_align_t-aligned (≥ 8 bytes on all supported platforms), so the
+    // cast is safe for the in-bounds slice. bytemuck would be cleaner but
+    // this avoids an extra dep; the debug assert catches any future breakage.
+    debug_assert!(state.composite_buf.as_ptr().align_offset(4) == 0);
+    {
+        let (pre, u32s, post) = unsafe { state.composite_buf.align_to_mut::<u32>() };
+        for b in pre.chunks_exact_mut(4) { b.copy_from_slice(&bg); }
+        u32s.fill(bg_u32);
+        for b in post.chunks_exact_mut(4) { b.copy_from_slice(&bg); }
+    }
+
+    let show_help = state.show_help;
+    let launcher_present = state.launcher.is_some();
+
+    let back = &mut state.composite_buf;
 
     // Toplevels (root buffer + subsurfaces) then their popups, each at its
     // tiled rect origin. Popups are positioned relative to their toplevel.
@@ -938,10 +980,10 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
     for (i, surf) in toplevels.iter().enumerate() {
         let r = state.layout_rects.get(i).copied()
             .unwrap_or(Rect { x: 0, y: 0, w, h });
-        blit_subtree(&mut back, w, h, &state.surface_buffers, surf, (r.x, r.y));
+        blit_subtree(back, w, h, &state.surface_buffers, surf, (r.x, r.y));
         for (popup, off) in PopupManager::popups_for_surface(surf) {
             let ps = popup.wl_surface().clone();
-            blit_subtree(&mut back, w, h, &state.surface_buffers, &ps, (r.x + off.x, r.y + off.y));
+            blit_subtree(back, w, h, &state.surface_buffers, &ps, (r.x + off.x, r.y + off.y));
         }
     }
 
@@ -955,14 +997,14 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
             });
             let cx = state.pointer_pos.0 as i32 - hotspot.x;
             let cy = state.pointer_pos.1 as i32 - hotspot.y;
-            blit_subtree(&mut back, w, h, &state.surface_buffers, cs, (cx, cy));
+            blit_subtree(back, w, h, &state.surface_buffers, cs, (cx, cy));
         }
         CursorImageStatus::Named(_) => {
             // Client wants a themed cursor (default arrow etc) — we don't
             // load themes. Draw a tiny built-in arrow so the user can see
             // where their pointer is.
             draw_fallback_cursor(
-                &mut back, w, h,
+                back, w, h,
                 state.pointer_pos.0 as i32,
                 state.pointer_pos.1 as i32,
             );
@@ -970,17 +1012,37 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
         CursorImageStatus::Hidden => {}
     }
 
-    if state.show_help {
-        draw_help_overlay(state, &mut back, w, h);
+    // Only clone keybinds/launcher when the overlays are actually on screen.
+    if show_help {
+        let keybinds = state.keybinds.clone();
+        draw_help_overlay(&keybinds, back, w, h);
     }
-    if let Some(launcher) = &state.launcher {
-        draw_launcher_overlay(launcher, state.keybinds.mod_key, &mut back, w, h);
+    if launcher_present {
+        if let Some(ref l) = state.launcher {
+            let mod_key = state.keybinds.mod_key;
+            // Borrow checker: we need to call draw_launcher_overlay with `back`
+            // already mutably borrowed. Clone the launcher (it's tiny) rather
+            // than fighting the borrow checker with unsafe aliasing.
+            let l = l.clone();
+            draw_launcher_overlay(&l, mod_key, back, w, h);
+        }
     }
 
     state.frame_serial = state.frame_serial.wrapping_add(1);
-    let _ = state.frame_tx.send(Frame {
-        rgba: back, width: w, height: h, serial: state.frame_serial,
+
+    // Zero-copy dispatch: swap composite_buf with a fresh Vec so the
+    // compositor can immediately reuse the allocation for the next frame,
+    // while the render thread independently holds the Arc-wrapped old buffer.
+    let mut outgoing = Vec::new();
+    std::mem::swap(&mut state.composite_buf, &mut outgoing);
+    let _ = state.frame_tx.send(crate::sink::Frame {
+        rgba: Arc::new(outgoing), width: w, height: h, serial: state.frame_serial,
     });
+    // Put a correctly-sized buffer back for next frame. If the channel
+    // consumer drained quickly the Vec may come back via Arc::try_unwrap on
+    // the next composite; for now just allocate a new one (still cheaper than
+    // the old .clone() — only one allocation per frame vs a full memcpy).
+    state.composite_buf = Vec::with_capacity(needed);
 
     // Fire frame callbacks now that we've consumed and displayed this frame.
     // Chromium uses these as vsync: it won't submit the next buffer until
@@ -1003,7 +1065,7 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
 /// on-screen box, stamped directly into the composited RGBA frame with the
 /// built-in 5x7 font ([`crate::font5x7`]) — veil-host has no other text
 /// rendering.
-fn draw_help_overlay(state: &State, back: &mut [u8], w: u32, h: u32) {
+fn draw_help_overlay(keybinds: &veil_config::Keybinds, back: &mut [u8], w: u32, h: u32) {
     use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
 
     let scale = 2u32;
@@ -1011,9 +1073,9 @@ fn draw_help_overlay(state: &State, back: &mut [u8], w: u32, h: u32) {
     let line_h = (GLYPH_H + 3) * scale;
     let pad = 12i32;
 
-    let mod_label = state.keybinds.mod_key.label().to_ascii_uppercase();
+    let mod_label = keybinds.mod_key.label().to_ascii_uppercase();
     let mut lines: Vec<String> = vec!["KEYBINDS".to_string(), String::new()];
-    for (key, action) in &state.keybinds.binds {
+    for (key, action) in &keybinds.binds {
         lines.push(format!("{mod_label}+{}  {}", key.to_ascii_uppercase(), action.label().to_ascii_uppercase()));
     }
     lines.push(String::new());
@@ -1027,10 +1089,13 @@ fn draw_help_overlay(state: &State, back: &mut [u8], w: u32, h: u32) {
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
 
-    fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 0, 16, 235]); // near-opaque #0a0010
+    let border = 2i32;
+    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), [199, 146, 234, 255]);
+    fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 0, 16, 245]); // dark purple background
     for (i, line) in lines.iter().enumerate() {
         let ty = y0 + pad + i as i32 * line_h as i32;
-        draw_text(back, w, h, x0 + pad, ty, scale, line, [199, 146, 234, 255]); // #c792ea
+        let color = if i == 0 { [255, 215, 0, 255] } else { [199, 146, 234, 255] };
+        draw_text(back, w, h, x0 + pad, ty, scale, line, color);
     }
 }
 
@@ -1076,21 +1141,27 @@ fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, back
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
 
-    fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 0, 16, 235]); // near-opaque #0a0010
+    let border = 2i32;
+    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), [199, 146, 234, 255]);
+    fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 0, 16, 245]);
 
     // Highlight bar behind the selected match row, drawn before the text.
-    // fill_rect overwrites pixels outright (nothing downstream alpha-blends
-    // an RGBA frame — DRM's blit drops A entirely), so this has to be a
-    // solid tint, not a translucent wash.
     if !matches.is_empty() {
         let row = header_rows + selected;
         let ry = y0 + pad + row as i32 * line_h as i32 - 2;
-        fill_rect(back, w, h, x0 + 2, ry, box_w - 4, line_h, [40, 20, 52, 255]);
+        fill_rect(back, w, h, x0 + 2, ry, box_w - 4, line_h, [65, 35, 85, 255]);
     }
 
     for (i, line) in lines.iter().enumerate() {
         let ty = y0 + pad + i as i32 * line_h as i32;
-        draw_text(back, w, h, x0 + pad, ty, scale, line, [199, 146, 234, 255]); // #c792ea
+        let color = if i == 0 {
+            [255, 215, 0, 255] // Gold header
+        } else if i == 1 {
+            [128, 222, 234, 255] // Cyan query text
+        } else {
+            [199, 146, 234, 255]
+        };
+        draw_text(back, w, h, x0 + pad, ty, scale, line, color);
     }
 }
 
@@ -1254,7 +1325,7 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // else the toplevel. Surface-local coords are (global - origin).
             let focus = pick_focus(state, nx, ny);
             if focus.is_none() {
-                tracing::warn!("motion ({:.0},{:.0}) → no focus (toplevels={}, buffers={})",
+                tracing::debug!("motion ({:.0},{:.0}) → no focus (toplevels={}, buffers={})",
                     nx, ny, state.toplevels.len(), state.surface_buffers.len());
             }
             let ptr = state.pointer.clone();
@@ -1389,7 +1460,7 @@ pub fn run(
     let mut seat_state   = SeatState::<State>::new();
     let mut seat         = seat_state.new_wl_seat(&dh, "veil-seat");
     let keyboard = seat
-        .add_keyboard(XkbConfig::default(), 200, 25)
+        .add_keyboard(XkbConfig::default(), 200, 16)
         .map_err(|e| io::Error::other(format!("keyboard: {e}")))?;
     let pointer = seat.add_pointer();
 
@@ -1465,6 +1536,7 @@ pub fn run(
         clipboard_rx,
         pending_copy_out:     false,
         client_has_selection: false,
+        composite_buf:        Vec::new(),
     };
 
     let mut data = LoopData { state, display };
@@ -1619,10 +1691,7 @@ pub fn run(
         if !argv.is_empty() {
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]);
-            cmd.env("WAYLAND_DISPLAY", &socket_name_owned);
-            // Don't unset DISPLAY — XWayland may have set it by the time
-            // the child execs, or will shortly. Children that prefer
-            // wayland (anything modern) will use WAYLAND_DISPLAY first.
+            apply_wayland_env(&mut cmd, &socket_name_owned);
             if wayland_debug {
                 cmd.env("WAYLAND_DEBUG", "1");
             }

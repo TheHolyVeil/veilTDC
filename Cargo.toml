@@ -22,3 +22,10 @@ calloop               = "0.14"
 tracing               = "0.1"
 drm                   = "0.15"
 libseat               = "0.2"
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = true
+

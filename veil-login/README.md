@@ -24,14 +24,14 @@ See main Void/Veil README for installation instructions.
 
 ### Background Image
 
-Place your background image at:
+Place your background image at `/etc/velogin/background.png` (or `/etc/abyss/background.png` legacy path):
 
 ```bash
-sudo mkdir -p /etc/abyss
-sudo cp your-background.png /etc/abyss/background.png
+sudo mkdir -p /etc/velogin
+sudo cp your-background.png /etc/velogin/background.png
 ```
 
-Supported formats: PNG, JPEG. Recommended: 1920×1080 or higher.
+Supported formats: PNG, JPEG. Recommended: 1920×1080 or higher. Note: Existing wallpapers in `/etc/abyss/background.png` are automatically detected via fallback—no file renaming is required.
 
 ### Custom Sessions
 

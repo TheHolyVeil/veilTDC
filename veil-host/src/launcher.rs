@@ -20,6 +20,7 @@ pub struct DesktopEntry {
     pub exec: String,
 }
 
+#[derive(Clone)]
 pub struct Launcher {
     pub query:    String,
     pub selected: usize,
