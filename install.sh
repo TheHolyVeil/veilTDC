@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-REPO="viewerofall/veilTDC"
+REPO="TheHolyVeil/veilTDC"
 BIN="veil-host"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 VERSION="${VERSION:-}"
