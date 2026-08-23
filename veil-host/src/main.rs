@@ -307,7 +307,7 @@ fn main() -> std::io::Result<()> {
         }
 
         // Render via output backend (Arc<Vec<u8>> derefs to &[u8])
-        output.render_frame(&frame.rgba, frame.width, frame.height)?;
+        output.render_frame(&frame.rgba, frame.width, frame.height, frame.damage)?;
 
         // FPS stats logging every second
         fps_frame_count += 1;

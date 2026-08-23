@@ -208,7 +208,12 @@ impl TerminalOutput {
 }
 
 impl OutputBackend for TerminalOutput {
-    fn render_frame(&mut self, rgba: &[u8], width: u32, height: u32) -> io::Result<()> {
+    fn render_frame(&mut self, rgba: &[u8], width: u32, height: u32, _damage: crate::layout::Rect) -> io::Result<()> {
+        // _damage unused: halfblock/ascii/kitty encoding walks the full cell
+        // grid every call today (see render_output below), no partial-region
+        // path yet. That's real, separate follow-up work — not silently
+        // dropped, just not part of this pass. Full redraw every tick, same
+        // behavior as before this parameter existed.
         self.width = width;
         self.height = height;
 

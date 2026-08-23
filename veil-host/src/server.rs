@@ -2,8 +2,11 @@
 //!
 //! v1 scope: single client, single fullscreen toplevel, shm + dmabuf buffers,
 //! keyboard + pointer + scroll, wl_output advertisement, xdg_activation stub.
-//! dmabuf: single-plane linear ARGB/XRGB/ABGR/XBGR 8888 accepted via mmap;
-//! tiled/compressed modifiers fall back to shm gracefully.
+//! dmabuf: single-plane linear ARGB/XRGB/ABGR/XBGR/RGBX/BGRX 8888 accepted via
+//! mmap; tiled/non-linear and multi-plane buffers go through the GPU detile
+//! path (`detile::GpuImporter`) when available, else fall back to shm.
+//! Explicit sync (`linux-drm-syncobj-v1`) is honored on commit when the
+//! render node supports it — see `DrmSyncobjHandler` below.
 
 use std::collections::HashMap;
 use std::io;
@@ -41,7 +44,7 @@ use smithay::{
         protocol::{wl_buffer, wl_seat, wl_shm, wl_surface::WlSurface},
         Client, Display, DisplayHandle, Resource,
     },
-    utils::{Logical, Point, Serial, Transform},
+    utils::{DeviceFd, Logical, Point, Serial, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -82,8 +85,13 @@ use smithay::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
         },
         socket::ListeningSocketSource,
+        drm_syncobj::{
+            supports_syncobj_eventfd, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState,
+        },
     },
     xwayland::{XWayland, XWaylandClientData, XWaylandEvent},
+    delegate_drm_syncobj,
+    backend::drm::DrmDeviceFd,
 };
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -112,6 +120,11 @@ pub struct State {
     /// GPU dmabuf importer for tiled/non-linear client buffers. `None` when no
     /// render node / EGL is available — veil then stays CPU-only + linear-only.
     pub gpu:               Option<GpuImporter>,
+    /// `linux-drm-syncobj-v1` explicit sync. `None` when the render node's
+    /// kernel/driver doesn't support `syncobj_eventfd` — commit() then skips
+    /// the acquire-fence wait entirely and relies on implicit (kernel dma-buf)
+    /// sync only, same behavior as before this existed.
+    pub syncobj_state:     Option<DrmSyncobjState>,
     pub _data_device:      DataDeviceState,
     pub _xdg_decoration:        XdgDecorationState,
     pub _viewporter:            ViewporterState,
@@ -158,6 +171,13 @@ pub struct State {
     pub surface_buffers:   HashMap<ObjectId, SurfaceBuf>,
     pub cursor_status:     CursorImageStatus,
     pub dirty:             bool,
+    /// Union of changed regions since the last composite. `None` alongside
+    /// `dirty == true` shouldn't happen in practice (every dirty=true site
+    /// also sets this via `mark_dirty_rect`/`mark_dirty_full`) but composite
+    /// treats `None` as "assume full frame" rather than panicking, so a
+    /// future call site that forgets to set it degrades to the old
+    /// always-full-redraw behavior instead of drawing nothing.
+    pub damage:            Option<Rect>,
     pub last_composite:    Option<Instant>,
     pub frame_tx:          mpsc::Sender<Frame>,
     pub serial_counter:    u32,
@@ -236,6 +256,36 @@ impl CompositorHandler for State {
 
         match assign {
             Assign::New(buffer) => {
+                // Explicit sync (linux-drm-syncobj-v1): if this commit carries
+                // an acquire point (client set one via wp_linux_drm_syncobj_
+                // surface_v1), block until the client's GPU signals it before
+                // we touch the buffer's memory below. `.current()` already
+                // reflects this commit — smithay merges the cached state
+                // during its own commit resolution, before our handler runs.
+                //
+                // This is a synchronous, bounded wait on veil's single-
+                // threaded event loop, not smithay's own async blocker
+                // pattern (DrmSyncPoint::generate_blocker + compositor::
+                // add_blocker registered on a calloop source). That's the
+                // "correct" non-stalling approach; this is the pragmatic one.
+                // If a GPU client ever visibly stalls the compositor here,
+                // that's the upgrade path — not a rewrite of this.
+                // No-op (both None) for any surface that never bound the
+                // syncobj-surface protocol object, i.e. every client today.
+                let (acquire_pt, release_pt) = with_states(surface, |states| {
+                    let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                    let cur = cached.current();
+                    (cur.acquire_point.clone(), cur.release_point.clone())
+                });
+                if let Some(pt) = &acquire_pt {
+                    if let Err(e) = pt.wait(16_000_000) {
+                        tracing::warn!(
+                            "commit {} — syncobj acquire wait failed/timed out: {e}",
+                            surface.id()
+                        );
+                    }
+                }
+
                 // Try shm first, then dmabuf.
                 let imported = with_buffer_contents(&buffer, |ptr, len, data| {
                     tracing::info!("commit {} shm {}x{} fmt={:?}", surface.id(), data.width, data.height, data.format);
@@ -264,20 +314,40 @@ impl CompositorHandler for State {
                 if let Some((rgba, w, h)) = imported {
                     tracing::info!("commit {} → surface_buffers {}x{}", surface.id(), w, h);
                     self.surface_buffers.insert(surface.id(), SurfaceBuf { rgba, w, h });
-                    self.dirty = true;
+                    match toplevel_rect_for(self, surface) {
+                        Some(r) => mark_dirty_rect(self, r),
+                        None    => mark_dirty_full(self), // subsurface/popup/cursor — no precise rect
+                    }
                 } else {
                     tracing::warn!("commit {} — unsupported buffer type, skipping", surface.id());
+                }
+
+                // Tell the client's GPU it can reuse/free the buffer now that
+                // we're done reading it — mirrors buffer.release() below, just
+                // for explicit-sync clients specifically.
+                if let Some(pt) = &release_pt {
+                    if let Err(e) = pt.signal() {
+                        tracing::warn!(
+                            "commit {} — syncobj release signal failed: {e}",
+                            surface.id()
+                        );
+                    }
                 }
                 buffer.release();
             }
             Assign::Removed => {
                 self.surface_buffers.remove(&surface.id());
-                self.dirty = true;
+                match toplevel_rect_for(self, surface) {
+                    Some(r) => mark_dirty_rect(self, r),
+                    None    => mark_dirty_full(self),
+                }
             }
             Assign::None => {
-                // Pure state commit (geometry, role config). Still mark
-                // dirty so subsurface-offset changes get re-composited.
-                self.dirty = true;
+                // Pure state commit (geometry, role config). Full-frame: a
+                // subsurface offset change could affect area outside its own
+                // parent toplevel's last-known rect, and this is infrequent
+                // enough that precise tracking here isn't worth the risk.
+                mark_dirty_full(self);
             }
         }
 
@@ -287,7 +357,10 @@ impl CompositorHandler for State {
 
     fn destroyed(&mut self, surface: &WlSurface) {
         if self.surface_buffers.remove(&surface.id()).is_some() {
-            self.dirty = true;
+            match toplevel_rect_for(self, surface) {
+                Some(r) => mark_dirty_rect(self, r),
+                None    => mark_dirty_full(self),
+            }
         }
     }
 }
@@ -341,7 +414,7 @@ impl SeatHandler for State {
     }
     fn cursor_image(&mut self, _s: &Seat<Self>, image: CursorImageStatus) {
         self.cursor_status = image;
-        self.dirty = true;
+        mark_dirty_full(self);
     }
 }
 
@@ -421,6 +494,7 @@ impl DmabufHandler for State {
             && matches!(
                 fmt.code,
                 Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888
+                | Fourcc::Rgbx8888 | Fourcc::Bgrx8888
             );
 
         if cpu_ok {
@@ -442,6 +516,12 @@ impl DmabufHandler for State {
         // shm (software) rendering, which we always handle, instead of handing
         // us a buffer we'd render blank or freeze trying to CPU-map.
         notifier.failed();
+    }
+}
+
+impl DrmSyncobjHandler for State {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.syncobj_state.as_mut()
     }
 }
 
@@ -507,6 +587,11 @@ delegate_xdg_decoration!(State);
 delegate_viewporter!(State);
 delegate_fractional_scale!(State);
 delegate_presentation!(State);
+// drm_syncobj's manager/surface/timeline dispatch — smithay 0.7.0 uses the
+// classic Dispatch/GlobalDispatch pattern here (not Dispatch2, which is
+// master-branch-only and not in this pinned version), hence its own macro
+// rather than the generic delegate_dispatch2! bridge.
+delegate_drm_syncobj!(State);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -541,6 +626,8 @@ fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> DmabufFeedback {
         Format { code: Fourcc::Xrgb8888, modifier: Modifier::Linear },
         Format { code: Fourcc::Abgr8888, modifier: Modifier::Linear },
         Format { code: Fourcc::Xbgr8888, modifier: Modifier::Linear },
+        Format { code: Fourcc::Rgbx8888, modifier: Modifier::Linear },
+        Format { code: Fourcc::Bgrx8888, modifier: Modifier::Linear },
     ];
 
     // Everything the render node can import (tiled modifiers included).
@@ -591,6 +678,8 @@ fn import_dmabuf(dmabuf: &Dmabuf) -> Option<(Vec<u8>, u32, u32)> {
             let (r, g, b) = match fmt.code {
                 Fourcc::Argb8888 | Fourcc::Xrgb8888 => (px[2], px[1], px[0]),
                 Fourcc::Abgr8888 | Fourcc::Xbgr8888 => (px[0], px[1], px[2]),
+                Fourcc::Rgbx8888                    => (px[3], px[2], px[1]),
+                Fourcc::Bgrx8888                    => (px[1], px[2], px[3]),
                 _ => return None,
             };
             out.extend_from_slice(&[r, g, b, 255]);
@@ -797,6 +886,7 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
         }
         ResizeGrow   => state.layout.resize_grow(),
         ResizeShrink => state.layout.resize_shrink(),
+        ToggleLayout => state.layout.toggle_mode(),
         Launch(cmd)  => spawn_command(&state.socket_name, &cmd),
     }
     relayout(state);
@@ -820,13 +910,13 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
     };
     if mod_held && matches!(sym, keysyms::KEY_d | keysyms::KEY_D) {
         state.launcher = None;
-        state.dirty = true;
+        mark_dirty_full(state);
         return;
     }
 
     if sym == keysyms::KEY_Escape {
         state.launcher = None;
-        state.dirty = true;
+        mark_dirty_full(state);
         return;
     }
     if sym == keysyms::KEY_Return || sym == keysyms::KEY_KP_Enter {
@@ -837,14 +927,14 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
         if let Some(l) = state.launcher.as_mut() {
             l.query.pop();
             l.selected = 0;
-            state.dirty = true;
+            mark_dirty_full(state);
         }
         return;
     }
     if sym == keysyms::KEY_Up {
         if let Some(l) = state.launcher.as_mut() {
             l.selected = l.selected.saturating_sub(1);
-            state.dirty = true;
+            mark_dirty_full(state);
         }
         return;
     }
@@ -852,7 +942,7 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
         if let Some(l) = state.launcher.as_mut() {
             let count = l.matches().len();
             if count > 0 { l.selected = (l.selected + 1).min(count - 1); }
-            state.dirty = true;
+            mark_dirty_full(state);
         }
         return;
     }
@@ -863,7 +953,7 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
             if let Some(l) = state.launcher.as_mut() {
                 l.query.push(c);
                 l.selected = 0;
-                state.dirty = true;
+                mark_dirty_full(state);
             }
         }
     }
@@ -876,7 +966,7 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
 /// abyss when the last window closed).
 fn launch_selected(state: &mut State) {
     let Some(launcher) = state.launcher.take() else { return };
-    state.dirty = true;
+    mark_dirty_full(state);
 
     let matches = launcher.matches();
     let exec = if !matches.is_empty() {
@@ -915,7 +1005,7 @@ fn relayout(state: &mut State) {
     }
 
     state.layout_rects = rects;
-    state.dirty = true;
+    mark_dirty_full(state);
 }
 
 /// Point the keyboard at whichever live toplevel is currently focused (or
@@ -930,6 +1020,43 @@ fn refocus_keyboard(state: &mut State) {
     kb.set_focus(state, target, serial);
 }
 
+/// Maps a committing/destroyed `WlSurface` to the on-screen rect of the
+/// toplevel it's the ROOT surface of, if it is one. Returns `None` for
+/// anything else (subsurfaces, popups, cursor surfaces) — callers fall back
+/// to `mark_dirty_full` in that case. Deliberately not subsurface-tree-aware:
+/// a toplevel's root surface committing is the common case (most apps render
+/// straight into it), and under-detecting here only costs a full-frame
+/// redraw instead of a partial one — it can never cause a stale-pixel bug,
+/// since full-frame damage always covers whatever a precise rect would have.
+fn toplevel_rect_for(state: &State, surface: &WlSurface) -> Option<Rect> {
+    let i = state.toplevels.iter().position(|t| t.wl_surface() == surface)?;
+    state.layout_rects.get(i).copied()
+}
+
+/// Marks the whole output as needing repaint — the safe default for any
+/// dirty event without a precise on-screen rect (resize, cursor motion,
+/// overlay toggles, relayout, anything not going through
+/// `toplevel_rect_for`). Over-damaging can only cost extra redraw work, never
+/// leave stale pixels, so this is always a legal fallback.
+fn mark_dirty_full(state: &mut State) {
+    state.dirty = true;
+    let full = Rect { x: 0, y: 0, w: state.output_w, h: state.output_h };
+    state.damage = Some(match state.damage.take() {
+        Some(d) => d.union(&full),
+        None => full,
+    });
+}
+
+/// Marks just `rect` as needing repaint, unioned with whatever's already
+/// pending this tick (multiple surfaces can go dirty between composites).
+fn mark_dirty_rect(state: &mut State, rect: Rect) {
+    state.dirty = true;
+    state.damage = Some(match state.damage.take() {
+        Some(d) => d.union(&rect),
+        None => rect,
+    });
+}
+
 /// Composite all live toplevels + their popups + the cursor into a single
 /// RGBA frame and ship it. Called from the periodic tick when `dirty`.
 fn composite_and_send(state: &mut State, composite_interval: Duration) {
@@ -940,6 +1067,14 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
     }
     state.last_composite = Some(now);
     state.dirty = false;
+    // Snapshot + reset this tick's damage now, before any of the drawing
+    // below — so damage that arrives *during* composite (shouldn't happen on
+    // this single-threaded loop, but keeps the invariant obviously true
+    // rather than relying on ordering elsewhere) accumulates for next tick
+    // instead of being silently dropped.
+    let frame_damage = state.damage.take()
+        .unwrap_or(Rect { x: 0, y: 0, w: state.output_w, h: state.output_h })
+        .clamp_to(state.output_w, state.output_h);
     tracing::info!("compositing frame (buffers={})", state.surface_buffers.len());
 
     let w = state.output_w;
@@ -1037,6 +1172,7 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
     std::mem::swap(&mut state.composite_buf, &mut outgoing);
     let _ = state.frame_tx.send(crate::sink::Frame {
         rgba: Arc::new(outgoing), width: w, height: h, serial: state.frame_serial,
+        damage: frame_damage,
     });
     // Put a correctly-sized buffer back for next frame. If the channel
     // consumer drained quickly the Vec may come back via Arc::try_unwrap on
@@ -1296,12 +1432,12 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                         // means it works in whatever mode's actually in use.
                         if ch == '/' {
                             st.show_help = !st.show_help;
-                            st.dirty = true;
+                            mark_dirty_full(st);
                             return FilterResult::Intercept(());
                         }
                         if ch == 'd' {
                             st.launcher = Some(Launcher::new());
-                            st.dirty = true;
+                            mark_dirty_full(st);
                             return FilterResult::Intercept(());
                         }
                         if let Some(action) = st.keybinds.action_for(ch) {
@@ -1319,7 +1455,7 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             let nx = if width  > 0 { x as f64 * state.output_w as f64 / width  as f64 } else { x as f64 };
             let ny = if height > 0 { y as f64 * state.output_h as f64 / height as f64 } else { y as f64 };
             state.pointer_pos = (nx, ny);
-            state.dirty = true;
+            mark_dirty_full(state);
 
             // Resolve focus: prefer the topmost popup under the cursor,
             // else the toplevel. Surface-local coords are (global - origin).
@@ -1437,6 +1573,23 @@ pub fn run(
     // before the dmabuf global so feedback can advertise its formats.
     let gpu = GpuImporter::new();
 
+    // Explicit sync (linux-drm-syncobj-v1): a second, independent fd on the
+    // same render node used only to import client syncobj timelines and
+    // wait/signal fences — deliberately separate from `gpu`'s EGL/GBM device
+    // so this never touches the working detile path. Decoupled from `gpu`
+    // being `Some` too: syncobj import doesn't need EGL, just kernel
+    // CONFIG_DRM_SYNCOBJ support on the node, so this still comes up on
+    // (rare) hardware where EGL fails but the render node itself is fine.
+    let syncobj_state = crate::detile::open_render_node().and_then(|fd| {
+        let dev = DrmDeviceFd::new(DeviceFd::from(fd));
+        if supports_syncobj_eventfd(&dev) {
+            Some(DrmSyncobjState::new::<State>(&dh, dev))
+        } else {
+            eprintln!("[veil-host] syncobj: device doesn't support syncobj_eventfd, explicit sync disabled");
+            None
+        }
+    });
+
     // v4 dmabuf with default feedback: advertise the render device + the formats
     // we can import (linear always; tiled too when the GPU importer is up).
     // Feedback-aware clients allocate accordingly; we detile tiled buffers.
@@ -1502,6 +1655,7 @@ pub fn run(
         xdg_activation, output_manager,
         dmabuf_state, _dmabuf_global,
         gpu,
+        syncobj_state,
         _data_device,
         _xdg_decoration, _viewporter, _fractional, _presentation,
         _text_input, _primary_sel, _cursor_shape,
@@ -1524,6 +1678,7 @@ pub fn run(
         surface_buffers:  HashMap::new(),
         cursor_status:    CursorImageStatus::default_named(),
         dirty:            false,
+        damage:           None,
         last_composite:   None,
         frame_tx,
         serial_counter: 0,

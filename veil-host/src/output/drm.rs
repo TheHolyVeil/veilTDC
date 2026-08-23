@@ -10,6 +10,7 @@
 //! out), clipped/letterboxed to the display mode.
 
 use super::OutputBackend;
+use crate::layout::Rect;
 use crate::seat::Seat;
 use crate::vt::VtGuard;
 use drm::buffer::{Buffer, DrmFourcc};
@@ -49,6 +50,7 @@ struct CardSetup {
 
 impl CardSetup {
     fn into_output(self, seat: Seat, vt: VtGuard) -> DrmOutput {
+        let full = Rect { x: 0, y: 0, w: self.width, h: self.height };
         DrmOutput {
             seat,
             card: self.card,
@@ -62,6 +64,10 @@ impl CardSetup {
             back: 1,
             flip_pending: false,
             was_active: true,
+            // Both slots start "fully dirty": neither dumb buffer has real
+            // content yet, so the first write to each must be a full frame
+            // regardless of what the compositor's first damage rect says.
+            pending_damage: [full, full],
             _vt: vt,
         }
     }
@@ -96,6 +102,14 @@ pub struct DrmOutput {
     fbs:          [framebuffer::Handle; 2],
     /// Index of the buffer we'll render into next (not currently scanned out).
     back:         usize,
+    /// Damage not yet applied to buffer `[i]`, accumulated since that
+    /// buffer's last write. Necessary because writes alternate between two
+    /// buffers: buffer 0's content is two frames stale relative to buffer 1
+    /// at any given moment, not one — so "only copy what changed since last
+    /// frame" is wrong for a swapchain unless tracked per-slot like this.
+    /// Reset to empty for slot `back` right after that slot's write; the
+    /// other slot keeps accumulating until its own turn.
+    pending_damage: [Rect; 2],
     /// A page-flip is queued; its completion event hasn't been drained yet.
     flip_pending: bool,
     /// Seat activity as of the last `render_frame` call, to detect the
@@ -256,7 +270,16 @@ impl DrmOutput {
 }
 
 impl OutputBackend for DrmOutput {
-    fn render_frame(&mut self, rgba: &[u8], fw: u32, fh: u32) -> io::Result<()> {
+    fn render_frame(&mut self, rgba: &[u8], fw: u32, fh: u32, damage: Rect) -> io::Result<()> {
+        // Accumulate into both buffer-age slots before anything else in this
+        // function can early-return. If we skip the actual write below (VT
+        // switched away, resume not landed yet), this damage must still be
+        // remembered for whichever buffer eventually gets written next —
+        // dropping it here would leave that buffer stale once it's used.
+        for p in &mut self.pending_damage {
+            *p = p.union(&damage);
+        }
+
         // Service VT enable/disable. While suspended (another VT foreground)
         // we must not touch the card.
         let _ = self.seat.dispatch();
@@ -305,10 +328,16 @@ impl OutputBackend for DrmOutput {
 
         let back = self.back;
         let pitch = self.bufs[back].pitch() as usize;
+        let rows = self.pending_damage[back];
+        let y0 = rows.y.max(0) as usize;
+        let y1 = ((rows.y + rows.h as i32).max(0) as usize).min(self.height as usize);
         {
             let mut map = self.card.map_dumb_buffer(&mut self.bufs[back])?;
-            blit_rgba_to_xrgb(map.as_mut(), pitch, self.width, self.height, rgba, fw, fh);
+            blit_rgba_to_xrgb(map.as_mut(), pitch, self.width, self.height, rgba, fw, fh, y0, y1);
         }
+        // This slot now matches the source for everything in [y0, y1) — the
+        // only rows it was behind on.
+        self.pending_damage[back] = Rect { x: 0, y: 0, w: 0, h: 0 };
 
         if !self.flip_pending {
             match self
@@ -366,6 +395,13 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
 
 /// Repack compositor RGBA (R,G,B,A) into KMS XRGB8888 little-endian (B,G,R,X),
 /// honouring the destination pitch and clipping to the overlap of frame/display.
+/// Only rows in `[y0, y1)` are touched — callers pass the rest of the buffer's
+/// existing content is assumed still correct (buffer-age damage tracking in
+/// `render_frame` guarantees that). Full row width is still copied within
+/// that range regardless of the source damage rect's x-extent: the source
+/// `src` is always a complete, correct frame (composite never produces a
+/// partial one), so widening within an already-included row wastes a few
+/// bytes, never risks correctness.
 fn blit_rgba_to_xrgb(
     dst: &mut [u8],
     pitch: usize,
@@ -374,12 +410,14 @@ fn blit_rgba_to_xrgb(
     src: &[u8],
     sw: u32,
     sh: u32,
+    y0: usize,
+    y1: usize,
 ) {
     let copy_w = dw.min(sw) as usize;
     let copy_h = dh.min(sh) as usize;
     let src_pitch = (sw as usize) * 4;
 
-    for y in 0..dh as usize {
+    for y in y0..y1.min(dh as usize) {
         let drow = &mut dst[y * pitch..y * pitch + (dw as usize) * 4];
         if y >= copy_h {
             drow.fill(0);

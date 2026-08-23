@@ -129,6 +129,8 @@ pub enum Action {
     Close,
     ResizeGrow,
     ResizeShrink,
+    /// Switch between Dwindle and Scroll tiling modes.
+    ToggleLayout,
     Launch(String),
 }
 
@@ -144,6 +146,7 @@ impl Action {
             Self::Close        => "close window".to_string(),
             Self::ResizeGrow   => "resize grow".to_string(),
             Self::ResizeShrink => "resize shrink".to_string(),
+            Self::ToggleLayout => "toggle layout mode".to_string(),
             Self::Launch(cmd)  => format!("launch: {cmd}"),
         }
     }
@@ -177,6 +180,7 @@ impl Default for Keybinds {
                 ('q', Action::Close),
                 ('=', Action::ResizeGrow),
                 ('-', Action::ResizeShrink),
+                ('w', Action::ToggleLayout),
             ],
         }
     }
@@ -193,7 +197,7 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         .unwrap_or(default.mod_key);
 
     // (Lua field name, Action) — order here is the help-menu display order.
-    const FIELDS: [(&str, Action); 9] = [
+    const FIELDS: [(&str, Action); 10] = [
         ("focus_left",    Action::FocusLeft),
         ("focus_right",   Action::FocusRight),
         ("focus_up",      Action::FocusUp),
@@ -203,6 +207,7 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         ("close",         Action::Close),
         ("resize_grow",   Action::ResizeGrow),
         ("resize_shrink", Action::ResizeShrink),
+        ("toggle_layout", Action::ToggleLayout),
     ];
 
     let mut binds: Vec<(char, Action)> = FIELDS.iter().map(|(field, action)| {

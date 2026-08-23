@@ -97,6 +97,29 @@ impl InputBackend for EvdevInput {
                 for dev in &mut devices {
                     let _ = dev.grab();
                 }
+                // Any modifier held when we went inactive may never have had
+                // its release delivered: events that arrive while inactive
+                // are drained above (must be, or the device queue backs up)
+                // but never passed through `handle_event` (see the `if
+                // active` guard below), so if the physical release happened
+                // on the other VT, the compositor's own keyboard state never
+                // heard about it — stuck holding a phantom modifier forever
+                // after. Synthesize the release now, for both L/R variants
+                // regardless of which was actually pressed (ctrl_held/
+                // alt_held conflate them already, and releasing an
+                // already-released key is a no-op — safe either way). If the
+                // key is in fact still physically down, the next real event
+                // reasserts it correctly; this only ever clears a phantom.
+                if ctrl_held {
+                    let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL as u32, mods: 0, pressed: false });
+                    let _ = tx.send(InputCmd::Key { keycode: KEY_RIGHTCTRL as u32, mods: 0, pressed: false });
+                    ctrl_held = false;
+                }
+                if alt_held {
+                    let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT as u32, mods: 0, pressed: false });
+                    let _ = tx.send(InputCmd::Key { keycode: KEY_RIGHTALT as u32, mods: 0, pressed: false });
+                    alt_held = false;
+                }
                 was_active = true;
             }
 

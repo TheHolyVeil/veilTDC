@@ -5,6 +5,7 @@
 //! /dev/fb0, sixel, iterm2, DRM dumb buffers tomorrow.
 
 use std::sync::Arc;
+use crate::layout::Rect;
 
 /// One rendered frame of the hosted scene.
 ///
@@ -21,4 +22,12 @@ pub struct Frame {
     pub height: u32,
     /// Monotonic frame counter from the compositor. Useful for skip detection.
     pub serial: u64,
+    /// Bounding box of what actually changed since the last frame — always
+    /// present and always `rgba`-full-size-or-smaller, never a precise
+    /// region list. Composite itself still fully recomputes `rgba` every
+    /// tick (correctness first); this is purely so an output backend that
+    /// *can* skip unchanged rows (DRM's dumb-buffer copy) does. Backends
+    /// that can't easily do partial redraw (terminal cell encoding) are
+    /// free to ignore it and redraw everything, same as before this existed.
+    pub damage: Rect,
 }

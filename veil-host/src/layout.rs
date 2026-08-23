@@ -25,6 +25,28 @@ impl Rect {
     fn center(&self) -> (i32, i32) {
         (self.x + self.w as i32 / 2, self.y + self.h as i32 / 2)
     }
+
+    /// Smallest rect containing both `self` and `other`. Used to accumulate
+    /// damage: each changed region gets unioned into a running bounding box
+    /// rather than tracked as an exact list, so composite only needs to
+    /// carry one rect per frame instead of an unbounded set.
+    pub fn union(&self, other: &Rect) -> Rect {
+        let x0 = self.x.min(other.x);
+        let y0 = self.y.min(other.y);
+        let x1 = (self.x + self.w as i32).max(other.x + other.w as i32);
+        let y1 = (self.y + self.h as i32).max(other.y + other.h as i32);
+        Rect { x: x0, y: y0, w: (x1 - x0).max(0) as u32, h: (y1 - y0).max(0) as u32 }
+    }
+
+    /// Clip to `[0,0]..[max_w,max_h]` — defensive against a stale damage
+    /// rect referencing dimensions from before an output resize.
+    pub fn clamp_to(&self, max_w: u32, max_h: u32) -> Rect {
+        let x0 = self.x.max(0).min(max_w as i32);
+        let y0 = self.y.max(0).min(max_h as i32);
+        let x1 = (self.x + self.w as i32).max(0).min(max_w as i32);
+        let y1 = (self.y + self.h as i32).max(0).min(max_h as i32);
+        Rect { x: x0, y: y0, w: (x1 - x0).max(0) as u32, h: (y1 - y0).max(0) as u32 }
+    }
 }
 
 /// Direction for spatial focus movement.
@@ -43,29 +65,93 @@ const MAX_RATIO: f32 = 0.9;
 /// Per-keypress adjustment for `resize_grow`/`resize_shrink`.
 const RESIZE_STEP: f32 = 0.05;
 
+/// Which tiling algorithm computes rects for the current window set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// v2.0 behavior — 1..4 windows via recursive splits, 5+ stacks on the
+    /// last cell (unusable past 4). Default, unchanged.
+    Dwindle,
+    /// Horizontal scrolling strip (PaperWM/niri-style). Every window gets a
+    /// fixed-width column; no cap on window count — excess windows scroll
+    /// off-screen instead of shrinking. No separate scroll-position field:
+    /// the viewport is always derived from `focused`, the same way dwindle's
+    /// rects are always derived from `flip`/`split_ratio` rather than
+    /// cached — one less piece of state that can drift out of sync.
+    Scroll,
+}
+
 /// Tiling state not derivable from the window list.
 pub struct Layout {
     /// Index (into the live-toplevel order) of the focused window.
     pub focused: usize,
-    /// `rotate_split` toggles this — flips the primary split axis.
+    /// `rotate_split` toggles this — flips the primary split axis. Unused
+    /// in `Scroll` mode (no axis to flip in a linear strip); harmless no-op
+    /// there, not worth special-casing.
     pub flip: bool,
     /// Primary pane's share of the OUTERMOST split only — adjusted by
     /// `resize_grow`/`resize_shrink` (Super+=/-). The secondary split (the
     /// stack's internal top/bottom for n=3, the whole n=4 grid) always stays
     /// a fixed 50/50; this is dwm-style "mfact", not per-pane resizing.
+    /// In `Scroll` mode this same field/keybinds double as column width
+    /// instead — one ratio, one pair of keybinds, two meanings depending on
+    /// mode, rather than a second ratio field.
     pub split_ratio: f32,
+    /// Which algorithm `rects()` uses. `toggle_mode()` flips it.
+    pub mode: LayoutMode,
 }
 
 impl Default for Layout {
     fn default() -> Self {
-        Self { focused: 0, flip: false, split_ratio: 0.5 }
+        Self { focused: 0, flip: false, split_ratio: 0.5, mode: LayoutMode::Dwindle }
     }
 }
 
 impl Layout {
+    /// Compute a rect for each of `n` windows filling `w`×`h`. Dispatches on
+    /// `self.mode`; see `rects_dwindle`/`rects_scroll`.
+    pub fn rects(&self, n: usize, w: u32, h: u32) -> Vec<Rect> {
+        match self.mode {
+            LayoutMode::Dwindle => self.rects_dwindle(n, w, h),
+            LayoutMode::Scroll  => self.rects_scroll(n, w, h),
+        }
+    }
+
+    /// Switch between `Dwindle` and `Scroll`. Deliberately just these two —
+    /// a master/stack third mode is cheap to add the same way later if
+    /// wanted, but doesn't solve "more than ~4 windows" any better than
+    /// dwindle does (still bounded by the fixed viewport), so it's not part
+    /// of this pass.
+    pub fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            LayoutMode::Dwindle => LayoutMode::Scroll,
+            LayoutMode::Scroll  => LayoutMode::Dwindle,
+        };
+    }
+
+    /// Horizontal scrolling strip: every window gets a fixed-width column
+    /// (`split_ratio` of output width, same clamp/keybinds as dwindle's
+    /// primary-pane ratio), positioned left-to-right by index, scrolled so
+    /// the focused column is left-aligned in the viewport. Columns off to
+    /// either side simply have rects outside `[0,w)` — `blit()` in
+    /// server.rs already clips to the composite buffer bounds for every
+    /// blit regardless of mode, so an off-screen rect is a correct, safe
+    /// no-op, not a special case this function has to handle.
+    fn rects_scroll(&self, n: usize, w: u32, h: u32) -> Vec<Rect> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let ratio = self.split_ratio.clamp(MIN_RATIO, MAX_RATIO);
+        let col_w = ((w as f32) * ratio).round().max(1.0) as u32;
+        let focused = self.focused.min(n - 1);
+        let offset = focused as i32 * col_w as i32;
+        (0..n)
+            .map(|i| Rect { x: i as i32 * col_w as i32 - offset, y: 0, w: col_w, h })
+            .collect()
+    }
+
     /// Compute a rect for each of `n` windows filling `w`×`h`. Always returns
     /// exactly `n` rects; windows past the 4th reuse the last cell.
-    pub fn rects(&self, n: usize, w: u32, h: u32) -> Vec<Rect> {
+    fn rects_dwindle(&self, n: usize, w: u32, h: u32) -> Vec<Rect> {
         if n == 0 {
             return Vec::new();
         }
@@ -323,5 +409,66 @@ mod tests {
         // secondary (stacked) column's internal top/bottom split stays 50/50
         assert_eq!(r[1].h, 40);
         assert_eq!(r[2].h, 40);
+    }
+
+    #[test]
+    fn toggle_mode_round_trips() {
+        let mut l = Layout::default();
+        assert_eq!(l.mode, LayoutMode::Dwindle);
+        l.toggle_mode();
+        assert_eq!(l.mode, LayoutMode::Scroll);
+        l.toggle_mode();
+        assert_eq!(l.mode, LayoutMode::Dwindle);
+    }
+
+    #[test]
+    fn scroll_mode_focused_column_left_aligned() {
+        let mut l = Layout { mode: LayoutMode::Scroll, ..Default::default() };
+        let r = l.rects(5, 100, 80);
+        assert_eq!(r.len(), 5);
+        // focused defaults to 0 — its column should sit exactly at x=0.
+        assert_eq!(r[0], Rect { x: 0, y: 0, w: 50, h: 80 }); // split_ratio 0.5 → col_w 50
+        assert_eq!(r[1], Rect { x: 50, y: 0, w: 50, h: 80 });
+
+        l.focused = 2;
+        let r = l.rects(5, 100, 80);
+        assert_eq!(r[2].x, 0); // now column 2 is the one left-aligned
+        assert_eq!(r[0].x, -100); // columns before it scroll off to the left
+        assert_eq!(r[4].x, 100);  // columns after it sit further right
+    }
+
+    #[test]
+    fn scroll_mode_has_no_window_count_cap() {
+        // The actual bug being fixed: dwindle stacks everything past 4 on
+        // one cell. Scroll must give every window its own distinct rect
+        // regardless of count.
+        let l = Layout { mode: LayoutMode::Scroll, ..Default::default() };
+        let r = l.rects(12, 100, 80);
+        assert_eq!(r.len(), 12);
+        let mut xs: Vec<i32> = r.iter().map(|rect| rect.x).collect();
+        xs.sort();
+        xs.dedup();
+        assert_eq!(xs.len(), 12); // every column is at a distinct x — none reused
+    }
+
+    #[test]
+    fn scroll_mode_resize_changes_column_width() {
+        let mut l = Layout { mode: LayoutMode::Scroll, ..Default::default() };
+        l.resize_grow();
+        let r = l.rects(3, 100, 80);
+        assert!(r[0].w > 50); // same split_ratio knob, reused as column width
+    }
+
+    #[test]
+    fn scroll_mode_focus_navigates_and_autoscrolls() {
+        // focus() is untouched/reused as-is for Scroll mode — this proves it
+        // still does the right thing when rects are a strict left-to-right
+        // strip instead of dwindle's 2D layout.
+        let mut l = Layout { mode: LayoutMode::Scroll, ..Default::default() };
+        let r = l.rects(5, 100, 80);
+        l.focus(&r, Dir::Right);
+        assert_eq!(l.focused, 1);
+        let r = l.rects(5, 100, 80); // viewport re-derived from new focused
+        assert_eq!(r[1].x, 0); // auto-scrolled so column 1 is now left-aligned
     }
 }

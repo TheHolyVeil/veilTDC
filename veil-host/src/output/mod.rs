@@ -8,6 +8,7 @@ pub mod terminal;
 pub mod drm;
 
 use std::io;
+use crate::layout::Rect;
 
 pub use terminal::TerminalOutput;
 pub use drm::DrmOutput;
@@ -18,7 +19,13 @@ pub use drm::DrmOutput;
 /// the main thread for its whole lifetime. The frame loop never moves it.
 pub trait OutputBackend {
     /// Render an RGBA frame. Blocks until complete or error.
-    fn render_frame(&mut self, rgba: &[u8], width: u32, height: u32) -> io::Result<()>;
+    ///
+    /// `damage`: bounding box of what changed since the last frame (always
+    /// present, may equal the full frame). Backends that can cheaply skip
+    /// unchanged regions (DRM's dumb-buffer copy) should use it; backends
+    /// that can't (terminal cell encoding, today) are free to ignore it and
+    /// redraw everything, same as before this parameter existed.
+    fn render_frame(&mut self, rgba: &[u8], width: u32, height: u32, damage: Rect) -> io::Result<()>;
 
     /// Get current output dimensions in pixels.
     fn get_size(&self) -> (u32, u32);

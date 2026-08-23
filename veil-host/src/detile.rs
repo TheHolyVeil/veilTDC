@@ -35,20 +35,20 @@ impl GpuImporter {
     pub fn new() -> Option<Self> {
         let fd = open_render_node()?;
         let gbm = GbmDevice::new(DrmDeviceFd::new(DeviceFd::from(fd)))
-            .map_err(|e| eprintln!("[veil-host] gpu: gbm open failed: {e}"))
-            .ok()?;
+        .map_err(|e| eprintln!("[veil-host] gpu: gbm open failed: {e}"))
+        .ok()?;
         // SAFETY: `gbm` outlives the display for the program's lifetime (moved in).
         let display = unsafe { EGLDisplay::new(gbm) }
-            .map_err(|e| eprintln!("[veil-host] gpu: EGL display failed: {e}"))
-            .ok()?;
+        .map_err(|e| eprintln!("[veil-host] gpu: EGL display failed: {e}"))
+        .ok()?;
         let context = EGLContext::new(&display)
-            .map_err(|e| eprintln!("[veil-host] gpu: EGL context failed: {e}"))
-            .ok()?;
+        .map_err(|e| eprintln!("[veil-host] gpu: EGL context failed: {e}"))
+        .ok()?;
         // SAFETY: context is current-able on this (the compositor) thread and
         // never moved off it — GpuImporter lives in State, which is thread-local.
         let renderer = unsafe { GlesRenderer::new(context) }
-            .map_err(|e| eprintln!("[veil-host] gpu: GLES renderer failed: {e}"))
-            .ok()?;
+        .map_err(|e| eprintln!("[veil-host] gpu: GLES renderer failed: {e}"))
+        .ok()?;
         eprintln!("[veil-host] gpu: dmabuf importer ready (tiled buffers enabled)");
         Some(Self { renderer })
     }
@@ -74,10 +74,10 @@ impl GpuImporter {
         let w = dmabuf.width();
         let h = dmabuf.height();
         let tex = self
-            .renderer
-            .import_dmabuf(dmabuf, None)
-            .map_err(|e| eprintln!("[veil-host] gpu: import_dmabuf failed: {e}"))
-            .ok()?;
+        .renderer
+        .import_dmabuf(dmabuf, None)
+        .map_err(|e| eprintln!("[veil-host] gpu: import_dmabuf failed: {e}"))
+        .ok()?;
         let region = Rectangle::from_size((w as i32, h as i32).into());
 
         // Scope the mapping so its full-screen PBO drops (queues for deletion)
@@ -86,17 +86,17 @@ impl GpuImporter {
         let out = {
             // Abgr8888 little-endian = bytes R,G,B,A in memory — exactly SurfaceBuf.
             let mapping = self
-                .renderer
-                .copy_texture(&tex, region, Fourcc::Abgr8888)
-                .map_err(|e| eprintln!("[veil-host] gpu: copy_texture failed: {e}"))
-                .ok();
+            .renderer
+            .copy_texture(&tex, region, Fourcc::Abgr8888)
+            .map_err(|e| eprintln!("[veil-host] gpu: copy_texture failed: {e}"))
+            .ok();
             match mapping {
                 Some(m) => self
-                    .renderer
-                    .map_texture(&m)
-                    .map_err(|e| eprintln!("[veil-host] gpu: map_texture failed: {e}"))
-                    .ok()
-                    .map(|bytes| bytes.to_vec()),
+                .renderer
+                .map_texture(&m)
+                .map_err(|e| eprintln!("[veil-host] gpu: map_texture failed: {e}"))
+                .ok()
+                .map(|bytes| bytes.to_vec()),
                 None => None,
             }
         };
@@ -117,7 +117,12 @@ impl GpuImporter {
 }
 
 /// Open the first accessible DRM render node (renderD128..135) read/write.
-fn open_render_node() -> Option<OwnedFd> {
+///
+/// `pub(crate)`: also used by `server.rs` to open a second, independent fd on
+/// the same node for the `linux-drm-syncobj-v1` import device — kept separate
+/// from `GpuImporter`'s own EGL/GBM device so explicit-sync wiring never risks
+/// the working detile path.
+pub(crate) fn open_render_node() -> Option<OwnedFd> {
     use std::fs::OpenOptions;
     for n in 128..=135u32 {
         let path = format!("/dev/dri/renderD{n}");
