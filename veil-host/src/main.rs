@@ -12,6 +12,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+// glibc's malloc routes every buffer in this codebase (surface RGBA copies,
+// composite_buf) through mmap/munmap directly since they're all well above
+// its 128KB threshold — repeated alloc/free of same-sized large blocks is a
+// known fragmentation/RSS-bloat pattern for it. mimalloc handles that case
+// without the auto-tuning pathology. Since the two hot alloc/free paths are
+// now reuse-in-place instead (see server.rs), this is a smaller win than it
+// would've been on its own, but still real for anything still churning
+// (Lua allocations, wayland-server internals, etc).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use veil_host::input_backend::{self, InputCtx, InputGeometry};
 use veil_host::{Host, HostConfig};
 use veil_config::detect_quality;

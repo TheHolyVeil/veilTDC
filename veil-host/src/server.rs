@@ -120,6 +120,11 @@ pub struct State {
     /// GPU dmabuf importer for tiled/non-linear client buffers. `None` when no
     /// render node / EGL is available — veil then stays CPU-only + linear-only.
     pub gpu:               Option<GpuImporter>,
+    /// Whether a DRM render node was found and imports work, per the startup
+    /// probe — governs whether gpu_lazy() will attempt (re)creation at all.
+    pub gpu_available:     bool,
+    /// Whether a DRM render node was found and imports work, per the startup
+    /// probe — governs whether gpu_lazy() will attempt (re)creation at all.
     /// `linux-drm-syncobj-v1` explicit sync. `None` when the render node's
     /// kernel/driver doesn't support `syncobj_eventfd` — commit() then skips
     /// the acquire-fence wait entirely and relies on implicit (kernel dma-buf)
@@ -194,6 +199,10 @@ pub struct State {
     pub pending_copy_out:     bool,
     pub client_has_selection: bool,
     pub composite_buf:        Vec<u8>,
+    /// The Arc we handed to frame_tx last time. Checked next composite via
+    /// Arc::try_unwrap — if the render thread has already dropped its
+    /// clone, we reclaim the allocation instead of allocating fresh.
+    pub prev_frame:           Option<Arc<Vec<u8>>>,
 }
 
 /// Per-surface RGBA cache entry. We re-blit these every dirty tick.
@@ -207,6 +216,27 @@ impl State {
     fn next_serial(&mut self) -> Serial {
         self.serial_counter = self.serial_counter.wrapping_add(1);
         Serial::from(self.serial_counter)
+    }
+
+    /// The GPU importer's EGL/GLES context sits on the render node and costs
+    /// real RSS (Mesa driver-side caches, shader compiler state) just by
+    /// existing — so it's not built at startup. `gpu_available` (set once,
+    /// from the startup probe used to build dmabuf feedback) tells us
+    /// whether a render node was even found; if so, we stand the real
+    /// context up here on the first commit that actually needs it, and keep
+    /// it resident from then on. Sessions that never receive a non-linear
+    /// dmabuf (plain shm clients, XWayland apps, linear-only GL apps) never
+    /// pay for it at all.
+    fn gpu_lazy(&mut self) -> Option<&mut GpuImporter> {
+        if self.gpu.is_none() && self.gpu_available {
+            self.gpu = GpuImporter::new();
+            if self.gpu.is_none() {
+                // Render node was there at boot but init failed now (e.g.
+                // revoked) — stop retrying every commit.
+                self.gpu_available = false;
+            }
+        }
+        self.gpu.as_mut()
     }
 }
 
@@ -286,11 +316,20 @@ impl CompositorHandler for State {
                     }
                 }
 
+                // Reuse last frame's backing Vec for this surface instead of
+                // allocating fresh every commit — same-size redraws (by far
+                // the common case: video, animations, cursor blink) then cost
+                // zero allocator churn instead of a alloc+free of the full
+                // buffer every single commit. Falls back to an empty Vec
+                // (first commit, or previous buffer type was GPU-detiled and
+                // we don't reuse across that boundary — see note below).
+                let mut dest = self.surface_buffers.remove(&surface.id()).map(|b| b.rgba).unwrap_or_default();
+
                 // Try shm first, then dmabuf.
                 let imported = with_buffer_contents(&buffer, |ptr, len, data| {
                     tracing::info!("commit {} shm {}x{} fmt={:?}", surface.id(), data.width, data.height, data.format);
                     let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
-                    shm_to_rgba(raw, &data)
+                    shm_to_rgba_into(raw, &data, &mut dest)
                 })
                 .ok()
                 .flatten()
@@ -303,17 +342,22 @@ impl CompositorHandler for State {
                     // (tiled / implicit modifier) → GPU detile via EGLImage, if
                     // an importer is up; otherwise unsupported → blank.
                     if dmabuf.format().modifier == Modifier::Linear {
-                        import_dmabuf(dmabuf)
-                    } else if let Some(gpu) = self.gpu.as_mut() {
-                        gpu.import(dmabuf)
+                        import_dmabuf_into(dmabuf, &mut dest)
+                    } else if let Some(gpu) = self.gpu_lazy() {
+                        // NOTE: GPU detile path still allocates fresh each
+                        // call (untouched — didn't want to change detile.rs
+                        // without checking its internals first). Reusable
+                        // `dest` is dropped here; not a regression, just not
+                        // the win the other two paths get.
+                        gpu.import(dmabuf).map(|(rgba, w, h)| { dest = rgba; (w, h) })
                     } else {
                         None
                     }
                 });
 
-                if let Some((rgba, w, h)) = imported {
+                if let Some((w, h)) = imported {
                     tracing::info!("commit {} → surface_buffers {}x{}", surface.id(), w, h);
-                    self.surface_buffers.insert(surface.id(), SurfaceBuf { rgba, w, h });
+                    self.surface_buffers.insert(surface.id(), SurfaceBuf { rgba: dest, w, h });
                     match toplevel_rect_for(self, surface) {
                         Some(r) => mark_dirty_rect(self, r),
                         None    => mark_dirty_full(self), // subsurface/popup/cursor — no precise rect
@@ -505,7 +549,9 @@ impl DmabufHandler for State {
         // GPU path: any tiled / non-linear buffer, imported as an EGLImage and
         // read back linear (see detile::GpuImporter). Actually trial-import it
         // now so we only accept what we can genuinely detile.
-        if let Some(gpu) = self.gpu.as_mut() {
+        // First-touch point for a tiled buffer: this is where the lazy GPU
+        // context actually gets stood up (see State::gpu_lazy), not commit().
+        if let Some(gpu) = self.gpu_lazy() {
             if gpu.can_import(&dmabuf) {
                 let _ = notifier.successful::<State>();
                 return;
@@ -649,7 +695,8 @@ fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> DmabufFeedback {
 
 /// Import a linear dmabuf by mmapping plane 0 and converting pixels to RGBA.
 /// Only single-plane ARGB/XRGB/ABGR/XBGR 8888 with linear layout are supported.
-fn import_dmabuf(dmabuf: &Dmabuf) -> Option<(Vec<u8>, u32, u32)> {
+/// Writes into `out` in place instead of allocating — see shm_to_rgba_into.
+fn import_dmabuf_into(dmabuf: &Dmabuf, out: &mut Vec<u8>) -> Option<(u32, u32)> {
     if dmabuf.num_planes() != 1 { return None; }
     let fmt    = dmabuf.format();
     // Backstop: this is the CPU fast path — only ever mmap a LINEAR buffer.
@@ -670,7 +717,8 @@ fn import_dmabuf(dmabuf: &Dmabuf) -> Option<(Vec<u8>, u32, u32)> {
     let pixel_data = raw.get(offset..)?;
     if pixel_data.len() < stride * h { return None; }
 
-    let mut out = Vec::with_capacity(w * h * 4);
+    out.clear();
+    out.reserve(w * h * 4);
     for y in 0..h {
         let row = &pixel_data[y * stride .. y * stride + w * 4];
         for px in row.chunks_exact(4) {
@@ -685,16 +733,20 @@ fn import_dmabuf(dmabuf: &Dmabuf) -> Option<(Vec<u8>, u32, u32)> {
             out.extend_from_slice(&[r, g, b, 255]);
         }
     }
-    Some((out, w as u32, h as u32))
+    Some((w as u32, h as u32))
 }
 
-fn shm_to_rgba(raw: &[u8], data: &smithay::wayland::shm::BufferData) -> Option<(Vec<u8>, u32, u32)> {
+/// Writes into `out` in place instead of allocating — `out.clear()` keeps
+/// its existing heap capacity, so a same-size redraw (the common case)
+/// reuses the same allocation instead of alloc+free every commit.
+fn shm_to_rgba_into(raw: &[u8], data: &smithay::wayland::shm::BufferData, out: &mut Vec<u8>) -> Option<(u32, u32)> {
     let w = data.width  as usize;
     let h = data.height as usize;
     let stride = data.stride as usize;
     if stride < w * 4 || raw.len() < stride * h { return None; }
 
-    let mut out = Vec::with_capacity(w * h * 4);
+    out.clear();
+    out.reserve(w * h * 4);
     for y in 0..h {
         let row_start = data.offset as usize + y * stride;
         let row = &raw[row_start .. row_start + w * 4];
@@ -707,7 +759,7 @@ fn shm_to_rgba(raw: &[u8], data: &smithay::wayland::shm::BufferData) -> Option<(
             out.extend_from_slice(&[r, g, b, 255]);
         }
     }
-    Some((out, w as u32, h as u32))
+    Some((w as u32, h as u32))
 }
 
 /// Alpha-over blit `src` onto `back` at `(x, y)`. Clips to back bounds.
@@ -1165,20 +1217,30 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
 
     state.frame_serial = state.frame_serial.wrapping_add(1);
 
-    // Zero-copy dispatch: swap composite_buf with a fresh Vec so the
-    // compositor can immediately reuse the allocation for the next frame,
-    // while the render thread independently holds the Arc-wrapped old buffer.
+    // Zero-copy dispatch: swap composite_buf out, wrap in Arc, hand to the
+    // render thread. For the *next* frame's buffer: try to reclaim the Arc
+    // we sent last time via try_unwrap — if the render thread already
+    // dropped its clone (the common case; it's the bottleneck, not us),
+    // that's a real allocation avoided instead of "one alloc per frame no
+    // matter what."
     let mut outgoing = Vec::new();
     std::mem::swap(&mut state.composite_buf, &mut outgoing);
+    let outgoing = Arc::new(outgoing);
+    state.composite_buf = match state.prev_frame.take().map(Arc::try_unwrap) {
+        Some(Ok(mut reclaimed)) => {
+            reclaimed.clear();
+            reclaimed.reserve(needed);
+            reclaimed
+        }
+        // Render thread is still holding its reference (lagging) or this is
+        // the first frame — fall back to a fresh allocation, same as before.
+        _ => Vec::with_capacity(needed),
+    };
+    state.prev_frame = Some(outgoing.clone());
     let _ = state.frame_tx.send(crate::sink::Frame {
-        rgba: Arc::new(outgoing), width: w, height: h, serial: state.frame_serial,
+        rgba: outgoing, width: w, height: h, serial: state.frame_serial,
         damage: frame_damage,
     });
-    // Put a correctly-sized buffer back for next frame. If the channel
-    // consumer drained quickly the Vec may come back via Arc::try_unwrap on
-    // the next composite; for now just allocate a new one (still cheaper than
-    // the old .clone() — only one allocation per frame vs a full memcpy).
-    state.composite_buf = Vec::with_capacity(needed);
 
     // Fire frame callbacks now that we've consumed and displayed this frame.
     // Chromium uses these as vsync: it won't submit the next buffer until
@@ -1571,7 +1633,17 @@ pub fn run(
     // Bring up the GPU dmabuf importer (EGL/GLES on the render node). None if
     // there's no GPU / EGL — veil then stays CPU-only + linear-only. Created
     // before the dmabuf global so feedback can advertise its formats.
-    let gpu = GpuImporter::new();
+    // Probe once, here, purely to learn what the render node can import —
+    // that result gets baked into the dmabuf feedback below so feedback-aware
+    // clients (niri, Hyprland, GL/Vulkan apps) still know to send us tiled
+    // buffers. The actual EGL/GLES context (the expensive part — Mesa
+    // driver-side caches, shader compiler state) is dropped right after and
+    // only stood back up lazily, in State::gpu_lazy(), on the first commit
+    // that actually hands us a non-linear buffer. Sessions that never do
+    // (plain shm clients, XWayland apps, linear-only GL apps) never pay for
+    // a live context at all.
+    let gpu_probe = GpuImporter::new();
+    let gpu_available = gpu_probe.is_some();
 
     // Explicit sync (linux-drm-syncobj-v1): a second, independent fd on the
     // same render node used only to import client syncobj timelines and
@@ -1594,7 +1666,8 @@ pub fn run(
     // we can import (linear always; tiled too when the GPU importer is up).
     // Feedback-aware clients allocate accordingly; we detile tiled buffers.
     let mut dmabuf_state  = DmabufState::new();
-    let dmabuf_feedback   = build_dmabuf_feedback(&gpu);
+    let dmabuf_feedback   = build_dmabuf_feedback(&gpu_probe);
+    drop(gpu_probe); // real context recreated lazily by gpu_lazy() when actually needed
     let _dmabuf_global    = dmabuf_state.create_global_with_default_feedback::<State>(&dh, &dmabuf_feedback);
     let _data_device          = DataDeviceState::new::<State>(&dh);
     let _xdg_decoration       = XdgDecorationState::new::<State>(&dh);
@@ -1654,7 +1727,8 @@ pub fn run(
         compositor_state, xdg_shell_state, shm_state, seat_state,
         xdg_activation, output_manager,
         dmabuf_state, _dmabuf_global,
-        gpu,
+        gpu:                  None, // stood up lazily by gpu_lazy() on first non-linear commit
+        gpu_available,
         syncobj_state,
         _data_device,
         _xdg_decoration, _viewporter, _fractional, _presentation,
@@ -1692,6 +1766,7 @@ pub fn run(
         pending_copy_out:     false,
         client_has_selection: false,
         composite_buf:        Vec::new(),
+        prev_frame:           None,
     };
 
     let mut data = LoopData { state, display };

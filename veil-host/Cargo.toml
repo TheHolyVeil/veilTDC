@@ -28,3 +28,4 @@ wayland-protocols  = { version = "0.32", features = ["server"] }
 wayland-server     = "0.31"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wl-clipboard-rs = "0.9"
+mimalloc        = "0.1.52"
