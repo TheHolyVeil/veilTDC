@@ -131,6 +131,10 @@ pub enum Action {
     ResizeShrink,
     /// Switch between Dwindle and Scroll tiling modes.
     ToggleLayout,
+    /// Fullscreen the focused window (compositor-triggered — same effect as
+    /// a client's own fullscreen request, just initiated from a keybind
+    /// instead of waiting for the app to ask).
+    ToggleFullscreen,
     Launch(String),
 }
 
@@ -147,6 +151,7 @@ impl Action {
             Self::ResizeGrow   => "resize grow".to_string(),
             Self::ResizeShrink => "resize shrink".to_string(),
             Self::ToggleLayout => "toggle layout mode".to_string(),
+            Self::ToggleFullscreen => "toggle fullscreen".to_string(),
             Self::Launch(cmd)  => format!("launch: {cmd}"),
         }
     }
@@ -181,6 +186,7 @@ impl Default for Keybinds {
                 ('=', Action::ResizeGrow),
                 ('-', Action::ResizeShrink),
                 ('w', Action::ToggleLayout),
+                ('f', Action::ToggleFullscreen),
             ],
         }
     }
@@ -197,7 +203,7 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         .unwrap_or(default.mod_key);
 
     // (Lua field name, Action) — order here is the help-menu display order.
-    const FIELDS: [(&str, Action); 10] = [
+    const FIELDS: [(&str, Action); 11] = [
         ("focus_left",    Action::FocusLeft),
         ("focus_right",   Action::FocusRight),
         ("focus_up",      Action::FocusUp),
@@ -208,6 +214,7 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         ("resize_grow",   Action::ResizeGrow),
         ("resize_shrink", Action::ResizeShrink),
         ("toggle_layout", Action::ToggleLayout),
+        ("fullscreen",    Action::ToggleFullscreen),
     ];
 
     let mut binds: Vec<(char, Action)> = FIELDS.iter().map(|(field, action)| {

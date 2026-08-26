@@ -41,10 +41,10 @@ use smithay::{
     output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
     reexports::wayland_server::{
         backend::{ClientData, ClientId, DisconnectReason, ObjectId},
-        protocol::{wl_buffer, wl_seat, wl_shm, wl_surface::WlSurface},
+        protocol::{wl_buffer, wl_output, wl_seat, wl_shm, wl_surface::WlSurface},
         Client, Display, DisplayHandle, Resource,
     },
-    utils::{DeviceFd, Logical, Point, Serial, Transform},
+    utils::{DeviceFd, Logical, Point, Rectangle, Serial, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -88,9 +88,13 @@ use smithay::{
         drm_syncobj::{
             supports_syncobj_eventfd, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState,
         },
+        xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     },
-    xwayland::{XWayland, XWaylandClientData, XWaylandEvent},
-    delegate_drm_syncobj,
+    xwayland::{
+        XWayland, XWaylandClientData, XWaylandEvent, X11Surface, X11Wm, XwmHandler,
+        xwm::{Reorder, ResizeEdge, X11Window, XwmId},
+    },
+    delegate_drm_syncobj, delegate_xwayland_shell,
     backend::drm::DrmDeviceFd,
 };
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
@@ -107,6 +111,83 @@ use crate::detile::GpuImporter;
 use crate::launcher::Launcher;
 
 // ─── State ────────────────────────────────────────────────────────────────────
+
+/// Unifies xdg-shell and X11 (XWayland) top-level windows so relayout,
+/// composite, and input don't need to branch on protocol origin. Deliberately
+/// NOT smithay::desktop::Window — that drags in Space assumptions this file
+/// doesn't use (compositing here is manual, no Space).
+pub enum Window {
+    Xdg(ToplevelSurface),
+    X11(X11Surface),
+}
+
+impl Window {
+    /// False once the client destroys it (xdg) or the X connection drops it.
+    pub fn alive(&self) -> bool {
+        match self {
+            Window::Xdg(t) => t.alive(),
+            Window::X11(x) => x.alive(),
+        }
+    }
+
+    /// `None` for an X11 window created but not yet paired with its
+    /// wl_surface (see XWaylandShellHandler::surface_associated) — callers
+    /// must skip these the same way they already skip bufferless toplevels.
+    pub fn wl_surface(&self) -> Option<WlSurface> {
+        match self {
+            Window::Xdg(t) => Some(t.wl_surface().clone()),
+            Window::X11(x) => x.wl_surface(),
+        }
+    }
+
+    /// Push a tiled rect + activation/fullscreen state. Xdg: async
+    /// configure/ack via with_pending_state + send_configure. X11:
+    /// configure() is synchronous and — unlike xdg — must carry absolute
+    /// position, not just size. Safe to call before the window is
+    /// paired/mapped; X11 configure doesn't need either.
+    pub fn configure_size(&self, rect: Rect, activated: bool, fullscreen: bool) {
+        match self {
+            Window::Xdg(t) => {
+                t.with_pending_state(|s| {
+                    s.size = Some((rect.w as i32, rect.h as i32).into());
+                    if activated {
+                        s.states.set(xdg_toplevel::State::Activated);
+                    } else {
+                        s.states.unset(xdg_toplevel::State::Activated);
+                    }
+                    if fullscreen {
+                        s.states.set(xdg_toplevel::State::Fullscreen);
+                    } else {
+                        s.states.unset(xdg_toplevel::State::Fullscreen);
+                    }
+                });
+                t.send_configure();
+            }
+            Window::X11(surf) => {
+                let _ = surf.configure(Rectangle::new(
+                    Point::from((rect.x, rect.y)),
+                    Size::from((rect.w as i32, rect.h as i32)),
+                ));
+                let _ = surf.set_activated(activated);
+                // Updates _NET_WM_STATE so the client's own idea of its
+                // fullscreen state matches ours — without this a well-behaved
+                // client can get confused about whether its request "took"
+                // and keep re-requesting.
+                let _ = surf.set_fullscreen(fullscreen);
+            }
+        }
+    }
+
+    /// Ask the client to close. Xdg: xdg_toplevel.close event, client may
+    /// ignore it. X11: sends WM_DELETE_WINDOW / kills the connection per
+    /// smithay's close(), same "may be ignored" caveat applies.
+    pub fn close_window(&self) {
+        match self {
+            Window::Xdg(t) => t.send_close(),
+            Window::X11(x) => { let _ = x.close(); }
+        }
+    }
+}
 
 pub struct State {
     pub compositor_state:  CompositorState,
@@ -152,7 +233,21 @@ pub struct State {
     /// Last absolute pointer position; pointer.motion() needs an absolute
     /// location, so we keep track of it across button/scroll events.
     pub pointer_pos:       (f64, f64),
-    pub toplevels:         Vec<ToplevelSurface>,
+    pub toplevels:         Vec<Window>,
+    /// The one window currently fullscreen, if any — identified by
+    /// wl_surface rather than a toplevels index, since indices shift on
+    /// insert/remove but a WlSurface identity doesn't. relayout() looks up
+    /// its current position each call rather than trusting a stored index.
+    pub fullscreen:        Option<WlSurface>,
+    /// Override-redirect X11 windows (menus, tooltips, Steam's own popups) —
+    /// unmanaged, positioned absolutely by the client itself, never tiled.
+    /// Painted last (topmost) every composite. See mapped_override_redirect_window.
+    pub floating:          Vec<X11Surface>,
+    /// X11 window manager for the XWayland connection — `None` until
+    /// XWaylandEvent::Ready fires and start_wm succeeds (or if Xwayland
+    /// isn't installed).
+    pub xwm:               Option<X11Wm>,
+    pub xwayland_shell_state: XWaylandShellState,
     /// Dwindle tiling state (focus + split orientation).
     pub layout:            Layout,
     /// Per-window rects, indexed to match the live-toplevel order. Recomputed
@@ -424,7 +519,7 @@ impl XdgShellHandler for State {
         let kb = self.keyboard.clone();
         kb.set_focus(self, Some(wl), serial);
 
-        self.toplevels.push(surface);
+        self.toplevels.push(Window::Xdg(surface));
         // New window takes focus; retile so every window gets its rect + size.
         let n = self.toplevels.iter().filter(|t| t.alive()).count();
         self.layout.focused = n.saturating_sub(1);
@@ -442,6 +537,25 @@ impl XdgShellHandler for State {
     }
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
     fn reposition_request(&mut self, _s: PopupSurface, _p: PositionerState, _t: u32) {}
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<wl_output::WlOutput>) {
+        let wl = surface.wl_surface().clone();
+        if let Some(i) = self.toplevels.iter().filter(|t| t.alive())
+            .position(|t| t.wl_surface().as_ref() == Some(&wl))
+        {
+            self.layout.focused = i;
+        }
+        self.fullscreen = Some(wl);
+        relayout(self);
+        refocus_keyboard(self);
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        if self.fullscreen.as_ref() == Some(surface.wl_surface()) {
+            self.fullscreen = None;
+            relayout(self);
+        }
+    }
 }
 
 impl SeatHandler for State {
@@ -571,6 +685,15 @@ impl DrmSyncobjHandler for State {
     }
 }
 
+impl XWaylandShellHandler for State {
+    fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
+        &mut self.xwayland_shell_state
+    }
+    // surface_associated default (no-op) is fine — X11Surface::wl_surface()
+    // reflects the pairing automatically once smithay's own bookkeeping
+    // completes; we don't need a notification hook for it.
+}
+
 impl XdgDecorationHandler for State {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         // We don't draw decorations; ask client to do it itself.
@@ -638,6 +761,7 @@ delegate_presentation!(State);
 // master-branch-only and not in this pinned version), hence its own macro
 // rather than the generic delegate_dispatch2! bridge.
 delegate_drm_syncobj!(State);
+delegate_xwayland_shell!(State);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -933,12 +1057,26 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
         Rotate => state.layout.rotate_split(),
         Close => {
             if let Some(tl) = state.toplevels.iter().filter(|t| t.alive()).nth(state.layout.focused) {
-                tl.send_close();
+                tl.close_window();
             }
         }
         ResizeGrow   => state.layout.resize_grow(),
         ResizeShrink => state.layout.resize_shrink(),
         ToggleLayout => state.layout.toggle_mode(),
+        ToggleFullscreen => {
+            let focused_wl = state.toplevels.iter().filter(|t| t.alive())
+                .nth(state.layout.focused)
+                .and_then(|t| t.wl_surface());
+            match (&state.fullscreen, &focused_wl) {
+                // Already fullscreen on the focused window — toggle off.
+                (Some(fs), Some(f)) if fs == f => state.fullscreen = None,
+                // Nothing focused-fullscreen yet (including: something ELSE
+                // is fullscreen and you've since focused a different
+                // window) — fullscreen whichever window has focus now.
+                (_, Some(f)) => state.fullscreen = Some(f.clone()),
+                (_, None) => {}
+            }
+        }
         Launch(cmd)  => spawn_command(&state.socket_name, &cmd),
     }
     relayout(state);
@@ -1041,19 +1179,38 @@ fn relayout(state: &mut State) {
         state.layout.focused = n.saturating_sub(1);
     }
     let focused = state.layout.focused;
-    let rects = state.layout.rects(n, state.output_w, state.output_h);
 
-    for (i, tl) in state.toplevels.iter().filter(|t| t.alive()).enumerate() {
-        let r = rects[i];
-        tl.with_pending_state(|s| {
-            s.size = Some((r.w as i32, r.h as i32).into());
-            if i == focused {
-                s.states.set(xdg_toplevel::State::Activated);
-            } else {
-                s.states.unset(xdg_toplevel::State::Activated);
-            }
-        });
-        tl.send_configure();
+    // Same alive-only sequence configure/composite/pick_focus all already
+    // use — index into THIS, not the raw toplevels vec.
+    let alive: Vec<&Window> = state.toplevels.iter().filter(|t| t.alive()).collect();
+
+    // Which (alive-sequence) index, if any, is the fullscreen window right
+    // now. Looked up by identity every call rather than cached, since
+    // `state.fullscreen` only stores a WlSurface, not a position.
+    let fs_idx = state.fullscreen.as_ref().and_then(|fs| {
+        alive.iter().position(|t| t.wl_surface().as_ref() == Some(fs))
+    });
+
+    // Everyone tiles exactly as if nothing were fullscreen — this is what
+    // keeps the *other* windows' positions stable across a fullscreen
+    // toggle instead of re-tiling around the gap (previously this called
+    // rects(n-1, ...) for "everyone else", which re-tiled them every time
+    // and, in Scroll mode, used the wrong focused index since that mode's
+    // rects depend on it for viewport position — both are what caused
+    // windows to visibly jump/shrink/shift left on fullscreen toggle).
+    // The fullscreen window's rect is simply overridden afterward.
+    let mut rects = state.layout.rects(n, state.output_w, state.output_h);
+    if let Some(fs_i) = fs_idx {
+        rects[fs_i] = Rect { x: 0, y: 0, w: state.output_w, h: state.output_h };
+    }
+
+    for (i, tl) in alive.iter().enumerate() {
+        let is_fs = fs_idx == Some(i);
+        // While something's fullscreen, it's the only thing activated —
+        // matches it visually being the only thing on screen. Otherwise,
+        // normal focus-follows-tiling behavior.
+        let activated = fs_idx.map_or(i == focused, |_| is_fs);
+        tl.configure_size(rects[i], activated, is_fs);
     }
 
     state.layout_rects = rects;
@@ -1066,7 +1223,7 @@ fn refocus_keyboard(state: &mut State) {
     let target = state.toplevels.iter()
         .filter(|t| t.alive())
         .nth(state.layout.focused)
-        .map(|t| t.wl_surface().clone());
+        .and_then(|t| t.wl_surface());
     let serial = state.next_serial();
     let kb = state.keyboard.clone();
     kb.set_focus(state, target, serial);
@@ -1081,7 +1238,7 @@ fn refocus_keyboard(state: &mut State) {
 /// redraw instead of a partial one — it can never cause a stale-pixel bug,
 /// since full-frame damage always covers whatever a precise rect would have.
 fn toplevel_rect_for(state: &State, surface: &WlSurface) -> Option<Rect> {
-    let i = state.toplevels.iter().position(|t| t.wl_surface() == surface)?;
+    let i = state.toplevels.iter().position(|t| t.wl_surface().as_ref() == Some(surface))?;
     state.layout_rects.get(i).copied()
 }
 
@@ -1160,11 +1317,15 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
 
     // Toplevels (root buffer + subsurfaces) then their popups, each at its
     // tiled rect origin. Popups are positioned relative to their toplevel.
-    let toplevels: Vec<WlSurface> = state.toplevels.iter()
+    // Collected as Option so index i still lines up with layout_rects[i] —
+    // an X11 window not yet paired with a wl_surface has nothing to blit,
+    // but it still occupies a tiled slot and must not shift later indices.
+    let toplevels: Vec<Option<WlSurface>> = state.toplevels.iter()
         .filter(|t| t.alive())
-        .map(|t| t.wl_surface().clone())
+        .map(|t| t.wl_surface())
         .collect();
-    for (i, surf) in toplevels.iter().enumerate() {
+    for (i, surf_opt) in toplevels.iter().enumerate() {
+        let Some(surf) = surf_opt else { continue };
         let r = state.layout_rects.get(i).copied()
             .unwrap_or(Rect { x: 0, y: 0, w, h });
         blit_subtree(back, w, h, &state.surface_buffers, surf, (r.x, r.y));
@@ -1172,6 +1333,35 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
             let ps = popup.wl_surface().clone();
             blit_subtree(back, w, h, &state.surface_buffers, &ps, (r.x + off.x, r.y + off.y));
         }
+    }
+
+    // Fullscreen window repaints last among tiled content, regardless of its
+    // position in the loop above — other windows keep their normal (real,
+    // non-full) tiled rects now (see relayout()), so without this, one that
+    // happens to iterate after the fullscreen window in `toplevels` order
+    // could paint its own small rect right over part of it.
+    if let Some(fs) = &state.fullscreen {
+        if let Some(surf) = state.toplevels.iter().filter(|t| t.alive())
+            .find(|t| t.wl_surface().as_ref() == Some(fs))
+            .and_then(|t| t.wl_surface())
+        {
+            blit_subtree(back, w, h, &state.surface_buffers, &surf, (0, 0));
+            for (popup, off) in PopupManager::popups_for_surface(&surf) {
+                let ps = popup.wl_surface().clone();
+                blit_subtree(back, w, h, &state.surface_buffers, &ps, (off.x, off.y));
+            }
+        }
+    }
+
+    // Override-redirect windows (menus, tooltips, dropdowns) — absolute
+    // position from the X server, not a tiled rect. Always on top of tiled
+    // content; smithay updates X11Surface's internal geometry before
+    // configure_notify fires, so .geometry() here is always current, no
+    // caching needed on our side.
+    for f in state.floating.iter().filter(|f| f.alive()) {
+        let Some(surf) = f.wl_surface() else { continue };
+        let g = f.geometry();
+        blit_subtree(back, w, h, &state.surface_buffers, &surf, (g.loc.x, g.loc.y));
     }
 
     // Cursor on top.
@@ -1249,7 +1439,8 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
     let time = state.start_time.elapsed().as_millis() as u32;
     let surfaces: Vec<WlSurface> = state.toplevels.iter()
         .filter(|t| t.alive())
-        .map(|t| t.wl_surface().clone())
+        .filter_map(|t| t.wl_surface())
+        .chain(state.floating.iter().filter(|f| f.alive()).filter_map(|f| f.wl_surface()))
         .collect();
     for s in &surfaces {
         send_frame_callbacks(s, time);
@@ -1397,12 +1588,39 @@ fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::util
     let xi = x as i32;
     let yi = y as i32;
 
+    // Floating (override-redirect) windows first — they're painted on top of
+    // everything in composite(), so they must win hit-testing too, or a
+    // dropdown/menu would be unclickable over the tiled window beneath it.
+    // Last-mapped wins on overlap, same "last wins" convention as popups below.
+    for f in state.floating.iter().rev().filter(|f| f.alive()) {
+        let Some(surf) = f.wl_surface() else { continue };
+        let g = f.geometry();
+        if xi >= g.loc.x && yi >= g.loc.y
+            && xi < g.loc.x + g.size.w && yi < g.loc.y + g.size.h
+        {
+            return Some((surf, (g.loc.x as f64, g.loc.y as f64).into()));
+        }
+    }
+
+    // While something's fullscreen, it's the only tiled thing clickable —
+    // everything else keeps its normal rect (see relayout()) but is
+    // visually covered (see composite()), so hit-testing it would let
+    // clicks fall through to a window you can't actually see.
+    if let Some(fs) = &state.fullscreen {
+        return state.toplevels.iter().filter(|t| t.alive())
+            .find(|t| t.wl_surface().as_ref() == Some(fs))
+            .and_then(|t| t.wl_surface())
+            .map(|surf| (surf, (0.0, 0.0).into()));
+    }
+
     // Live toplevels paired with their tiled rect, topmost (last) first.
-    let live: Vec<WlSurface> = state.toplevels.iter()
+    // Option preserves index alignment with layout_rects (see composite()).
+    let live: Vec<Option<WlSurface>> = state.toplevels.iter()
         .filter(|t| t.alive())
-        .map(|t| t.wl_surface().clone())
+        .map(|t| t.wl_surface())
         .collect();
-    for (i, root) in live.iter().enumerate().rev() {
+    for (i, root_opt) in live.iter().enumerate().rev() {
+        let Some(root) = root_opt else { continue };
         let r = state.layout_rects.get(i).copied()
             .unwrap_or(Rect { x: 0, y: 0, w: state.output_w, h: state.output_h });
 
@@ -1606,6 +1824,234 @@ pub struct LoopData {
     pub display: Display<State>,
 }
 
+/// Shared by unmapped_window and destroyed_window — X11 can in some edge
+/// cases destroy a window without a prior unmap, so both call this and it's
+/// idempotent (retain on an already-removed entry is a no-op). Checks both
+/// lists since we don't always know which one a given window landed in by
+/// the time an unmap/destroy notification arrives.
+fn remove_x11_window(state: &mut State, window: &X11Surface) {
+    if let Some(wl) = window.wl_surface() {
+        if state.fullscreen.as_ref() == Some(&wl) {
+            state.fullscreen = None;
+        }
+    }
+
+    let before = state.toplevels.len();
+    state.toplevels.retain(|w| !matches!(w, Window::X11(x) if x == window));
+    if state.toplevels.len() != before {
+        relayout(state);
+        refocus_keyboard(state);
+    }
+
+    let before = state.floating.len();
+    state.floating.retain(|f| f != window);
+    if state.floating.len() != before {
+        mark_dirty_full(state);
+    }
+}
+
+// X11Wm::start_wm's D type parameter is tied to whatever LoopHandle it's
+// given — ours is LoopHandle<'static, LoopData>, so these two handler traits
+// have to live on LoopData, not State (unlike every other handler in this
+// file, which only ever needs &mut State via Display<State>'s dispatch).
+// Both just forward into the same State fields/logic everything else uses.
+// delegate_xwayland_shell!(State)'s generated Dispatch impls (see smithay's
+// wayland::xwayland_shell) require D: XwmHandler where D=State — that's the
+// piece the first build caught (State: XwmHandler wasn't satisfied). So the
+// real logic has to live here, on State, not just on LoopData. LoopData
+// still needs its own impl too — X11Wm::start_wm<D>'s D is tied to whatever
+// LoopHandle it's given, and ours is LoopHandle<'static, LoopData> — so
+// LoopData's impl below is a thin forward into these.
+impl XwmHandler for State {
+    fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
+        self.xwm.as_mut().expect("XwmHandler called before X11Wm started")
+    }
+
+    fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    // Nothing to do before it's actually mapped — X11 lets a client create a
+    // window well before showing it, same as new_window.
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let _ = window.set_mapped(true);
+        let wl = window.wl_surface();
+        self.toplevels.push(Window::X11(window));
+        let n = self.toplevels.iter().filter(|t| t.alive()).count();
+        self.layout.focused = n.saturating_sub(1);
+        // Only if already paired with a wl_surface (usually is, by this
+        // point) — if not yet, it'll pick up focus on the next natural
+        // refocus_keyboard call (prune tick, next window open/close, etc).
+        if let Some(wl) = wl {
+            let serial = self.next_serial();
+            let kb = self.keyboard.clone();
+            kb.set_focus(self, Some(wl), serial);
+        }
+        relayout(self);
+    }
+
+    // Override-redirect windows (menus, tooltips, Steam's own popups) bypass
+    // the WM entirely and position themselves absolutely — unlike
+    // map_window_request, there's no "please map me" round-trip to answer;
+    // the X server has already mapped it by the time this notification
+    // arrives, so this is purely "start painting it". It goes in `floating`,
+    // not `toplevels`: never tiled, never gets keyboard focus via the
+    // tab/swap cycle, painted topmost every composite (see composite()),
+    // hit-tested first (see pick_focus()).
+    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.floating.push(window);
+        mark_dirty_full(self);
+    }
+
+    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        if !window.is_override_redirect() {
+            let _ = window.set_mapped(false);
+        }
+        remove_x11_window(self, &window);
+    }
+
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        remove_x11_window(self, &window);
+    }
+
+    fn configure_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        x: Option<i32>,
+        y: Option<i32>,
+        w: Option<u32>,
+        h: Option<u32>,
+        _reorder: Option<Reorder>,
+    ) {
+        let mut geo = window.geometry();
+        let or = window.is_override_redirect();
+        if or {
+            // Floating windows own their geometry entirely — this is how a
+            // dropdown/menu ends up positioned where the client wants it.
+            if let Some(x) = x { geo.loc.x = x; }
+            if let Some(y) = y { geo.loc.y = y; }
+        }
+        // Tiling WM: a *managed* window's position is always ours, never
+        // the client's to set — x/y ignored for those (fall through, no
+        // loc change above). Size honored either way, immediately, rather
+        // than making the client wait for the next relayout tick (matches
+        // smithay's own anvil reference).
+        if let Some(w) = w { geo.size.w = w as i32; }
+        if let Some(h) = h { geo.size.h = h as i32; }
+
+        // Heuristic for games/apps that go fullscreen by directly requesting
+        // output-sized geometry instead of the proper EWMH
+        // _NET_WM_STATE_FULLSCREEN path (fullscreen_request below) — same
+        // trick i3 uses for legacy clients. Without this, a managed window
+        // gets the size it asked for but keeps its old tiled x/y (position
+        // is never honored for managed windows, see above), so it renders
+        // output-sized but offset — visibly "half on screen".
+        if !or && w == Some(self.output_w) && h == Some(self.output_h) {
+            if let Some(wl) = window.wl_surface() {
+                if let Some(i) = self.toplevels.iter().filter(|t| t.alive())
+                    .position(|t| t.wl_surface().as_ref() == Some(&wl))
+                {
+                    self.layout.focused = i;
+                }
+                self.fullscreen = Some(wl);
+                relayout(self);
+                refocus_keyboard(self);
+                return; // relayout already configured this window correctly
+            }
+        }
+
+        let _ = window.configure(geo);
+        if or {
+            mark_dirty_full(self);
+        }
+    }
+
+    // Only override-redirect windows can really trigger self-moves under a
+    // real WM (a managed window's geometry is ours, set via configure_size).
+    // smithay updates X11Surface's internal geometry before this fires, so
+    // composite()'s window.geometry() call already sees the new position —
+    // this just needs to trigger the repaint.
+    fn configure_notify(
+        &mut self,
+        _xwm: XwmId,
+        _window: X11Surface,
+        _geometry: Rectangle<i32, Logical>,
+        _above: Option<X11Window>,
+    ) {
+        mark_dirty_full(self);
+    }
+
+    // Tiling WM: geometry is always ours, never interactive. Declining these
+    // is the philosophically correct answer here, same as i3/sway would.
+    fn resize_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32, _edges: ResizeEdge) {}
+    fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {}
+
+    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(wl) = window.wl_surface() else { return };
+        if let Some(i) = self.toplevels.iter().filter(|t| t.alive())
+            .position(|t| t.wl_surface().as_ref() == Some(&wl))
+        {
+            self.layout.focused = i;
+        }
+        self.fullscreen = Some(wl);
+        relayout(self);
+        refocus_keyboard(self);
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(wl) = window.wl_surface() {
+            if self.fullscreen.as_ref() == Some(&wl) {
+                self.fullscreen = None;
+                relayout(self);
+            }
+        }
+    }
+
+    // Selection (clipboard) passthrough for X11 apps — deferred; defaults
+    // (allow_selection_access -> false) are safe, just means no X11<->Wayland
+    // clipboard bridging yet.
+}
+
+impl XWaylandShellHandler for LoopData {
+    fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
+        self.state.xwayland_shell_state()
+    }
+}
+
+impl XwmHandler for LoopData {
+    fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm { self.state.xwm_state(xwm) }
+    fn new_window(&mut self, xwm: XwmId, window: X11Surface) { self.state.new_window(xwm, window) }
+    fn new_override_redirect_window(&mut self, xwm: XwmId, window: X11Surface) {
+        self.state.new_override_redirect_window(xwm, window)
+    }
+    fn map_window_request(&mut self, xwm: XwmId, window: X11Surface) {
+        self.state.map_window_request(xwm, window)
+    }
+    fn mapped_override_redirect_window(&mut self, xwm: XwmId, window: X11Surface) {
+        self.state.mapped_override_redirect_window(xwm, window)
+    }
+    fn unmapped_window(&mut self, xwm: XwmId, window: X11Surface) { self.state.unmapped_window(xwm, window) }
+    fn destroyed_window(&mut self, xwm: XwmId, window: X11Surface) { self.state.destroyed_window(xwm, window) }
+    fn configure_request(
+        &mut self, xwm: XwmId, window: X11Surface,
+        x: Option<i32>, y: Option<i32>, w: Option<u32>, h: Option<u32>, reorder: Option<Reorder>,
+    ) {
+        self.state.configure_request(xwm, window, x, y, w, h, reorder)
+    }
+    fn configure_notify(
+        &mut self, xwm: XwmId, window: X11Surface, geometry: Rectangle<i32, Logical>, above: Option<X11Window>,
+    ) {
+        self.state.configure_notify(xwm, window, geometry, above)
+    }
+    fn resize_request(&mut self, xwm: XwmId, window: X11Surface, button: u32, edges: ResizeEdge) {
+        XwmHandler::resize_request(&mut self.state, xwm, window, button, edges)
+    }
+    fn move_request(&mut self, xwm: XwmId, window: X11Surface, button: u32) {
+        XwmHandler::move_request(&mut self.state, xwm, window, button)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     socket_name: &str,
@@ -1669,6 +2115,10 @@ pub fn run(
     let dmabuf_feedback   = build_dmabuf_feedback(&gpu_probe);
     drop(gpu_probe); // real context recreated lazily by gpu_lazy() when actually needed
     let _dmabuf_global    = dmabuf_state.create_global_with_default_feedback::<State>(&dh, &dmabuf_feedback);
+    // XWayland pairing: lets an X11 window's wl_surface get associated with
+    // its X11Surface (see XWaylandShellHandler::surface_associated). Only
+    // XWayland clients can bind this global.
+    let xwayland_shell_state = XWaylandShellState::new::<State>(&dh);
     let _data_device          = DataDeviceState::new::<State>(&dh);
     let _xdg_decoration       = XdgDecorationState::new::<State>(&dh);
     let _viewporter           = ViewporterState::new::<State>(&dh);
@@ -1739,6 +2189,10 @@ pub fn run(
         output_w: width, output_h: height,
         pointer_pos: (0.0, 0.0),
         toplevels: Vec::new(),
+        fullscreen: None,
+        floating: Vec::new(),
+        xwm: None,
+        xwayland_shell_state,
         layout: Layout::default(),
         layout_rects: Vec::new(),
         keybinds,
@@ -1815,14 +2269,29 @@ pub fn run(
         Stdio::null(),
         |_user_data| {},
     ) {
-        Ok((xwayland, _x_client)) => {
+        Ok((xwayland, x_client)) => {
             let xd = xwayland_display.clone();
-            handle.insert_source(xwayland, move |event, _, _data| {
+            let wm_handle = handle.clone();
+            // Client isn't Clone-relied-on here — Option::take() means this
+            // works regardless, and degrades safely if Ready somehow fired
+            // more than once (it shouldn't).
+            let mut x_client = Some(x_client);
+            handle.insert_source(xwayland, move |event, _, data| {
                 match event {
-                    XWaylandEvent::Ready { x11_socket: _, display_number } => {
+                    XWaylandEvent::Ready { x11_socket, display_number } => {
                         tracing::info!("XWayland ready on DISPLAY=:{display_number}");
                         *xd.lock().unwrap() = Some(display_number);
                         std::env::set_var("DISPLAY", format!(":{display_number}"));
+                        match x_client.take() {
+                            Some(client) => match X11Wm::start_wm(wm_handle.clone(), x11_socket, client) {
+                                Ok(wm) => {
+                                    tracing::info!("X11 window manager started");
+                                    data.state.xwm = Some(wm);
+                                }
+                                Err(e) => tracing::error!("X11Wm::start_wm failed: {e} — X11 apps will not work"),
+                            },
+                            None => tracing::warn!("XWaylandEvent::Ready fired more than once — ignoring"),
+                        }
                     }
                     XWaylandEvent::Error => {
                         tracing::error!("XWayland startup failed");
@@ -1847,6 +2316,24 @@ pub fn run(
         if data.state.toplevels.len() != before {
             relayout(&mut data.state);
             refocus_keyboard(&mut data.state);
+        }
+        // If the fullscreen window was among those just pruned, don't leave
+        // `fullscreen` pointing at a dead surface — relayout() already
+        // treats a not-found fullscreen surface as "nothing fullscreen", so
+        // this is tidiness (no stale handle retained), not a correctness fix.
+        if let Some(wl) = &data.state.fullscreen {
+            if !data.state.toplevels.iter().any(|t| t.wl_surface().as_ref() == Some(wl)) {
+                data.state.fullscreen = None;
+            }
+        }
+
+        // Same backstop for floating (override-redirect) windows — normally
+        // removed explicitly via unmapped_window/destroyed_window, this just
+        // catches anything that slipped through without one firing.
+        let before = data.state.floating.len();
+        data.state.floating.retain(|f| f.alive());
+        if data.state.floating.len() != before {
+            mark_dirty_full(&mut data.state);
         }
 
         // Drain input cmds.
