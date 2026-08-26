@@ -135,24 +135,37 @@ pub enum Action {
     /// a client's own fullscreen request, just initiated from a keybind
     /// instead of waiting for the app to ask).
     ToggleFullscreen,
+    /// Hot-reload config file on demand.
+    ReloadConfig,
+    VolumeUp,
+    VolumeDown,
+    VolumeMute,
+    BrightnessUp,
+    BrightnessDown,
     Launch(String),
 }
 
 impl Action {
     pub fn label(&self) -> String {
         match self {
-            Self::FocusLeft    => "focus left".to_string(),
-            Self::FocusRight   => "focus right".to_string(),
-            Self::FocusUp      => "focus up".to_string(),
-            Self::FocusDown    => "focus down".to_string(),
-            Self::Swap         => "swap with next".to_string(),
-            Self::Rotate       => "rotate split".to_string(),
-            Self::Close        => "close window".to_string(),
-            Self::ResizeGrow   => "resize grow".to_string(),
-            Self::ResizeShrink => "resize shrink".to_string(),
-            Self::ToggleLayout => "toggle layout mode".to_string(),
+            Self::FocusLeft        => "focus left".to_string(),
+            Self::FocusRight       => "focus right".to_string(),
+            Self::FocusUp          => "focus up".to_string(),
+            Self::FocusDown        => "focus down".to_string(),
+            Self::Swap             => "swap with next".to_string(),
+            Self::Rotate           => "rotate split".to_string(),
+            Self::Close            => "close window".to_string(),
+            Self::ResizeGrow       => "resize grow".to_string(),
+            Self::ResizeShrink     => "resize shrink".to_string(),
+            Self::ToggleLayout     => "toggle layout mode".to_string(),
             Self::ToggleFullscreen => "toggle fullscreen".to_string(),
-            Self::Launch(cmd)  => format!("launch: {cmd}"),
+            Self::ReloadConfig     => "reload config".to_string(),
+            Self::VolumeUp         => "volume up".to_string(),
+            Self::VolumeDown       => "volume down".to_string(),
+            Self::VolumeMute       => "toggle mute".to_string(),
+            Self::BrightnessUp     => "brightness up".to_string(),
+            Self::BrightnessDown   => "brightness down".to_string(),
+            Self::Launch(cmd)      => format!("launch: {cmd}"),
         }
     }
 }
@@ -187,6 +200,7 @@ impl Default for Keybinds {
                 ('-', Action::ResizeShrink),
                 ('w', Action::ToggleLayout),
                 ('f', Action::ToggleFullscreen),
+                ('c', Action::ReloadConfig),
             ],
         }
     }
@@ -203,28 +217,34 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         .unwrap_or(default.mod_key);
 
     // (Lua field name, Action) — order here is the help-menu display order.
-    const FIELDS: [(&str, Action); 11] = [
-        ("focus_left",    Action::FocusLeft),
-        ("focus_right",   Action::FocusRight),
-        ("focus_up",      Action::FocusUp),
-        ("focus_down",    Action::FocusDown),
-        ("swap",          Action::Swap),
-        ("rotate",        Action::Rotate),
-        ("close",         Action::Close),
-        ("resize_grow",   Action::ResizeGrow),
-        ("resize_shrink", Action::ResizeShrink),
-        ("toggle_layout", Action::ToggleLayout),
-        ("fullscreen",    Action::ToggleFullscreen),
+    const FIELDS: [(&str, Action); 17] = [
+        ("focus_left",      Action::FocusLeft),
+        ("focus_right",     Action::FocusRight),
+        ("focus_up",        Action::FocusUp),
+        ("focus_down",      Action::FocusDown),
+        ("swap",            Action::Swap),
+        ("rotate",          Action::Rotate),
+        ("close",           Action::Close),
+        ("resize_grow",     Action::ResizeGrow),
+        ("resize_shrink",   Action::ResizeShrink),
+        ("toggle_layout",   Action::ToggleLayout),
+        ("fullscreen",      Action::ToggleFullscreen),
+        ("reload_config",   Action::ReloadConfig),
+        ("volume_up",       Action::VolumeUp),
+        ("volume_down",     Action::VolumeDown),
+        ("volume_mute",     Action::VolumeMute),
+        ("brightness_up",   Action::BrightnessUp),
+        ("brightness_down", Action::BrightnessDown),
     ];
 
-    let mut binds: Vec<(char, Action)> = FIELDS.iter().map(|(field, action)| {
+    let mut binds: Vec<(char, Action)> = FIELDS.iter().filter_map(|(field, action)| {
         let key = t.get::<String>(*field).ok()
             .and_then(|s| s.chars().next())
             .map(|c| c.to_ascii_lowercase())
-            .unwrap_or_else(|| {
-                default.binds.iter().find(|(_, a)| a == action).unwrap().0
-            });
-        (key, action.clone())
+            .or_else(|| {
+                default.binds.iter().find(|(_, a)| a == action).map(|(c, _)| *c)
+            })?;
+        Some((key, action.clone()))
     }).collect();
 
     // App keybinds: keybinds.apps = { b = "helium", t = "kitty" } or global apps table
@@ -306,27 +326,55 @@ impl VeilConfig {
     }
 }
 
-/// Load config from `path`. Falls back to defaults on any error or missing file.
-pub fn load(path: &Path) -> VeilConfig {
+/// Canonical config directory `$XDG_CONFIG_HOME/veil` or `~/.config/veil`.
+fn dirs_config() -> std::path::PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".config")
+        })
+        .join("veil")
+}
+
+/// Resolve the canonical config file path. Checks cwd `./config.lua` first,
+/// then `$XDG_CONFIG_HOME/veil/config.lua` (or `~/.config/veil/config.lua`).
+pub fn config_path() -> Option<std::path::PathBuf> {
+    [
+        std::path::PathBuf::from("config.lua"),
+        dirs_config().join("config.lua"),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+}
+
+/// Load config from default locations (`config_path()`). Falls back to defaults.
+pub fn load_user_config() -> VeilConfig {
+    config_path()
+        .map(|p| load(&p))
+        .unwrap_or_default()
+}
+
+/// Load config from `path`. Returns `Err(error_msg)` on read or parse failure.
+pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
     if !path.exists() {
-        return VeilConfig::default();
+        return Ok(VeilConfig::default());
     }
 
     let src = match std::fs::read_to_string(path) {
         Ok(s)  => s,
-        Err(_) => return VeilConfig::default(),
+        Err(e) => return Err(format!("Read error: {e}")),
     };
 
     let lua = Lua::new();
-    if lua.load(&src).exec().is_err() {
-        eprintln!("[config] failed to parse {:?}, using defaults", path);
-        return VeilConfig::default();
+    if let Err(e) = lua.load(&src).exec() {
+        return Err(format!("{e}"));
     }
 
     let d  = VeilConfig::default();
     let gl = lua.globals();
 
-    VeilConfig {
+    Ok(VeilConfig {
         quality: gl.get::<String>("quality")
             .map(|s| Quality::parse_str(&s))
             .unwrap_or(d.quality),
@@ -346,6 +394,17 @@ pub fn load(path: &Path) -> VeilConfig {
             .ok()
             .and_then(|s| parse_hex_color(&s))
             .unwrap_or(d.background),
+    })
+}
+
+/// Load config from `path`. Falls back to defaults on any error or missing file.
+pub fn load(path: &Path) -> VeilConfig {
+    match try_load(path) {
+        Ok(cfg) => cfg,
+        Err(e)  => {
+            eprintln!("[config] failed to parse {:?}: {}, using defaults", path, e);
+            VeilConfig::default()
+        }
     }
 }
 
@@ -368,5 +427,25 @@ mod tests {
         assert_eq!(parse_hex_color("not a color"), None);
         assert_eq!(parse_hex_color("#fff"), None); // no 3-digit shorthand
         assert_eq!(parse_hex_color(""), None);
+    }
+
+    #[test]
+    fn default_keybinds_includes_reload() {
+        let kb = Keybinds::default();
+        assert_eq!(kb.action_for('c'), Some(Action::ReloadConfig));
+    }
+
+    #[test]
+    fn parse_custom_reload_keybind() {
+        let lua = Lua::new();
+        lua.load(r#"
+            keybinds = {
+                mod_key = "alt",
+                reload_config = "x",
+            }
+        "#).exec().unwrap();
+        let kb = parse_keybinds(&lua.globals());
+        assert_eq!(kb.mod_key, ModKey::Alt);
+        assert_eq!(kb.action_for('x'), Some(Action::ReloadConfig));
     }
 }

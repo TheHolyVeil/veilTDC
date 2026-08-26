@@ -39,6 +39,7 @@ component ThemedInput inherits Rectangle {
     in property <string> placeholder;
     in-out property <string> text;
     in property <bool> password: false;
+    in property <bool> caps-lock-on: false;
     property <bool> reveal: false;
     callback accepted();
     callback edited(string);
@@ -56,7 +57,7 @@ component ThemedInput inherits Rectangle {
 
     ti := TextInput {
         x: 16px;
-        width: parent.width - 32px - (root.password ? 28px : 0px);
+        width: parent.width - 32px - (root.password ? 28px : 0px) - (root.password && root.caps-lock-on ? 55px : 0px);
         height: parent.height;
         vertical-alignment: center;
         color: root.password && !root.reveal ? transparent : #e4e9dd;
@@ -83,6 +84,16 @@ component ThemedInput inherits Rectangle {
         visible: root.text == "";
     }
 
+    if root.password && root.caps-lock-on : Text {
+        x: parent.width - 82px;
+        height: 100%;
+        vertical-alignment: center;
+        text: "⇪ CAPS";
+        color: #e06c75;
+        font-size: 11px;
+        font-family: "Inconsolata";
+    }
+
     // masked view — little orbs standing in for each typed character
     // (character-count is bound through a plain property first — using the
     // builtin call directly as a repeater's model expression trips a rustc
@@ -90,7 +101,7 @@ component ThemedInput inherits Rectangle {
     property <int> mask-len: root.text.character-count;
     if root.password && !root.reveal : Rectangle {
         x: 16px;
-        width: parent.width - 32px - 28px;
+        width: parent.width - 32px - 28px - (root.caps-lock-on ? 55px : 0px);
         height: parent.height;
         clip: true;
         for i in root.mask-len : Rectangle {
@@ -174,6 +185,7 @@ export component LoginWindow inherits Window {
     // ── state from Rust ─────────────────────────────────────────────────────
     in-out property <string> username;
     in-out property <string> password;
+    in property <[string]> users: [];
     in property <[string]> sessions: ["Veil"];
     in-out property <int> session-index: 0;
     in property <string> error-msg;
@@ -189,6 +201,7 @@ export component LoginWindow inherits Window {
     in property <int> cooldown-secs: 0;
     in property <int> tty-target: 4;
     in-out property <length> shake-offset: 0px;
+    in-out property <bool> caps-lock-on: false;
     // true when the username was restored from last-user — hides the
     // username field and puts the cursor straight into the password.
     in-out property <bool> user-known: false;
@@ -268,15 +281,80 @@ export component LoginWindow inherits Window {
         opacity: root.has-wallpaper ? 0.45 : 0;
     }
 
-    // ── hostname corner ─────────────────────────────────────────────────────
-    Text {
-        x: 28px;
-        y: 22px;
-        text: root.hostname;
-        color: #b7c9a3aa;
-        font-size: 15px;
-        font-family: "Syne";
-        letter-spacing: 2px;
+    // ── top status bar ───────────────────────────────────────────────────────
+    HorizontalLayout {
+        x: 24px;
+        y: 18px;
+        width: parent.width - 48px;
+        height: 32px;
+        alignment: space-between;
+
+        // Hostname badge
+        Rectangle {
+            height: 28px;
+            border-radius: 14px;
+            background: #121a1499;
+            border-width: 1px;
+            border-color: #9db08a33;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                alignment: center;
+                Text {
+                    text: root.hostname;
+                    color: #b7c9a3ee;
+                    font-size: 13px;
+                    font-family: "Syne";
+                    letter-spacing: 1px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Live clock badge (when stage == 1, shown top center)
+        if root.stage == 1 : Rectangle {
+            height: 28px;
+            border-radius: 14px;
+            background: #121a1499;
+            border-width: 1px;
+            border-color: #9db08a33;
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                alignment: center;
+                Text {
+                    text: root.clock-time;
+                    color: #e4e9ddee;
+                    font-size: 13px;
+                    font-family: "Inconsolata";
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Right side badges: TTY target
+        HorizontalLayout {
+            spacing: 8px;
+            Rectangle {
+                height: 28px;
+                border-radius: 14px;
+                background: #121a1499;
+                border-width: 1px;
+                border-color: #9db08a33;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    alignment: center;
+                    Text {
+                        text: "TTY\{root.tty-target}";
+                        color: #9db08aaa;
+                        font-size: 12px;
+                        font-family: "Inconsolata";
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
     }
 
     // ── veil wordmark, top center — fills the dead space above the clock ────
@@ -292,7 +370,7 @@ export component LoginWindow inherits Window {
         animate opacity { duration: 350ms; }
     }
 
-    // ── login card (under the clock layer; fades in at stage 1) ─────────────
+    // ── login card (frosted glassmorphism design) ──────────────────────────
     card := Rectangle {
         width: 380px;
         height: self.preferred-height;
@@ -301,54 +379,104 @@ export component LoginWindow inherits Window {
             - (root.vk-visible ? 120px : 0px)
             + (root.stage == 1 ? 0px : 26px);
         animate x { duration: 70ms; easing: ease-in-out; }
-        border-radius: 22px;
-        background: #121a14e6;
+        border-radius: 24px;
+        background: @linear-gradient(145deg, #141f17ee 0%, #0a110dee 100%);
         border-width: 1px;
-        border-color: #9db08a44;
-        drop-shadow-blur: 32px;
-        drop-shadow-color: #000000aa;
+        border-color: #9db08a55;
+        drop-shadow-blur: 40px;
+        drop-shadow-color: #000000dd;
         opacity: root.stage == 1 ? 1 : 0;
-        animate opacity { duration: 400ms; easing: ease-out; }
-        animate y { duration: 400ms; easing: ease-out; }
+        animate opacity { duration: 380ms; easing: cubic-bezier(0.16, 1, 0.3, 1); }
+        animate y { duration: 380ms; easing: cubic-bezier(0.16, 1, 0.3, 1); }
 
         VerticalLayout {
             padding: 28px;
             spacing: 12px;
             alignment: start;
 
-            // avatar — click it to switch user when the name is remembered
-            HorizontalLayout {
+            // Multi-user carousel chips if multiple users exist
+            if root.users.length > 1 : HorizontalLayout {
+                spacing: 6px;
                 alignment: center;
-                Rectangle {
-                    width: 92px;
-                    height: 92px;
-                    border-radius: 46px;
-                    clip: true;
-                    background: #18211a;
-                    border-width: 2px;
-                    border-color: #9db08a;
+                height: 32px;
 
-                    if root.has-avatar : Image {
-                        source: root.avatar;
-                        width: 100%;
-                        height: 100%;
-                        image-fit: cover;
-                    }
-                    if !root.has-avatar : Text {
-                        width: 100%;
-                        height: 100%;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        text: root.user-initial;
-                        color: #9db08a;
-                        font-size: 38px;
-                        font-family: "Syne";
+                for u in root.users : Rectangle {
+                    height: 26px;
+                    border-radius: 13px;
+                    background: root.username == u ? #9db08a44 : #18211a88;
+                    border-width: 1px;
+                    border-color: root.username == u ? #9db08a : #9db08a22;
+                    animate background, border-color { duration: 150ms; }
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        alignment: center;
+                        Text {
+                            text: u;
+                            color: root.username == u ? #e4e9dd : #9db08aaa;
+                            font-size: 12px;
+                            font-family: "Inconsolata";
+                            vertical-alignment: center;
+                        }
                     }
 
                     TouchArea {
                         clicked => {
-                            root.user-known = false;
-                            user-input.focus-input();
+                            root.username = u;
+                            root.user-known = true;
+                            root.username-edited(u);
+                            root.show-password();
+                        }
+                    }
+                }
+            }
+
+            // avatar with breathing halo ring — click it to switch user
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 98px;
+                    height: 98px;
+                    border-radius: 49px;
+                    background: @linear-gradient(135deg, #9db08a44 0%, #9db08a11 100%);
+                    border-width: 1px;
+                    border-color: avatar-ta.has-hover ? #9db08aaa : #9db08a44;
+                    animate border-color, background { duration: 250ms; }
+
+                    Rectangle {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        width: 90px;
+                        height: 90px;
+                        border-radius: 45px;
+                        clip: true;
+                        background: #18211a;
+                        border-width: 2px;
+                        border-color: #9db08a;
+
+                        if root.has-avatar : Image {
+                            source: root.avatar;
+                            width: 100%;
+                            height: 100%;
+                            image-fit: cover;
+                        }
+                        if !root.has-avatar : Text {
+                            width: 100%;
+                            height: 100%;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            text: root.user-initial;
+                            color: #9db08a;
+                            font-size: 38px;
+                            font-family: "Syne";
+                        }
+
+                        avatar-ta := TouchArea {
+                            clicked => {
+                                root.user-known = false;
+                                user-input.focus-input();
+                            }
                         }
                     }
                 }
@@ -386,6 +514,7 @@ export component LoginWindow inherits Window {
                 placeholder: "password";
                 text <=> root.password;
                 password: true;
+                caps-lock-on: root.caps-lock-on;
                 height: root.pass-visible ? 44px : 0px;
                 opacity: root.pass-visible ? 1 : 0;
                 animate height, opacity { duration: 300ms; easing: ease-out; }

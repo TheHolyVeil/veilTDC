@@ -391,34 +391,12 @@ fn term_pixel_size() -> Option<(u32, u32)> {
     }
 }
 
-fn dirs_config() -> std::path::PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            std::path::PathBuf::from(home).join(".config")
-        })
-        .join("veil")
-}
-
-/// Single canonical config resolution, used by every command that reads
-/// config.lua (`run`, `probe`). `~/.config/veil/config.lua` (or
-/// `$XDG_CONFIG_HOME/veil/config.lua`) is authoritative; `./config.lua` in
-/// the cwd is a dev-convenience override checked first so a repo checkout
-/// can test its own config.lua without installing it.
 fn config_path() -> Option<std::path::PathBuf> {
-    [
-        std::path::PathBuf::from("config.lua"),
-        dirs_config().join("config.lua"),
-    ]
-    .into_iter()
-    .find(|p| p.exists())
+    veil_config::config_path()
 }
 
 fn load_veil_config() -> veil_config::VeilConfig {
-    config_path()
-        .map(|p| veil_config::load(&p))
-        .unwrap_or_default()
+    veil_config::load_user_config()
 }
 
 // ─── list-modes ───────────────────────────────────────────────────────────────

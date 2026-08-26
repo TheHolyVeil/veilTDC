@@ -40,6 +40,33 @@ pub fn save_last_user(username: &str) {
     write_state("last-user", username);
 }
 
+/// Detect normal non-system user accounts from /etc/passwd (UID >= 1000).
+pub fn detect_users() -> Vec<String> {
+    let mut users = Vec::new();
+    if let Ok(content) = std::fs::read_to_string("/etc/passwd") {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 7 {
+                let name = parts[0];
+                let uid: u32 = parts[2].parse().unwrap_or(0);
+                let shell = parts[6];
+                if (uid >= 1000 && uid < 65534)
+                    && !shell.contains("nologin")
+                    && !shell.contains("false")
+                {
+                    users.push(name.to_string());
+                }
+            }
+        }
+    }
+    if users.is_empty() {
+        if let Some(last) = last_user() {
+            users.push(last);
+        }
+    }
+    users
+}
+
 /// Session *name* (not index — the detected list can reorder between boots).
 pub fn last_session() -> Option<String> {
     read_state("last-session")

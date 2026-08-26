@@ -20,6 +20,9 @@ pub enum InputCmd {
 
     /// Terminal window resized — new compositor output dimensions in pixels.
     Resize { width: u32, height: u32 },
+
+    /// Display an On-Screen Display (OSD) popup overlay.
+    Osd { title: String, body: String, progress: Option<u8> },
 }
 
 // TODO: routing layer that takes an InputCmd and calls into

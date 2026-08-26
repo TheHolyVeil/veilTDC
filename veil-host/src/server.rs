@@ -189,6 +189,14 @@ impl Window {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct OsdNotification {
+    pub title: String,
+    pub body: String,
+    pub progress: Option<u8>,
+    pub expires_at: Instant,
+}
+
 pub struct State {
     pub compositor_state:  CompositorState,
     pub xdg_shell_state:   XdgShellState,
@@ -298,6 +306,12 @@ pub struct State {
     /// Arc::try_unwrap — if the render thread has already dropped its
     /// clone, we reclaim the allocation instead of allocating fresh.
     pub prev_frame:           Option<Arc<Vec<u8>>>,
+    pub config_path:          Option<std::path::PathBuf>,
+    pub config_mtime:         Option<std::time::SystemTime>,
+    pub last_config_check:    Instant,
+    pub composite_interval:   Duration,
+    /// On-Screen Display (OSD) popup notification overlay.
+    pub osd:                  Option<OsdNotification>,
 }
 
 /// Per-surface RGBA cache entry. We re-blit these every dirty tick.
@@ -308,6 +322,15 @@ pub struct SurfaceBuf {
 }
 
 impl State {
+    pub fn show_osd(&mut self, title: impl Into<String>, body: impl Into<String>, progress: Option<u8>, duration: Duration) {
+        self.osd = Some(OsdNotification {
+            title: title.into(),
+            body: body.into(),
+            progress,
+            expires_at: Instant::now() + duration,
+        });
+        mark_dirty_full(self);
+    }
     fn next_serial(&mut self) -> Serial {
         self.serial_counter = self.serial_counter.wrapping_add(1);
         Serial::from(self.serial_counter)
@@ -1033,6 +1056,219 @@ fn spawn_command(socket_name: &str, exec: &str) {
     }
 }
 
+fn adjust_volume(up: bool) -> (String, Option<u8>) {
+    let arg = if up { "5%+" } else { "5%-" };
+    if let Ok(out) = Command::new("wpctl")
+        .args(["set-volume", "@DEFAULT_AUDIO_SINK@", arg])
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(get_out) = Command::new("wpctl")
+                .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
+                .output()
+            {
+                let s = String::from_utf8_lossy(&get_out.stdout);
+                if s.contains("[MUTED]") {
+                    return ("MUTED".to_string(), Some(0));
+                }
+                if let Some(val_str) = s.split_whitespace().nth(1) {
+                    if let Ok(val) = val_str.parse::<f32>() {
+                        let pct = (val * 100.0).round() as u8;
+                        return (format!("{pct}%"), Some(pct));
+                    }
+                }
+            }
+        }
+    }
+
+    let amixer_arg = if up { "5%+" } else { "5%-" };
+    if let Ok(out) = Command::new("amixer")
+        .args(["sset", "Master", amixer_arg])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        if let Some(start) = s.find('[') {
+            if let Some(end) = s[start..].find('%') {
+                if let Ok(pct) = s[start + 1..start + end].parse::<u8>() {
+                    return (format!("{pct}%"), Some(pct));
+                }
+            }
+        }
+    }
+
+    let pactl_arg = if up { "+5%" } else { "-5%" };
+    if let Ok(_) = Command::new("pactl")
+        .args(["set-sink-volume", "@DEFAULT_SINK@", pactl_arg])
+        .output()
+    {
+        return ("ADJUSTED".to_string(), None);
+    }
+
+    (if up { "+5%" } else { "-5%" }.to_string(), None)
+}
+
+fn toggle_volume_mute() -> (String, Option<u8>) {
+    if let Ok(_) = Command::new("wpctl")
+        .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+        .output()
+    {
+        if let Ok(get_out) = Command::new("wpctl")
+            .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
+            .output()
+        {
+            let s = String::from_utf8_lossy(&get_out.stdout);
+            if s.contains("[MUTED]") {
+                return ("MUTED".to_string(), Some(0));
+            } else if let Some(val_str) = s.split_whitespace().nth(1) {
+                if let Ok(val) = val_str.parse::<f32>() {
+                    let pct = (val * 100.0).round() as u8;
+                    return (format!("UNMUTED ({pct}%)"), Some(pct));
+                }
+            }
+        }
+    }
+
+    if let Ok(out) = Command::new("amixer")
+        .args(["sset", "Master", "toggle"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        if s.contains("[off]") {
+            return ("MUTED".to_string(), Some(0));
+        } else {
+            return ("UNMUTED".to_string(), None);
+        }
+    }
+
+    ("TOGGLE MUTE".to_string(), None)
+}
+
+fn adjust_brightness(up: bool) -> (String, Option<u8>) {
+    let arg = if up { "+5%" } else { "5%-" };
+    if let Ok(out) = Command::new("brightnessctl")
+        .args(["set", arg])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(start) = s.find('(') {
+                if let Some(end) = s[start..].find('%') {
+                    if let Ok(pct) = s[start + 1..start + end].parse::<u8>() {
+                        return (format!("{pct}%"), Some(pct));
+                    }
+                }
+            }
+        }
+    }
+
+    let light_flag = if up { "-A" } else { "-U" };
+    if let Ok(_) = Command::new("light")
+        .args([light_flag, "5"])
+        .output()
+    {
+        if let Ok(get_out) = Command::new("light").output() {
+            let s = String::from_utf8_lossy(&get_out.stdout);
+            if let Ok(val) = s.trim().parse::<f32>() {
+                let pct = val.round() as u8;
+                return (format!("{pct}%"), Some(pct));
+            }
+        }
+    }
+
+    (if up { "+5%" } else { "-5%" }.to_string(), None)
+}
+
+fn draw_osd_overlay(osd: &OsdNotification, back: &mut [u8], w: u32, h: u32) {
+    use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
+
+    let scale = 2u32;
+    let advance = (GLYPH_W + 1) * scale;
+    let line_h = (GLYPH_H + 3) * scale;
+    let pad = 12i32;
+
+    let title_line = format!("{}", osd.title.to_ascii_uppercase());
+    let body_line = format!("{}", osd.body.to_ascii_uppercase());
+
+    let has_bar = osd.progress.is_some();
+    let bar_h = if has_bar { 14i32 } else { 0i32 };
+
+    let mut lines = vec![title_line];
+    if !body_line.is_empty() {
+        lines.push(body_line);
+    }
+
+    let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(18) as u32;
+    let box_w = (text_cols * advance + pad as u32 * 2).max(220);
+    let box_h = lines.len() as u32 * line_h + pad as u32 * 2 + if has_bar { bar_h as u32 } else { 0 };
+
+    let x0 = ((w as i32 - box_w as i32) / 2).max(0);
+    let y0 = (h as i32 / 12).max(10);
+
+    let is_error = osd.title.contains("ERROR");
+    let border_color = if is_error { [255, 85, 85, 255] } else { [128, 222, 234, 255] };
+
+    let border = 2i32;
+    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), border_color);
+    fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 10, 20, 240]);
+
+    for (i, line) in lines.iter().enumerate() {
+        let ty = y0 + pad + i as i32 * line_h as i32;
+        let color = if i == 0 {
+            if is_error { [255, 100, 100, 255] } else { [255, 215, 0, 255] }
+        } else {
+            [220, 220, 240, 255]
+        };
+        draw_text(back, w, h, x0 + pad, ty, scale, line, color);
+    }
+
+    if let Some(pct) = osd.progress {
+        let bar_x = x0 + pad;
+        let bar_y = y0 + pad + lines.len() as i32 * line_h as i32 + 2;
+        let inner_w = box_w - (pad as u32 * 2);
+        let filled_w = (inner_w * pct.min(100) as u32) / 100;
+
+        fill_rect(back, w, h, bar_x, bar_y, inner_w, 10, [40, 40, 60, 255]);
+        fill_rect(back, w, h, bar_x, bar_y, filled_w, 10, border_color);
+    }
+}
+
+/// Reload configuration from disk (`config_path()`), updating keybinds,
+/// background color, composite rate, etc.
+pub fn reload_config(state: &mut State) {
+    let path = veil_config::config_path();
+    let new_cfg = match path.as_ref() {
+        Some(p) => match veil_config::try_load(p) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let short_err = e.lines().next().unwrap_or("Syntax error").to_string();
+                eprintln!("[config] failed to parse {:?}: {}", p, e);
+                state.show_osd("CONFIG ERROR", short_err, None, Duration::from_secs(4));
+                return;
+            }
+        },
+        None => veil_config::VeilConfig::default(),
+    };
+
+    state.config_mtime = path.as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+    state.config_path = path.clone();
+
+    state.keybinds = new_cfg.keybinds;
+    state.background = [new_cfg.background[0], new_cfg.background[1], new_cfg.background[2], 255];
+    state.composite_interval = Duration::from_millis(1000 / new_cfg.fps.max(1) as u64);
+
+    if let Some(p) = &path {
+        let name = p.file_name().and_then(|f| f.to_str()).unwrap_or("config.lua");
+        state.show_osd("CONFIG RELOADED", format!("Applied {name}"), None, Duration::from_secs(2));
+        eprintln!("[veil-host] reloaded config from {}", p.display());
+    } else {
+        state.show_osd("CONFIG RELOADED", "Using default config", None, Duration::from_secs(2));
+        eprintln!("[veil-host] reloaded default config (no config.lua found)");
+    }
+    mark_dirty_full(state);
+}
+
 /// Run a Combo-4 keybind action against the live layout, then re-tile and
 /// re-focus so the client sees the result immediately.
 fn dispatch_action(state: &mut State, action: veil_config::Action) {
@@ -1076,6 +1312,27 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
                 (_, Some(f)) => state.fullscreen = Some(f.clone()),
                 (_, None) => {}
             }
+        }
+        ReloadConfig => reload_config(state),
+        VolumeUp => {
+            let (body, pct) = adjust_volume(true);
+            state.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+        }
+        VolumeDown => {
+            let (body, pct) = adjust_volume(false);
+            state.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+        }
+        VolumeMute => {
+            let (body, pct) = toggle_volume_mute();
+            state.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+        }
+        BrightnessUp => {
+            let (body, pct) = adjust_brightness(true);
+            state.show_osd("BRIGHTNESS", body, pct, Duration::from_secs(2));
+        }
+        BrightnessDown => {
+            let (body, pct) = adjust_brightness(false);
+            state.show_osd("BRIGHTNESS", body, pct, Duration::from_secs(2));
         }
         Launch(cmd)  => spawn_command(&state.socket_name, &cmd),
     }
@@ -1132,6 +1389,36 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
         if let Some(l) = state.launcher.as_mut() {
             let count = l.matches().len();
             if count > 0 { l.selected = (l.selected + 1).min(count - 1); }
+            mark_dirty_full(state);
+        }
+        return;
+    }
+    if sym == keysyms::KEY_Page_Down {
+        if let Some(l) = state.launcher.as_mut() {
+            let count = l.matches().len();
+            if count > 0 { l.selected = (l.selected + 10).min(count - 1); }
+            mark_dirty_full(state);
+        }
+        return;
+    }
+    if sym == keysyms::KEY_Page_Up {
+        if let Some(l) = state.launcher.as_mut() {
+            l.selected = l.selected.saturating_sub(10);
+            mark_dirty_full(state);
+        }
+        return;
+    }
+    if sym == keysyms::KEY_Home {
+        if let Some(l) = state.launcher.as_mut() {
+            l.selected = 0;
+            mark_dirty_full(state);
+        }
+        return;
+    }
+    if sym == keysyms::KEY_End {
+        if let Some(l) = state.launcher.as_mut() {
+            let count = l.matches().len();
+            if count > 0 { l.selected = count - 1; }
             mark_dirty_full(state);
         }
         return;
@@ -1268,11 +1555,11 @@ fn mark_dirty_rect(state: &mut State, rect: Rect) {
 
 /// Composite all live toplevels + their popups + the cursor into a single
 /// RGBA frame and ship it. Called from the periodic tick when `dirty`.
-fn composite_and_send(state: &mut State, composite_interval: Duration) {
+fn composite_and_send(state: &mut State) {
     if !state.dirty { return; }
     let now = Instant::now();
     if let Some(t) = state.last_composite {
-        if now.duration_since(t) < composite_interval { return; }
+        if now.duration_since(t) < state.composite_interval { return; }
     }
     state.last_composite = Some(now);
     state.dirty = false;
@@ -1404,6 +1691,16 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
             draw_launcher_overlay(&l, mod_key, back, w, h);
         }
     }
+    if let Some(ref osd) = state.osd {
+        if Instant::now() > osd.expires_at {
+            state.osd = None;
+            state.dirty = true;
+        } else {
+            let osd_clone = osd.clone();
+            draw_osd_overlay(&osd_clone, back, w, h);
+            state.dirty = true;
+        }
+    }
 
     state.frame_serial = state.frame_serial.wrapping_add(1);
 
@@ -1493,7 +1790,7 @@ fn draw_help_overlay(keybinds: &veil_config::Keybinds, back: &mut [u8], w: u32, 
 fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, back: &mut [u8], w: u32, h: u32) {
     use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
 
-    const MAX_ROWS: usize = 8;
+    const PAGE_SIZE: usize = 10;
     let scale = 2u32;
     let advance = (GLYPH_W + 1) * scale;
     let line_h = (GLYPH_H + 3) * scale;
@@ -1502,6 +1799,12 @@ fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, back
     let mod_label = mod_key.label().to_ascii_uppercase();
     let matches = launcher.matches();
     let selected = launcher.selected.min(matches.len().saturating_sub(1));
+
+    let scroll_offset = if selected < PAGE_SIZE {
+        0
+    } else {
+        selected + 1 - PAGE_SIZE
+    };
 
     let mut lines: Vec<String> = vec![
         format!("LAUNCHER  ({mod_label}+D CLOSE, ENTER RUN, ESC CANCEL)"),
@@ -1516,11 +1819,15 @@ fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, back
             "NO MATCH — ENTER RUNS AS SHELL COMMAND".to_string()
         });
     } else {
-        for m in matches.iter().take(MAX_ROWS) {
+        if scroll_offset > 0 {
+            lines.push(format!("^ {} MORE ABOVE", scroll_offset));
+        }
+        let end_idx = (scroll_offset + PAGE_SIZE).min(matches.len());
+        for m in &matches[scroll_offset..end_idx] {
             lines.push(m.name.clone());
         }
-        if matches.len() > MAX_ROWS {
-            lines.push(format!("... {} MORE", matches.len() - MAX_ROWS));
+        if end_idx < matches.len() {
+            lines.push(format!("v {} MORE BELOW", matches.len() - end_idx));
         }
     }
 
@@ -1534,9 +1841,11 @@ fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, back
     fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), [199, 146, 234, 255]);
     fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 0, 16, 245]);
 
-    // Highlight bar behind the selected match row, drawn before the text.
+    // Highlight bar behind the selected match row
     if !matches.is_empty() {
-        let row = header_rows + selected;
+        let relative_selected = selected - scroll_offset;
+        let above_indicator = if scroll_offset > 0 { 1 } else { 0 };
+        let row = header_rows + above_indicator + relative_selected;
         let ry = y0 + pad + row as i32 * line_h as i32 - 2;
         fill_rect(back, w, h, x0 + 2, ry, box_w - 4, line_h, [65, 35, 85, 255]);
     }
@@ -1547,6 +1856,8 @@ fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, back
             [255, 215, 0, 255] // Gold header
         } else if i == 1 {
             [128, 222, 234, 255] // Cyan query text
+        } else if line.starts_with('^') || line.starts_with('v') {
+            [150, 150, 180, 255] // Dim scroll indicator
         } else {
             [199, 146, 234, 255]
         };
@@ -1682,6 +1993,38 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                     if !pressed {
                         return FilterResult::Forward;
                     }
+
+                    // Multimedia keys (volume, brightness)
+                    let sym = keysym.modified_sym().raw();
+                    match sym {
+                        keysyms::KEY_XF86AudioRaiseVolume => {
+                            let (body, pct) = adjust_volume(true);
+                            st.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+                            return FilterResult::Intercept(());
+                        }
+                        keysyms::KEY_XF86AudioLowerVolume => {
+                            let (body, pct) = adjust_volume(false);
+                            st.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+                            return FilterResult::Intercept(());
+                        }
+                        keysyms::KEY_XF86AudioMute => {
+                            let (body, pct) = toggle_volume_mute();
+                            st.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+                            return FilterResult::Intercept(());
+                        }
+                        keysyms::KEY_XF86MonBrightnessUp => {
+                            let (body, pct) = adjust_brightness(true);
+                            st.show_osd("BRIGHTNESS", body, pct, Duration::from_secs(2));
+                            return FilterResult::Intercept(());
+                        }
+                        keysyms::KEY_XF86MonBrightnessDown => {
+                            let (body, pct) = adjust_brightness(false);
+                            st.show_osd("BRIGHTNESS", body, pct, Duration::from_secs(2));
+                            return FilterResult::Intercept(());
+                        }
+                        _ => {}
+                    }
+
                     let Some(ch) = keysym_char(keysym) else {
                         return FilterResult::Forward;
                     };
@@ -1802,6 +2145,19 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
         }
 
         InputCmd::Scroll { v120 } => {
+            if let Some(l) = state.launcher.as_mut() {
+                let matches_len = l.matches().len();
+                if matches_len > 0 {
+                    if v120 < 0 {
+                        l.selected = (l.selected + 1).min(matches_len - 1);
+                    } else if v120 > 0 {
+                        l.selected = l.selected.saturating_sub(1);
+                    }
+                    mark_dirty_full(state);
+                    return;
+                }
+            }
+
             // v120 = 120 per notch (Windows convention). Convert to a 15px-per-notch
             // continuous value as well; clients pick whichever they understand.
             let notches = v120 as f64 / 120.0;
@@ -1812,6 +2168,10 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             let ptr = state.pointer.clone();
             ptr.axis(state, f);
             ptr.frame(state);
+        }
+
+        InputCmd::Osd { title, body, progress } => {
+            state.show_osd(title, body, progress, Duration::from_secs(2));
         }
     }
 }
@@ -2173,6 +2533,11 @@ pub fn run(
         }
     });
 
+    let config_path = veil_config::config_path();
+    let config_mtime = config_path.as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+
     let state = State {
         compositor_state, xdg_shell_state, shm_state, seat_state,
         xdg_activation, output_manager,
@@ -2221,6 +2586,11 @@ pub fn run(
         client_has_selection: false,
         composite_buf:        Vec::new(),
         prev_frame:           None,
+        config_path,
+        config_mtime,
+        last_config_check: Instant::now(),
+        composite_interval,
+        osd: None,
     };
 
     let mut data = LoopData { state, display };
@@ -2388,9 +2758,23 @@ pub fn run(
             }
         }
 
+        // Auto-reload config if config.lua was created or modified on disk (checked every 1s).
+        let now = Instant::now();
+        if now.duration_since(data.state.last_config_check) >= Duration::from_secs(1) {
+            data.state.last_config_check = now;
+            let current_path = veil_config::config_path();
+            let current_mtime = current_path.as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok());
+
+            if current_path != data.state.config_path || current_mtime != data.state.config_mtime {
+                reload_config(&mut data.state);
+            }
+        }
+
         // Composite all dirty surfaces into one RGBA frame and ship it.
         // Frame callbacks are fired inside composite_and_send after the frame is sent.
-        composite_and_send(&mut data.state, composite_interval);
+        composite_and_send(&mut data.state);
 
         // Flush outgoing wayland messages.
         let _ = data.display.flush_clients();

@@ -36,6 +36,12 @@ keybinds = {
 	resize_grow = "=", -- Alt+= (grow primary pane)
 	resize_shrink = "-",
 	toggle_layout = "w", --Switch between Dwindle and scroll window management, scroll has no window cap.
+	reload_config = ";", -- Hot-reload config on demand (Alt+;)
+	volume_up = "[", -- Alt+[
+	volume_down = "]", -- Alt+]
+	-- volume_mute = "m",
+	-- brightness_up = "]",
+	-- brightness_down = "[",
 }
 -- Help overlay: <mod_key>+/ (e.g. Alt+/ above) always toggles a keybind
 -- cheat-sheet — hardcoded, not itself a config entry.

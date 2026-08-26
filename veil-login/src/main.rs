@@ -91,10 +91,19 @@ fn main() {
         ui.set_wallpaper(img);
         ui.set_has_wallpaper(true);
     }
+    // User enumeration & preselection
+    let detected_users = state::detect_users();
+    let user_names: Vec<slint::SharedString> =
+        detected_users.iter().map(|u| u.as_str().into()).collect();
+    ui.set_users(std::rc::Rc::new(slint::VecModel::from(user_names)).into());
+
     if let Some(user) = state::last_user() {
         ui.set_username(user.as_str().into());
         ui.set_user_known(true);
         load_avatar(&ui, &user);
+    } else if let Some(first_user) = detected_users.first() {
+        ui.set_username(first_user.as_str().into());
+        load_avatar(&ui, first_user);
     }
 
     ui.set_tty_target(TTY_TARGET);
@@ -492,11 +501,11 @@ fn close_lingering_fds() {
 /// through offsets since Slint's `animate` only tweens start→end, not a
 /// multi-point wiggle.
 fn shake_card(ui: &LoginWindow) {
-    const OFFSETS: [i32; 6] = [-10, 8, -6, 4, -2, 0];
+    const OFFSETS: [i32; 8] = [-14, 12, -10, 8, -5, 3, -1, 0];
     for (i, off) in OFFSETS.iter().enumerate() {
         let weak = ui.as_weak();
         let off = *off;
-        slint::Timer::single_shot(std::time::Duration::from_millis(45 * i as u64), move || {
+        slint::Timer::single_shot(std::time::Duration::from_millis(40 * i as u64), move || {
             if let Some(ui) = weak.upgrade() {
                 ui.set_shake_offset(off as f32);
             }
