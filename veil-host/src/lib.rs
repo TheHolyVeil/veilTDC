@@ -37,6 +37,7 @@ pub struct HostConfig {
     pub wayland_debug: bool,
     pub keybinds:      veil_config::Keybinds,
     pub background:    [u8; 3],
+    pub theme:         veil_config::Theme,
 }
 
 /// Signal handle returned by [`Host::spawn`]; flip via [`Host::stop`]
@@ -55,6 +56,7 @@ impl Default for HostConfig {
             wayland_debug: false,
             keybinds:      veil_config::Keybinds::default(),
             background:    [0x8c, 0x8c, 0x8c],
+            theme:         veil_config::Theme::for_name(veil_config::ThemeName::Default),
         }
     }
 }
@@ -88,6 +90,7 @@ impl Host {
                     stop_t,
                     config.keybinds,
                     config.background,
+                    config.theme,
                 ) {
                     eprintln!("[veil-host] server exited: {e}");
                 }

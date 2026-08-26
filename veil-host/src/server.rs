@@ -269,6 +269,9 @@ pub struct State {
     /// buffer before any window blit, so uncovered space is a solid color
     /// instead of black.
     pub background:        [u8; 4],
+    /// Resolved color set for launcher/help/sidebar chrome — see
+    /// `veil_config::Theme`. Swapped wholesale on `reload_config`.
+    pub theme:              veil_config::Theme,
     /// `<mod_key>+D` app launcher — `Some` while the modal is open. See
     /// `crate::launcher`. Not itself a `keybinds` config entry, same as help.
     pub launcher:          Option<Launcher>,
@@ -1256,6 +1259,7 @@ pub fn reload_config(state: &mut State) {
 
     state.keybinds = new_cfg.keybinds;
     state.background = [new_cfg.background[0], new_cfg.background[1], new_cfg.background[2], 255];
+    state.theme = new_cfg.theme;
     state.composite_interval = Duration::from_millis(1000 / new_cfg.fps.max(1) as u64);
 
     if let Some(p) = &path {
@@ -1677,9 +1681,12 @@ fn composite_and_send(state: &mut State) {
     }
 
     // Only clone keybinds/launcher when the overlays are actually on screen.
+    // `theme` is `Copy` (plain color bytes) so pulling it out ahead of the
+    // `back` borrow costs nothing.
+    let theme = state.theme;
     if show_help {
         let keybinds = state.keybinds.clone();
-        draw_help_overlay(&keybinds, back, w, h);
+        draw_help_overlay(&keybinds, &theme, back, w, h);
     }
     if launcher_present {
         if let Some(ref l) = state.launcher {
@@ -1688,7 +1695,7 @@ fn composite_and_send(state: &mut State) {
             // already mutably borrowed. Clone the launcher (it's tiny) rather
             // than fighting the borrow checker with unsafe aliasing.
             let l = l.clone();
-            draw_launcher_overlay(&l, mod_key, back, w, h);
+            draw_launcher_overlay(&l, mod_key, &theme, back, w, h);
         }
     }
     if let Some(ref osd) = state.osd {
@@ -1751,7 +1758,7 @@ fn composite_and_send(state: &mut State) {
 /// on-screen box, stamped directly into the composited RGBA frame with the
 /// built-in 5x7 font ([`crate::font5x7`]) — veil-host has no other text
 /// rendering.
-fn draw_help_overlay(keybinds: &veil_config::Keybinds, back: &mut [u8], w: u32, h: u32) {
+fn draw_help_overlay(keybinds: &veil_config::Keybinds, theme: &veil_config::Theme, back: &mut [u8], w: u32, h: u32) {
     use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
 
     let scale = 2u32;
@@ -1776,18 +1783,18 @@ fn draw_help_overlay(keybinds: &veil_config::Keybinds, back: &mut [u8], w: u32, 
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
 
     let border = 2i32;
-    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), [199, 146, 234, 255]);
-    fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 0, 16, 245]); // dark purple background
+    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), theme.border);
+    fill_rect(back, w, h, x0, y0, box_w, box_h, theme.panel_bg);
     for (i, line) in lines.iter().enumerate() {
         let ty = y0 + pad + i as i32 * line_h as i32;
-        let color = if i == 0 { [255, 215, 0, 255] } else { [199, 146, 234, 255] };
+        let color = if i == 0 { theme.header } else { theme.text };
         draw_text(back, w, h, x0 + pad, ty, scale, line, color);
     }
 }
 
 /// `<mod_key>+D` launcher modal: query box + top matches, same font/box
 /// style as the help overlay. Selected row gets a highlight bar.
-fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, back: &mut [u8], w: u32, h: u32) {
+fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, theme: &veil_config::Theme, back: &mut [u8], w: u32, h: u32) {
     use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
 
     const PAGE_SIZE: usize = 10;
@@ -1838,8 +1845,8 @@ fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, back
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
 
     let border = 2i32;
-    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), [199, 146, 234, 255]);
-    fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 0, 16, 245]);
+    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), theme.border);
+    fill_rect(back, w, h, x0, y0, box_w, box_h, theme.panel_bg);
 
     // Highlight bar behind the selected match row
     if !matches.is_empty() {
@@ -1847,19 +1854,19 @@ fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, back
         let above_indicator = if scroll_offset > 0 { 1 } else { 0 };
         let row = header_rows + above_indicator + relative_selected;
         let ry = y0 + pad + row as i32 * line_h as i32 - 2;
-        fill_rect(back, w, h, x0 + 2, ry, box_w - 4, line_h, [65, 35, 85, 255]);
+        fill_rect(back, w, h, x0 + 2, ry, box_w - 4, line_h, theme.highlight);
     }
 
     for (i, line) in lines.iter().enumerate() {
         let ty = y0 + pad + i as i32 * line_h as i32;
         let color = if i == 0 {
-            [255, 215, 0, 255] // Gold header
+            theme.header // header row
         } else if i == 1 {
-            [128, 222, 234, 255] // Cyan query text
+            theme.accent // query text
         } else if line.starts_with('^') || line.starts_with('v') {
-            [150, 150, 180, 255] // Dim scroll indicator
+            theme.text_dim // scroll indicator
         } else {
-            [199, 146, 234, 255]
+            theme.text
         };
         draw_text(back, w, h, x0 + pad, ty, scale, line, color);
     }
@@ -2425,6 +2432,7 @@ pub fn run(
     stop: Arc<AtomicBool>,
     keybinds: veil_config::Keybinds,
     background: [u8; 3],
+    theme: veil_config::Theme,
 ) -> io::Result<()> {
     let composite_interval = Duration::from_millis(1000 / fps.max(1) as u64);
     let display: Display<State> = Display::new()
@@ -2563,6 +2571,7 @@ pub fn run(
         keybinds,
         show_help: false,
         background: [background[0], background[1], background[2], 255],
+        theme,
         // No anchor client to spawn into (`veil-host start`) → open straight
         // to the launcher instead of an empty screen with no hint of what to press.
         launcher: if spawn.is_none() { Some(Launcher::new()) } else { None },

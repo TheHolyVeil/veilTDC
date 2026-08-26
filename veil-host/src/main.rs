@@ -190,6 +190,7 @@ fn main() -> std::io::Result<()> {
     let vcfg = load_veil_config();
     cfg.keybinds = vcfg.keybinds.clone();
     cfg.background = vcfg.background;
+    cfg.theme = vcfg.theme;
 
     // Register our socket for cleanup on ANY exit (clean shutdown, HOME,
     // Ctrl-C, or a crash) and install the panic/fatal-signal hooks that
@@ -478,6 +479,7 @@ fn cmd_probe() -> std::io::Result<()> {
     println!("config output   : {:?}", vcfg.output);
     println!("config mod_key  : {}", vcfg.keybinds.mod_key.label());
     println!("config bg color : #{:02x}{:02x}{:02x}", vcfg.background[0], vcfg.background[1], vcfg.background[2]);
+    println!("config theme    : {}", vcfg.theme_name.label());
     println!("config file     : {}", cfg_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (using defaults)".into()));
     println!("WAYLAND_DISPLAY : {wayland}");
     println!("DISPLAY         : {display}");

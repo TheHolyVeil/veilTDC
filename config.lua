@@ -7,9 +7,42 @@ cage_timeout_secs = 8 -- timeout for caged output
 input = true -- enable input forwarding
 gpu_render = true -- use GPU for frame encoding
 
+-- Color theme applied to the launcher overlay, help overlay, and background
+-- (sidebar/bar will pick it up too once built). Does NOT recolor hosted app
+-- windows — veil-host never touches a client's own buffer, only its own
+-- chrome. Built-in presets:
+--
+--   "default"    -- original hardcoded look (amethyst/purple on cement grey).
+--                    This is what you get with no `theme` line at all, so
+--                    an existing config.lua renders pixel-identical to
+--                    before theming existed.
+--   "nord"       -- Arctic, bluish (nordtheme.com palette)
+--   "dracula"    -- Dark purple/pink, high contrast (draculatheme.com)
+--   "catppuccin" -- Mocha variant — soft pastel dark (catppuccin.com)
+--                    ("mocha" also accepted as an alias)
+--   "gruvbox"    -- Warm, retro-groove dark (morhetz/gruvbox)
+--   "everforest" -- Green-tinted, low-contrast forest dark (sainnhe/everforest)
+--   "tokyonight" -- Deep blue-purple night city (enkia/tokyo-night)
+--                    ("tokyo_night" / "tokyo-night" also accepted)
+--   "solarized"  -- Classic low-contrast blue-green (ethanschoonover.com)
+--   "rosepine"   -- Muted rose/iris dark (rosepinetheme.com)
+--                    ("rose_pine" / "rose-pine" also accepted)
+--   "monokai"    -- Classic high-contrast editor theme
+--   "onedark"    -- Atom's One Dark (JS ecosystem staple)
+--                    ("one_dark" / "one-dark" also accepted)
+--   "deepsage"   -- Abyss's own: deep, desaturated sage green, hand-tuned,
+--                    not sourced from any published palette.
+--                    ("deep_sage" / "deep-sage" / "sage" also accepted)
+--
+theme = "default" -- default | nord | dracula | catppuccin | gruvbox | everforest
+                   -- | tokyonight | solarized | rosepine | monokai | onedark | deepsage
+
 -- Bare background color, shown wherever no window covers. Otherwise
 -- uncovered space is pure black — an actual void, which you can now
 -- deliberately land on at zero windows (Alt+D launcher).
+--
+-- This OVERRIDES the theme's own background when set — comment this line
+-- out entirely to let `theme` above pick the background for you instead.
 background = "#8c8c8c" -- hex, "#RRGGBB" or "RRGGBB" — cement grey default
 
 -- Output backend. "auto" (default) picks terminal under a WM/SSH, DRM/KMS on
