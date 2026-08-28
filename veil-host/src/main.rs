@@ -191,6 +191,7 @@ fn main() -> std::io::Result<()> {
     cfg.keybinds = vcfg.keybinds.clone();
     cfg.background = vcfg.background;
     cfg.theme = vcfg.theme;
+    cfg.bar = vcfg.bar.clone();
 
     // Register our socket for cleanup on ANY exit (clean shutdown, HOME,
     // Ctrl-C, or a crash) and install the panic/fatal-signal hooks that

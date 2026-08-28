@@ -112,21 +112,36 @@ use crate::launcher::Launcher;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-/// Unifies xdg-shell and X11 (XWayland) top-level windows so relayout,
-/// composite, and input don't need to branch on protocol origin. Deliberately
-/// NOT smithay::desktop::Window — that drags in Space assumptions this file
-/// doesn't use (compositing here is manual, no Space).
-pub enum Window {
+/// Which protocol backs a managed toplevel — the payload half of `Window`,
+/// split out so `Window` itself can carry the workspace tag alongside it
+/// without every match arm below needing a third case.
+pub enum WindowSurface {
     Xdg(ToplevelSurface),
     X11(X11Surface),
 }
 
+/// Unifies xdg-shell and X11 (XWayland) top-level windows so relayout,
+/// composite, and input don't need to branch on protocol origin. Deliberately
+/// NOT smithay::desktop::Window — that drags in Space assumptions this file
+/// doesn't use (compositing here is manual, no Space).
+pub struct Window {
+    pub surface: WindowSurface,
+    /// Which workspace this window is tiled on (0-indexed, 0..WORKSPACE_COUNT).
+    /// Set at creation to whatever workspace was active at the time; moved
+    /// only by future move-to-workspace keybinds (none bound yet).
+    pub workspace: u8,
+}
+
 impl Window {
+    pub fn new(surface: WindowSurface, workspace: u8) -> Self {
+        Self { surface, workspace }
+    }
+
     /// False once the client destroys it (xdg) or the X connection drops it.
     pub fn alive(&self) -> bool {
-        match self {
-            Window::Xdg(t) => t.alive(),
-            Window::X11(x) => x.alive(),
+        match &self.surface {
+            WindowSurface::Xdg(t) => t.alive(),
+            WindowSurface::X11(x) => x.alive(),
         }
     }
 
@@ -134,9 +149,9 @@ impl Window {
     /// wl_surface (see XWaylandShellHandler::surface_associated) — callers
     /// must skip these the same way they already skip bufferless toplevels.
     pub fn wl_surface(&self) -> Option<WlSurface> {
-        match self {
-            Window::Xdg(t) => Some(t.wl_surface().clone()),
-            Window::X11(x) => x.wl_surface(),
+        match &self.surface {
+            WindowSurface::Xdg(t) => Some(t.wl_surface().clone()),
+            WindowSurface::X11(x) => x.wl_surface(),
         }
     }
 
@@ -146,8 +161,8 @@ impl Window {
     /// position, not just size. Safe to call before the window is
     /// paired/mapped; X11 configure doesn't need either.
     pub fn configure_size(&self, rect: Rect, activated: bool, fullscreen: bool) {
-        match self {
-            Window::Xdg(t) => {
+        match &self.surface {
+            WindowSurface::Xdg(t) => {
                 t.with_pending_state(|s| {
                     s.size = Some((rect.w as i32, rect.h as i32).into());
                     if activated {
@@ -163,7 +178,7 @@ impl Window {
                 });
                 t.send_configure();
             }
-            Window::X11(surf) => {
+            WindowSurface::X11(surf) => {
                 let _ = surf.configure(Rectangle::new(
                     Point::from((rect.x, rect.y)),
                     Size::from((rect.w as i32, rect.h as i32)),
@@ -182,9 +197,9 @@ impl Window {
     /// ignore it. X11: sends WM_DELETE_WINDOW / kills the connection per
     /// smithay's close(), same "may be ignored" caveat applies.
     pub fn close_window(&self) {
-        match self {
-            Window::Xdg(t) => t.send_close(),
-            Window::X11(x) => { let _ = x.close(); }
+        match &self.surface {
+            WindowSurface::Xdg(t) => t.send_close(),
+            WindowSurface::X11(x) => { let _ = x.close(); }
         }
     }
 }
@@ -256,8 +271,20 @@ pub struct State {
     /// isn't installed).
     pub xwm:               Option<X11Wm>,
     pub xwayland_shell_state: XWaylandShellState,
-    /// Dwindle tiling state (focus + split orientation).
+    /// Dwindle tiling state (focus + split orientation) for the ACTIVE
+    /// workspace only. Swapped out to/from `workspace_layouts` on
+    /// `SwitchWorkspace` — see `dispatch_action`. This split (rather than
+    /// always indexing `workspace_layouts[active_workspace]` everywhere)
+    /// keeps every existing `state.layout.*` call site working unchanged.
     pub layout:            Layout,
+    /// Per-workspace tiling state for the 9 workspaces, INCLUDING the
+    /// active one's slot (kept in sync on every switch, not read from
+    /// directly while its workspace is active — `layout` above is the live
+    /// copy then). Index 0 == workspace 1, matching `active_workspace`.
+    pub workspace_layouts: [Layout; veil_config::WORKSPACE_COUNT as usize],
+    /// 0-indexed active workspace (workspace 1 == 0). Super+1..9 switches
+    /// this; new windows are tagged with whatever this is at creation time.
+    pub active_workspace:  u8,
     /// Per-window rects, indexed to match the live-toplevel order. Recomputed
     /// by `relayout` whenever the window set or output size changes.
     pub layout_rects:      Vec<Rect>,
@@ -272,6 +299,13 @@ pub struct State {
     /// Resolved color set for launcher/help/sidebar chrome — see
     /// `veil_config::Theme`. Swapped wholesale on `reload_config`.
     pub theme:              veil_config::Theme,
+    pub bar:                veil_config::BarConfig,
+    /// Screen-space rects of the bar's clickable app tiles, keyed to their
+    /// `exec` command — rebuilt every time `draw_bar` runs (once per
+    /// composite tick when the bar's on screen; cheap, a handful of rects).
+    /// `PointerButton` consults this before falling through to normal
+    /// click-to-focus/forwarding.
+    pub bar_hitboxes:       Vec<(Rect, String)>,
     /// `<mod_key>+D` app launcher — `Some` while the modal is open. See
     /// `crate::launcher`. Not itself a `keybinds` config entry, same as help.
     pub launcher:          Option<Launcher>,
@@ -545,9 +579,10 @@ impl XdgShellHandler for State {
         let kb = self.keyboard.clone();
         kb.set_focus(self, Some(wl), serial);
 
-        self.toplevels.push(Window::Xdg(surface));
+        self.toplevels.push(Window::new(WindowSurface::Xdg(surface), self.active_workspace));
         // New window takes focus; retile so every window gets its rect + size.
-        let n = self.toplevels.iter().filter(|t| t.alive()).count();
+        let ws = self.active_workspace;
+        let n = self.toplevels.iter().filter(|t| t.alive() && t.workspace == ws).count();
         self.layout.focused = n.saturating_sub(1);
         relayout(self);
     }
@@ -566,7 +601,8 @@ impl XdgShellHandler for State {
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<wl_output::WlOutput>) {
         let wl = surface.wl_surface().clone();
-        if let Some(i) = self.toplevels.iter().filter(|t| t.alive())
+        let ws = self.active_workspace;
+        if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
             .position(|t| t.wl_surface().as_ref() == Some(&wl))
         {
             self.layout.focused = i;
@@ -1260,6 +1296,7 @@ pub fn reload_config(state: &mut State) {
     state.keybinds = new_cfg.keybinds;
     state.background = [new_cfg.background[0], new_cfg.background[1], new_cfg.background[2], 255];
     state.theme = new_cfg.theme;
+    state.bar = new_cfg.bar;
     state.composite_interval = Duration::from_millis(1000 / new_cfg.fps.max(1) as u64);
 
     if let Some(p) = &path {
@@ -1277,17 +1314,19 @@ pub fn reload_config(state: &mut State) {
 /// re-focus so the client sees the result immediately.
 fn dispatch_action(state: &mut State, action: veil_config::Action) {
     use veil_config::Action::*;
+    let ws = state.active_workspace; // pulled out once; every filter below needs it
     match action {
         FocusLeft  => state.layout.focus(&state.layout_rects, crate::layout::Dir::Left),
         FocusRight => state.layout.focus(&state.layout_rects, crate::layout::Dir::Right),
         FocusUp    => state.layout.focus(&state.layout_rects, crate::layout::Dir::Up),
         FocusDown  => state.layout.focus(&state.layout_rects, crate::layout::Dir::Down),
         Swap => {
-            // swap_next's indices are positions among LIVE toplevels; map them
-            // back to real Vec indices in case a dead-but-unpruned entry sits
-            // between live ones.
+            // swap_next's indices are positions among LIVE toplevels ON THE
+            // ACTIVE WORKSPACE; map them back to real Vec indices in case a
+            // dead-but-unpruned or other-workspace entry sits between live
+            // ones.
             let live_idx: Vec<usize> = state.toplevels.iter().enumerate()
-                .filter(|(_, t)| t.alive())
+                .filter(|(_, t)| t.alive() && t.workspace == ws)
                 .map(|(i, _)| i)
                 .collect();
             if let Some((a, b)) = state.layout.swap_next(live_idx.len()) {
@@ -1296,7 +1335,7 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
         }
         Rotate => state.layout.rotate_split(),
         Close => {
-            if let Some(tl) = state.toplevels.iter().filter(|t| t.alive()).nth(state.layout.focused) {
+            if let Some(tl) = state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws).nth(state.layout.focused) {
                 tl.close_window();
             }
         }
@@ -1304,7 +1343,7 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
         ResizeShrink => state.layout.resize_shrink(),
         ToggleLayout => state.layout.toggle_mode(),
         ToggleFullscreen => {
-            let focused_wl = state.toplevels.iter().filter(|t| t.alive())
+            let focused_wl = state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
                 .nth(state.layout.focused)
                 .and_then(|t| t.wl_surface());
             match (&state.fullscreen, &focused_wl) {
@@ -1318,6 +1357,43 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
             }
         }
         ReloadConfig => reload_config(state),
+        SwitchWorkspace(n) => {
+            let target = n.saturating_sub(1).min(veil_config::WORKSPACE_COUNT - 1);
+            if target != state.active_workspace {
+                // Save the outgoing workspace's tiling state and restore the
+                // target's, so hopping back later finds it exactly as left —
+                // not reset to the dwindle default.
+                state.workspace_layouts[state.active_workspace as usize] = state.layout;
+                state.layout = state.workspace_layouts[target as usize];
+                state.active_workspace = target;
+                state.show_osd(format!("WORKSPACE {}", target + 1), "", None, Duration::from_millis(900));
+                mark_dirty_full(state);
+            }
+        }
+        MoveToWorkspace(n) => {
+            let target = n.saturating_sub(1).min(veil_config::WORKSPACE_COUNT - 1);
+            // Real Vec index of whatever's focused right now, found the same
+            // way Close/ToggleFullscreen do — `state.layout.focused` is a
+            // position among LIVE ACTIVE-WORKSPACE windows, not a raw index.
+            let real_idx = state.toplevels.iter().enumerate()
+                .filter(|(_, t)| t.alive() && t.workspace == ws)
+                .nth(state.layout.focused)
+                .map(|(i, _)| i);
+            if let (Some(idx), true) = (real_idx, target != ws) {
+                state.toplevels[idx].workspace = target;
+                // Follow the window: same swap-in/out as SwitchWorkspace, so
+                // the workspace we land on keeps its own layout state
+                // instead of inheriting whatever the old one had.
+                state.workspace_layouts[state.active_workspace as usize] = state.layout;
+                state.layout = state.workspace_layouts[target as usize];
+                state.active_workspace = target;
+                state.show_osd(format!("MOVED TO WORKSPACE {}", target + 1), "", None, Duration::from_millis(900));
+                mark_dirty_full(state);
+            }
+            // No window focused (empty workspace) — nothing to move, and
+            // deliberately don't switch either; a bare workspace-switch
+            // keybind already exists for that (SwitchWorkspace above).
+        }
         VolumeUp => {
             let (body, pct) = adjust_volume(true);
             state.show_osd("VOLUME", body, pct, Duration::from_secs(2));
@@ -1461,19 +1537,29 @@ fn launch_selected(state: &mut State) {
     spawn_command(&state.socket_name, &exec);
 }
 
+/// Fixed bar height in pixels: one line of the built-in 5x7 font at scale 1
+/// (7px glyph) plus 5px padding — see draw_bar(). Not configurable; the
+/// three-column layout it implies (16/8/rest chars) is sized against this
+/// exact value.
+const BAR_HEIGHT: u32 = 12;
+
 /// Recompute the dwindle tiling and push each toplevel its new size. Call
 /// whenever the live window set or the output size changes. Also marks the
 /// focused window Activated (others deactivated) so clients render focus state.
 fn relayout(state: &mut State) {
-    let n = state.toplevels.iter().filter(|t| t.alive()).count();
+    let ws = state.active_workspace;
+    let n = state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws).count();
     if state.layout.focused >= n {
         state.layout.focused = n.saturating_sub(1);
     }
     let focused = state.layout.focused;
 
-    // Same alive-only sequence configure/composite/pick_focus all already
-    // use — index into THIS, not the raw toplevels vec.
-    let alive: Vec<&Window> = state.toplevels.iter().filter(|t| t.alive()).collect();
+    // Same alive-and-active-workspace sequence configure/composite/pick_focus
+    // all already use — index into THIS, not the raw toplevels vec. Windows
+    // on other workspaces are simply absent here, so they never get a
+    // configure_size call and never enter layout_rects/composite below —
+    // that's what actually hides them, no separate visibility flag needed.
+    let alive: Vec<&Window> = state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws).collect();
 
     // Which (alive-sequence) index, if any, is the fullscreen window right
     // now. Looked up by identity every call rather than cached, since
@@ -1481,6 +1567,19 @@ fn relayout(state: &mut State) {
     let fs_idx = state.fullscreen.as_ref().and_then(|fs| {
         alive.iter().position(|t| t.wl_surface().as_ref() == Some(fs))
     });
+
+    // Bar reserves a strip of the output — tiled windows only ever see
+    // what's left. A fullscreen window still overrides to the FULL output
+    // just below, ignoring this: fullscreen conventionally covers the bar
+    // too, and composite() skips drawing the bar while something's
+    // fullscreen, so nothing's left peeking out from underneath it.
+    let (tile_h, tile_y) = if state.bar.enabled {
+        let h = state.output_h.saturating_sub(BAR_HEIGHT);
+        let y = if state.bar.position == veil_config::BarPosition::Top { BAR_HEIGHT as i32 } else { 0 };
+        (h, y)
+    } else {
+        (state.output_h, 0)
+    };
 
     // Everyone tiles exactly as if nothing were fullscreen — this is what
     // keeps the *other* windows' positions stable across a fullscreen
@@ -1490,7 +1589,10 @@ fn relayout(state: &mut State) {
     // rects depend on it for viewport position — both are what caused
     // windows to visibly jump/shrink/shift left on fullscreen toggle).
     // The fullscreen window's rect is simply overridden afterward.
-    let mut rects = state.layout.rects(n, state.output_w, state.output_h);
+    let mut rects = state.layout.rects(n, state.output_w, tile_h);
+    for r in rects.iter_mut() {
+        r.y += tile_y;
+    }
     if let Some(fs_i) = fs_idx {
         rects[fs_i] = Rect { x: 0, y: 0, w: state.output_w, h: state.output_h };
     }
@@ -1511,8 +1613,9 @@ fn relayout(state: &mut State) {
 /// Point the keyboard at whichever live toplevel is currently focused (or
 /// nothing, if there are no windows left).
 fn refocus_keyboard(state: &mut State) {
+    let ws = state.active_workspace;
     let target = state.toplevels.iter()
-        .filter(|t| t.alive())
+        .filter(|t| t.alive() && t.workspace == ws)
         .nth(state.layout.focused)
         .and_then(|t| t.wl_surface());
     let serial = state.next_serial();
@@ -1603,6 +1706,7 @@ fn composite_and_send(state: &mut State) {
 
     let show_help = state.show_help;
     let launcher_present = state.launcher.is_some();
+    let ws = state.active_workspace;
 
     let back = &mut state.composite_buf;
 
@@ -1611,8 +1715,11 @@ fn composite_and_send(state: &mut State) {
     // Collected as Option so index i still lines up with layout_rects[i] —
     // an X11 window not yet paired with a wl_surface has nothing to blit,
     // but it still occupies a tiled slot and must not shift later indices.
+    // Filtered to the active workspace — this MUST produce the same
+    // alive-and-active-workspace sequence relayout() used to build
+    // layout_rects, or index i here won't line up with rects[i] anymore.
     let toplevels: Vec<Option<WlSurface>> = state.toplevels.iter()
-        .filter(|t| t.alive())
+        .filter(|t| t.alive() && t.workspace == ws)
         .map(|t| t.wl_surface())
         .collect();
     for (i, surf_opt) in toplevels.iter().enumerate() {
@@ -1631,8 +1738,15 @@ fn composite_and_send(state: &mut State) {
     // non-full) tiled rects now (see relayout()), so without this, one that
     // happens to iterate after the fullscreen window in `toplevels` order
     // could paint its own small rect right over part of it.
+    //
+    // Workspace-filtered too: `state.fullscreen` is only ever set from a
+    // window that was active-workspace at the time (dispatch_action's
+    // ToggleFullscreen and the xdg fullscreen_request handler both look up
+    // the focused window the same filtered way), so a fullscreen window on
+    // a workspace you've since switched away from correctly stops matching
+    // here and this block becomes a no-op until you switch back.
     if let Some(fs) = &state.fullscreen {
-        if let Some(surf) = state.toplevels.iter().filter(|t| t.alive())
+        if let Some(surf) = state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
             .find(|t| t.wl_surface().as_ref() == Some(fs))
             .and_then(|t| t.wl_surface())
         {
@@ -1684,6 +1798,25 @@ fn composite_and_send(state: &mut State) {
     // `theme` is `Copy` (plain color bytes) so pulling it out ahead of the
     // `back` borrow costs nothing.
     let theme = state.theme;
+    if state.bar.enabled && state.fullscreen.is_none() {
+        let mut occupancy = [0u8; veil_config::WORKSPACE_COUNT as usize];
+        for t in state.toplevels.iter().filter(|t| t.alive()) {
+            let idx = t.workspace as usize;
+            if idx < occupancy.len() {
+                occupancy[idx] += 1;
+            }
+        }
+        let active_ws = state.active_workspace;
+        let hitboxes = draw_bar(&theme, &state.bar, active_ws, &occupancy, back, w, h);
+        state.bar_hitboxes = hitboxes;
+    } else {
+        // Fullscreen hides the bar entirely (conventional — see relayout()'s
+        // note on why the fullscreen rect ignores the bar's reserved strip)
+        // and a disabled bar obviously has nothing to draw. Either way, old
+        // hitboxes must go or a click could "launch" through a bar that
+        // isn't there anymore.
+        state.bar_hitboxes.clear();
+    }
     if show_help {
         let keybinds = state.keybinds.clone();
         draw_help_overlay(&keybinds, &theme, back, w, h);
@@ -1758,6 +1891,84 @@ fn composite_and_send(state: &mut State) {
 /// on-screen box, stamped directly into the composited RGBA frame with the
 /// built-in 5x7 font ([`crate::font5x7`]) — veil-host has no other text
 /// rendering.
+/// Renders the status bar: workspace widget (fixed 16 chars), clock (fixed
+/// 8 chars), then app shortcuts filling whatever's left. Returns the
+/// on-screen click target for each app tile — PointerButton consults this
+/// directly rather than redoing this layout math per click.
+///
+/// Font note: the built-in 5x7 bitmap font (font5x7.rs) is caps-only and
+/// has no bullet glyph, so app labels render UPPERCASE regardless of case
+/// here, and the workspace widget's per-window marks use `*` in place of
+/// the `•` bullets from the original bar spec — closest available glyph
+/// with real visual weight (`.` renders as a single near-invisible pixel
+/// at this scale).
+fn draw_bar(
+    theme: &veil_config::Theme,
+    bar: &veil_config::BarConfig,
+    active_ws: u8,
+    occupancy: &[u8; veil_config::WORKSPACE_COUNT as usize],
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+) -> Vec<(Rect, String)> {
+    use crate::font5x7::{draw_text, fill_rect};
+    use veil_config::BarPosition;
+
+    const SCALE: u32 = 1; // full help/launcher overlays use 2 — bar stays
+                           // compact: 7px glyph + 5px padding = BAR_HEIGHT.
+    const ADVANCE: u32 = 6; // (GLYPH_W + 1) * SCALE, matches font5x7's own spacing formula
+    const PAD_Y: i32 = 3;   // vertically centers a 7px glyph in a 12px bar
+
+    let y0 = if bar.position == BarPosition::Top { 0 } else { h.saturating_sub(BAR_HEIGHT) as i32 };
+    fill_rect(back, w, h, 0, y0, w, BAR_HEIGHT, theme.panel_bg);
+
+    // --- Column 1: workspace widget, fixed 16 chars / 96px ---
+    // Only draws up to whichever's higher: the active workspace, or the
+    // highest-numbered occupied one — otherwise all 9 slots would eat the
+    // whole budget before the clock column even started. Each token is
+    // "N:" (empty) or "N:" + up to 3 `*` (one per window, capped). Active
+    // workspace's token gets the accent color so it stands out at a glance.
+    let col1_w = 16 * ADVANCE;
+    let highest = occupancy.iter().rposition(|&c| c > 0)
+        .map(|i| i as u8 + 1)
+        .unwrap_or(0)
+        .max(active_ws + 1)
+        .min(veil_config::WORKSPACE_COUNT);
+    let mut cx = 2i32;
+    for n in 1..=highest {
+        let count = occupancy[(n - 1) as usize];
+        let token = format!("{n}:{}", "*".repeat(count.min(3) as usize));
+        let token_w = token.chars().count() as u32 * ADVANCE;
+        if cx as u32 + token_w > col1_w { break; }
+        let color = if n == active_ws + 1 { theme.accent } else { theme.text_dim };
+        draw_text(back, w, h, cx, y0 + PAD_Y, SCALE, &token, color);
+        cx += token_w as i32 + ADVANCE as i32; // one blank char of gap
+    }
+
+    // --- Column 2: clock, fixed 8 chars / 48px, starts right after col 1 ---
+    // 24-hour per spec. No internal timer needed — this just reads the
+    // current time on whatever cadence composite() already runs at; the
+    // displayed minute obviously only visibly changes once a minute.
+    let col2_x = col1_w as i32;
+    let clock = chrono::Local::now().format("%H:%M").to_string();
+    draw_text(back, w, h, col2_x + 2, y0 + PAD_Y, SCALE, &clock, theme.text);
+
+    // --- Column 3: app shortcuts, whatever width is left ---
+    let col3_x = col1_w as i32 + 8 * ADVANCE as i32;
+    let mut hitboxes = Vec::new();
+    let mut tx = col3_x + 2;
+    for app in &bar.apps {
+        let label = format!("[{}]", app.name);
+        let label_w = label.chars().count() as u32 * ADVANCE;
+        if tx as u32 + label_w > w { break; } // out of bar width — rest just don't fit
+        draw_text(back, w, h, tx, y0 + PAD_Y, SCALE, &label, theme.text);
+        hitboxes.push((Rect { x: tx, y: y0, w: label_w, h: BAR_HEIGHT }, app.exec.clone()));
+        tx += label_w as i32 + ADVANCE as i32;
+    }
+
+    hitboxes
+}
+
 fn draw_help_overlay(keybinds: &veil_config::Keybinds, theme: &veil_config::Theme, back: &mut [u8], w: u32, h: u32) {
     use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
 
@@ -1924,8 +2135,9 @@ fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::util
     // everything else keeps its normal rect (see relayout()) but is
     // visually covered (see composite()), so hit-testing it would let
     // clicks fall through to a window you can't actually see.
+    let ws = state.active_workspace;
     if let Some(fs) = &state.fullscreen {
-        return state.toplevels.iter().filter(|t| t.alive())
+        return state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
             .find(|t| t.wl_surface().as_ref() == Some(fs))
             .and_then(|t| t.wl_surface())
             .map(|surf| (surf, (0.0, 0.0).into()));
@@ -1933,8 +2145,10 @@ fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::util
 
     // Live toplevels paired with their tiled rect, topmost (last) first.
     // Option preserves index alignment with layout_rects (see composite()).
+    // Workspace-filtered for the same reason composite()'s copy is — must
+    // match the exact sequence relayout() used to build layout_rects.
     let live: Vec<Option<WlSurface>> = state.toplevels.iter()
-        .filter(|t| t.alive())
+        .filter(|t| t.alive() && t.workspace == ws)
         .map(|t| t.wl_surface())
         .collect();
     for (i, root_opt) in live.iter().enumerate().rev() {
@@ -2103,6 +2317,25 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
 
         InputCmd::PointerButton { button, pressed } => {
             let bs = if pressed { BState::Pressed } else { BState::Released };
+            const BTN_LEFT: u32 = 0x110;
+
+            // Bar app tile — launch and stop here. A bar click has no
+            // client surface behind it to focus or forward the event to,
+            // so it takes a completely separate path from the click-to-
+            // focus/forwarding below rather than falling through into it.
+            let bar_hit = if pressed && button == BTN_LEFT {
+                let (px, py) = (state.pointer_pos.0 as i32, state.pointer_pos.1 as i32);
+                state.bar_hitboxes.iter()
+                    .find(|(r, _)| px >= r.x && py >= r.y && px < r.x + r.w as i32 && py < r.y + r.h as i32)
+                    .map(|(_, exec)| exec.clone())
+            } else {
+                None
+            };
+
+            if let Some(exec) = bar_hit {
+                spawn_command(&state.socket_name, &exec);
+                return;
+            }
 
             // Left-click on a tile makes it the focused one — just follows
             // click focus, no position rearranging (that's what Alt+S is
@@ -2111,7 +2344,6 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // not whatever keyboard nav last visited. A click inside the
             // already-focused tile hits `idx == layout.focused` and no-ops,
             // so ordinary clicks/typing inside an app are unaffected.
-            const BTN_LEFT: u32 = 0x110;
             if pressed && button == BTN_LEFT {
                 if let Some(idx) = toplevel_at(state, state.pointer_pos.0, state.pointer_pos.1) {
                     if idx != state.layout.focused {
@@ -2204,7 +2436,7 @@ fn remove_x11_window(state: &mut State, window: &X11Surface) {
     }
 
     let before = state.toplevels.len();
-    state.toplevels.retain(|w| !matches!(w, Window::X11(x) if x == window));
+    state.toplevels.retain(|w| !matches!(&w.surface, WindowSurface::X11(x) if x == window));
     if state.toplevels.len() != before {
         relayout(state);
         refocus_keyboard(state);
@@ -2243,8 +2475,9 @@ impl XwmHandler for State {
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_mapped(true);
         let wl = window.wl_surface();
-        self.toplevels.push(Window::X11(window));
-        let n = self.toplevels.iter().filter(|t| t.alive()).count();
+        self.toplevels.push(Window::new(WindowSurface::X11(window), self.active_workspace));
+        let ws = self.active_workspace;
+        let n = self.toplevels.iter().filter(|t| t.alive() && t.workspace == ws).count();
         self.layout.focused = n.saturating_sub(1);
         // Only if already paired with a wl_surface (usually is, by this
         // point) — if not yet, it'll pick up focus on the next natural
@@ -2316,7 +2549,8 @@ impl XwmHandler for State {
         // output-sized but offset — visibly "half on screen".
         if !or && w == Some(self.output_w) && h == Some(self.output_h) {
             if let Some(wl) = window.wl_surface() {
-                if let Some(i) = self.toplevels.iter().filter(|t| t.alive())
+                let ws = self.active_workspace;
+                if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
                     .position(|t| t.wl_surface().as_ref() == Some(&wl))
                 {
                     self.layout.focused = i;
@@ -2356,7 +2590,8 @@ impl XwmHandler for State {
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let Some(wl) = window.wl_surface() else { return };
-        if let Some(i) = self.toplevels.iter().filter(|t| t.alive())
+        let ws = self.active_workspace;
+        if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
             .position(|t| t.wl_surface().as_ref() == Some(&wl))
         {
             self.layout.focused = i;
@@ -2433,6 +2668,7 @@ pub fn run(
     keybinds: veil_config::Keybinds,
     background: [u8; 3],
     theme: veil_config::Theme,
+    bar: veil_config::BarConfig,
 ) -> io::Result<()> {
     let composite_interval = Duration::from_millis(1000 / fps.max(1) as u64);
     let display: Display<State> = Display::new()
@@ -2567,11 +2803,15 @@ pub fn run(
         xwm: None,
         xwayland_shell_state,
         layout: Layout::default(),
+        workspace_layouts: [Layout::default(); veil_config::WORKSPACE_COUNT as usize],
+        active_workspace: 0,
         layout_rects: Vec::new(),
         keybinds,
         show_help: false,
         background: [background[0], background[1], background[2], 255],
         theme,
+        bar,
+        bar_hitboxes: Vec::new(),
         // No anchor client to spawn into (`veil-host start`) → open straight
         // to the launcher instead of an empty screen with no hint of what to press.
         launcher: if spawn.is_none() { Some(Launcher::new()) } else { None },

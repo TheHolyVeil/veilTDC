@@ -137,6 +137,13 @@ pub enum Action {
     ToggleFullscreen,
     /// Hot-reload config file on demand.
     ReloadConfig,
+    /// Switch the active workspace (1-indexed 1..=9, matches the Super+1..9
+    /// keys visually — converted to a 0-indexed array slot in veil-host).
+    SwitchWorkspace(u8),
+    /// Move the focused window to a workspace and follow it there (matches
+    /// niri's default convention — move-and-stay would leave you looking at
+    /// an empty workspace). 1-indexed, same as `SwitchWorkspace`.
+    MoveToWorkspace(u8),
     VolumeUp,
     VolumeDown,
     VolumeMute,
@@ -160,6 +167,8 @@ impl Action {
             Self::ToggleLayout     => "toggle layout mode".to_string(),
             Self::ToggleFullscreen => "toggle fullscreen".to_string(),
             Self::ReloadConfig     => "reload config".to_string(),
+            Self::SwitchWorkspace(n) => format!("switch to workspace {n}"),
+            Self::MoveToWorkspace(n) => format!("move to workspace {n}"),
             Self::VolumeUp         => "volume up".to_string(),
             Self::VolumeDown       => "volume down".to_string(),
             Self::VolumeMute       => "toggle mute".to_string(),
@@ -169,6 +178,23 @@ impl Action {
         }
     }
 }
+
+/// Number of workspaces (Super+1..9). Fixed rather than configurable — a
+/// variable count would mean variable-length digit keybinds too, which
+/// complicates the OSD/help display for no real benefit; 9 covers what
+/// digit keys can address on a standard keyboard anyway.
+pub const WORKSPACE_COUNT: u8 = 9;
+
+/// US/QWERTY shift+digit-row symbols, index 0 == workspace 1 — used for the
+/// default move-window-to-workspace binds (Super+Shift+1..9). No special
+/// input-handling code needed for the "Shift" part: xkb already produces
+/// these symbol keysyms when Shift is held over the digit row, so this
+/// rides the exact same char-lookup path as every other keybind. Layout-
+/// dependent like the rest of this file's char-based binds already are
+/// (h/l/j/k assume a QWERTY-ish physical layout too) — a non-US layout
+/// that shifts the digit row differently will need a `keybinds.apps`
+/// override for this to land on the keys you'd expect.
+const SHIFTED_DIGIT_SYMBOLS: [char; 9] = ['!', '@', '#', '$', '%', '^', '&', '*', '('];
 
 /// Parsed `keybinds` table. `binds` preserves declaration order — the Super+/
 /// help overlay lists them verbatim, so config order is display order.
@@ -201,7 +227,20 @@ impl Default for Keybinds {
                 ('w', Action::ToggleLayout),
                 ('f', Action::ToggleFullscreen),
                 ('c', Action::ReloadConfig),
-            ],
+            ]
+            // Super+1..9 workspace switch — appended rather than inlined
+            // above so the numeric range stays visually obvious and doesn't
+            // need updating if WORKSPACE_COUNT ever changes.
+            .into_iter()
+            .chain((1..=WORKSPACE_COUNT).map(|n| {
+                (char::from_digit(n as u32, 10).unwrap(), Action::SwitchWorkspace(n))
+            }))
+            // Super+Shift+1..9 — move focused window to that workspace and
+            // follow it there.
+            .chain((1..=WORKSPACE_COUNT).map(|n| {
+                (SHIFTED_DIGIT_SYMBOLS[(n - 1) as usize], Action::MoveToWorkspace(n))
+            }))
+            .collect(),
         }
     }
 }
@@ -246,6 +285,16 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
             })?;
         Some((key, action.clone()))
     }).collect();
+
+    // Super+1..9 workspace switch and Super+Shift+1..9 move-to-workspace —
+    // not in FIELDS above (no natural single Lua field name for eighteen
+    // keys), so seeded straight from the defaults rather than looped
+    // per-field. Still user-overridable: the `apps` loop below runs after
+    // this and will happily replace either if someone wants those keys for
+    // something else instead.
+    binds.extend(default.binds.iter()
+        .filter(|(_, a)| matches!(a, Action::SwitchWorkspace(_) | Action::MoveToWorkspace(_)))
+        .cloned());
 
     // App keybinds: keybinds.apps = { b = "helium", t = "kitty" } or global apps table
     let app_table = t.get::<mlua::Table>("apps")
@@ -477,6 +526,73 @@ impl Theme {
     }
 }
 
+/// Where the bar sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarPosition {
+    Top,
+    Bottom,
+}
+
+impl BarPosition {
+    fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "top" => Self::Top,
+            _     => Self::Bottom,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Top    => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+}
+
+/// One clickable shortcut tile on the bar. `name` is the on-screen label —
+/// the bitmap font is caps-only, so it always renders uppercase regardless
+/// of how you write it here — and, unless `exec` is given, also the click
+/// target run through `sh -c`.
+#[derive(Debug, Clone)]
+pub struct BarApp {
+    pub name: String,
+    pub exec: String,
+}
+
+/// `bar = { ... }` in config.lua. Only what's configurable about the bar —
+/// tile rendering (workspace widget, clock, app shortcuts) is a fixed
+/// three-column layout in veil-host, not something exposed here.
+#[derive(Debug, Clone)]
+pub struct BarConfig {
+    pub enabled:  bool,
+    pub position: BarPosition,
+    pub apps:     Vec<BarApp>,
+}
+
+impl Default for BarConfig {
+    fn default() -> Self {
+        Self { enabled: true, position: BarPosition::Bottom, apps: Vec::new() }
+    }
+}
+
+fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
+    let Ok(bt) = gl.get::<mlua::Table>("bar") else { return default.clone() };
+    let enabled = bt.get::<bool>("enabled").unwrap_or(default.enabled);
+    let position = bt.get::<String>("position")
+        .map(|s| BarPosition::from_str(&s))
+        .unwrap_or(default.position);
+    let mut apps = Vec::new();
+    if let Ok(apps_t) = bt.get::<mlua::Table>("apps") {
+        for entry in apps_t.sequence_values::<mlua::Table>().flatten() {
+            let name = entry.get::<String>("name").unwrap_or_default();
+            if name.is_empty() { continue; }
+            let exec = entry.get::<String>("exec").unwrap_or_else(|_| name.clone());
+            apps.push(BarApp { name, exec });
+        }
+    }
+    BarConfig { enabled, position, apps }
+}
+
 #[derive(Debug, Clone)]
 pub struct VeilConfig {
     pub quality:           Quality,
@@ -501,6 +617,8 @@ pub struct VeilConfig {
     /// purely for round-tripping to things like `veil-host probe`, which
     /// wants to display the name, not the raw color bytes.
     pub theme_name:         ThemeName,
+    /// `bar = { ... }` config — see `BarConfig`.
+    pub bar:                BarConfig,
 }
 
 impl Default for VeilConfig {
@@ -516,6 +634,7 @@ impl Default for VeilConfig {
             background:        [0x8c, 0x8c, 0x8c],
             theme:             Theme::for_name(ThemeName::Default),
             theme_name:        ThemeName::Default,
+            bar:               BarConfig::default(),
         }
     }
 }
@@ -622,6 +741,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
             .unwrap_or(theme.background),
         theme,
         theme_name,
+        bar: parse_bar(&gl, &d.bar),
     })
 }
 

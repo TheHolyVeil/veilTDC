@@ -81,6 +81,7 @@ pub enum LayoutMode {
 }
 
 /// Tiling state not derivable from the window list.
+#[derive(Clone, Copy)]
 pub struct Layout {
     /// Index (into the live-toplevel order) of the focused window.
     pub focused: usize,

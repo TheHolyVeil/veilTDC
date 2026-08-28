@@ -4,6 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 image        = "0.25"
+chrono       = "0.4"
 clap         = { version = "4", features = ["derive"] }
 mlua         = { version = "0.10", features = ["lua54", "vendored"] }
 crossterm    = "0.28"

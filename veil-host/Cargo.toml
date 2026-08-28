@@ -16,6 +16,7 @@ path = "src/main.rs"
 smithay            = { workspace = true }
 calloop            = { workspace = true }
 tracing            = { workspace = true }
+chrono             = { workspace = true }
 veil-render        = { path = "../veil-render" }
 veil-config        = { path = "../veil-config" }
 veil-gpu           = { path = "../veil-gpu" }

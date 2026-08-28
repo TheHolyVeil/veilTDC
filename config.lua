@@ -45,6 +45,32 @@ theme = "default" -- default | nord | dracula | catppuccin | gruvbox | everfores
 -- out entirely to let `theme` above pick the background for you instead.
 background = "#8c8c8c" -- hex, "#RRGGBB" or "RRGGBB" — cement grey default
 
+-- Status bar: workspace widget + clock + app shortcuts. Fixed three-column
+-- layout (workspace widget 16 chars, clock 8 chars, shortcuts fill the
+-- rest), 12px tall, rendered with the same built-in 5x7 bitmap font as the
+-- help/launcher overlays — no new font engine. Themed by `theme` above
+-- (panel_bg for the strip, text/text_dim/accent for the columns).
+--
+-- App labels render UPPERCASE regardless of case here — the bitmap font is
+-- caps-only, same as the help overlay's keybind list.
+bar = {
+	enabled = true,   -- false hides the bar entirely and gives tiled windows
+	                   -- back the full output height
+	position = "bottom", -- top | bottom
+
+	-- Click any tile to launch it. This is separate from `keybinds.apps` /
+	-- top-level `apps` above — that table gives a shortcut a KEYBIND, this
+	-- one puts it on the BAR. Set both (matching name + exec) if you want
+	-- an app both clickable and keybound, e.g. `apps = { f = "firefox" }`
+	-- above alongside the firefox entry below for Alt+F too.
+	apps = {
+		{ name = "firefox",  exec = "firefox" },
+		{ name = "foot",     exec = "foot" },
+		{ name = "nautilus", exec = "nautilus" },
+		{ name = "code",     exec = "code" },
+	},
+}
+
 -- Output backend. "auto" (default) picks terminal under a WM/SSH, DRM/KMS on
 -- bare TTY. Set "drm" to always go straight for DRM/KMS on `run` (same as
 -- VEIL_OUTPUT=drm, but you don't have to re-type it every time) — good for a
@@ -78,6 +104,24 @@ keybinds = {
 }
 -- Help overlay: <mod_key>+/ (e.g. Alt+/ above) always toggles a keybind
 -- cheat-sheet — hardcoded, not itself a config entry.
+--
+-- Workspaces: <mod_key>+1..9 switches workspace (e.g. Alt+1..Alt+9 above),
+-- <mod_key>+Shift+1..9 moves the focused window to that workspace and
+-- follows it there (Alt+Shift+1..Alt+Shift+9). Both are default binds, not
+-- individual `keybinds.*` fields above — there's no natural single-word Lua
+-- field name for eighteen keys — but they're still remappable the same way
+-- any other key is: add an entry to `keybinds.apps` (or the top-level
+-- `apps` table) keyed by the digit or shift-symbol character you want
+-- instead, same as overriding any app-launch key. Per-workspace tiling
+-- state (focus, split ratio, flip, dwindle/scroll mode) is remembered
+-- independently — switching back to a workspace finds it exactly as you
+-- left it, not reset.
+--
+-- NOTE: the move-to-workspace shift-symbol keys (!@#$%^&*() assume a
+-- US/QWERTY-ish physical layout, same class of assumption this file's
+-- h/l/j/k focus binds already make. A layout that shifts the digit row
+-- differently will need the `keybinds.apps` override above to land on the
+-- keys you'd expect.
 --
 -- Shift+Alt+E: graceful quit — fixed, not scaled to mod_key (same reasoning
 -- as Ctrl+C below: your escape hatch shouldn't move when you remap the
