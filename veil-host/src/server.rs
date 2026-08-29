@@ -1807,7 +1807,7 @@ fn composite_and_send(state: &mut State) {
             }
         }
         let active_ws = state.active_workspace;
-        let hitboxes = draw_bar(&theme, &state.bar, active_ws, &occupancy, back, w, h);
+        let hitboxes = draw_bar(&theme, &state.bar, &state.keybinds, active_ws, &occupancy, back, w, h);
         state.bar_hitboxes = hitboxes;
     } else {
         // Fullscreen hides the bar entirely (conventional — see relayout()'s
@@ -1892,9 +1892,12 @@ fn composite_and_send(state: &mut State) {
 /// built-in 5x7 font ([`crate::font5x7`]) — veil-host has no other text
 /// rendering.
 /// Renders the status bar: workspace widget (fixed 16 chars), clock (fixed
-/// 8 chars), then app shortcuts filling whatever's left. Returns the
-/// on-screen click target for each app tile — PointerButton consults this
-/// directly rather than redoing this layout math per click.
+/// 8 chars), then app shortcuts filling whatever's left. Shortcuts are
+/// derived from `keybinds` — every `Action::Launch` bind becomes a tile,
+/// labeled from its command — not a separate config list, so nothing needs
+/// declaring twice. Returns the on-screen click target for each app tile —
+/// PointerButton consults this directly rather than redoing this layout
+/// math per click.
 ///
 /// Font note: the built-in 5x7 bitmap font (font5x7.rs) is caps-only and
 /// has no bullet glyph, so app labels render UPPERCASE regardless of case
@@ -1905,6 +1908,7 @@ fn composite_and_send(state: &mut State) {
 fn draw_bar(
     theme: &veil_config::Theme,
     bar: &veil_config::BarConfig,
+    keybinds: &veil_config::Keybinds,
     active_ws: u8,
     occupancy: &[u8; veil_config::WORKSPACE_COUNT as usize],
     back: &mut [u8],
@@ -1954,15 +1958,23 @@ fn draw_bar(
     draw_text(back, w, h, col2_x + 2, y0 + PAD_Y, SCALE, &clock, theme.text);
 
     // --- Column 3: app shortcuts, whatever width is left ---
+    // Every Action::Launch bind becomes a tile — no separate `bar.apps`
+    // list to keep in sync. Label is the command's program name (first
+    // whitespace token, path stripped), so `apps.f = "firefox"` shows as
+    // FIREFOX and `apps.t = "foot -e htop"` shows as FOOT, not the full
+    // command line. Order follows `keybinds.binds` declaration order.
     let col3_x = col1_w as i32 + 8 * ADVANCE as i32;
     let mut hitboxes = Vec::new();
     let mut tx = col3_x + 2;
-    for app in &bar.apps {
-        let label = format!("[{}]", app.name);
+    for (_, action) in &keybinds.binds {
+        let veil_config::Action::Launch(cmd) = action else { continue };
+        let prog = cmd.split_whitespace().next().unwrap_or(cmd);
+        let name = prog.rsplit('/').next().unwrap_or(prog);
+        let label = format!("[{name}]");
         let label_w = label.chars().count() as u32 * ADVANCE;
         if tx as u32 + label_w > w { break; } // out of bar width — rest just don't fit
         draw_text(back, w, h, tx, y0 + PAD_Y, SCALE, &label, theme.text);
-        hitboxes.push((Rect { x: tx, y: y0, w: label_w, h: BAR_HEIGHT }, app.exec.clone()));
+        hitboxes.push((Rect { x: tx, y: y0, w: label_w, h: BAR_HEIGHT }, cmd.clone()));
         tx += label_w as i32 + ADVANCE as i32;
     }
 

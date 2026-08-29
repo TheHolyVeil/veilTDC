@@ -549,29 +549,22 @@ impl BarPosition {
     }
 }
 
-/// One clickable shortcut tile on the bar. `name` is the on-screen label —
-/// the bitmap font is caps-only, so it always renders uppercase regardless
-/// of how you write it here — and, unless `exec` is given, also the click
-/// target run through `sh -c`.
-#[derive(Debug, Clone)]
-pub struct BarApp {
-    pub name: String,
-    pub exec: String,
-}
-
 /// `bar = { ... }` in config.lua. Only what's configurable about the bar —
 /// tile rendering (workspace widget, clock, app shortcuts) is a fixed
-/// three-column layout in veil-host, not something exposed here.
+/// three-column layout in veil-host, not something exposed here. Notably
+/// NOT configured here: which apps show up as shortcuts — those are
+/// derived straight from `keybinds.apps`/top-level `apps` (every
+/// `Action::Launch` bind becomes a tile) instead of a separate list, so an
+/// app never needs declaring twice.
 #[derive(Debug, Clone)]
 pub struct BarConfig {
     pub enabled:  bool,
     pub position: BarPosition,
-    pub apps:     Vec<BarApp>,
 }
 
 impl Default for BarConfig {
     fn default() -> Self {
-        Self { enabled: true, position: BarPosition::Bottom, apps: Vec::new() }
+        Self { enabled: true, position: BarPosition::Bottom }
     }
 }
 
@@ -581,16 +574,7 @@ fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
     let position = bt.get::<String>("position")
         .map(|s| BarPosition::from_str(&s))
         .unwrap_or(default.position);
-    let mut apps = Vec::new();
-    if let Ok(apps_t) = bt.get::<mlua::Table>("apps") {
-        for entry in apps_t.sequence_values::<mlua::Table>().flatten() {
-            let name = entry.get::<String>("name").unwrap_or_default();
-            if name.is_empty() { continue; }
-            let exec = entry.get::<String>("exec").unwrap_or_else(|_| name.clone());
-            apps.push(BarApp { name, exec });
-        }
-    }
-    BarConfig { enabled, position, apps }
+    BarConfig { enabled, position }
 }
 
 #[derive(Debug, Clone)]
