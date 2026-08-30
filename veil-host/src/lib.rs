@@ -16,6 +16,7 @@ pub mod input;
 pub mod input_backend;
 pub mod launcher;
 pub mod layout;
+pub mod powermenu;
 pub mod lockfile;
 pub mod server;
 pub mod sink;

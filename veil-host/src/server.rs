@@ -109,6 +109,7 @@ use crate::{input::InputCmd, sink::Frame};
 use crate::layout::{Layout, Rect};
 use crate::detile::GpuImporter;
 use crate::launcher::Launcher;
+use crate::powermenu::{PowerMenu, PowerAction};
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -126,15 +127,22 @@ pub enum WindowSurface {
 /// doesn't use (compositing here is manual, no Space).
 pub struct Window {
     pub surface: WindowSurface,
-    /// Which workspace this window is tiled on (0-indexed, 0..WORKSPACE_COUNT).
-    /// Set at creation to whatever workspace was active at the time; moved
-    /// only by future move-to-workspace keybinds (none bound yet).
+    /// Which monitor this window was spawned on (index into `State.monitors`).
+    /// "Dumb" multi-monitor: a window never migrates monitors on its own —
+    /// only an explicit future move-to-monitor action would change this,
+    /// same as `workspace` below only moves via move-to-workspace.
+    pub monitor: usize,
+    /// Which workspace this window is tiled on (0-indexed, 0..WORKSPACE_COUNT)
+    /// — scoped to `monitor` above, not global; monitor 0's workspace 3 and
+    /// monitor 1's workspace 3 are unrelated. Set at creation to whatever
+    /// workspace was active on that monitor at the time; moved only by
+    /// future move-to-workspace keybinds (none bound yet).
     pub workspace: u8,
 }
 
 impl Window {
-    pub fn new(surface: WindowSurface, workspace: u8) -> Self {
-        Self { surface, workspace }
+    pub fn new(surface: WindowSurface, monitor: usize, workspace: u8) -> Self {
+        Self { surface, monitor, workspace }
     }
 
     /// False once the client destroys it (xdg) or the X connection drops it.
@@ -212,6 +220,65 @@ pub struct OsdNotification {
     pub expires_at: Instant,
 }
 
+/// One monitor's worth of independent compositor state — its own
+/// workspaces, tiling, composite buffer, damage tracking, bar hitboxes.
+/// "Dumb" multi-monitor (see MULTI_MONITOR_SCOPE.md): nothing here is ever
+/// shared or synced across monitors except by explicit user action (a
+/// future move-to-monitor keybind). Populated from real display detection
+/// via `InputCmd::SetMonitors`; which monitor is "active" is resolved from
+/// the shared `State.pointer_global` against each monitor's `rect` — see
+/// `active_monitor_idx`.
+pub struct Monitor {
+    /// Position + size in the shared *virtual* arrangement space, side by
+    /// side left-to-right — used only for pointer routing (which monitor
+    /// the cursor is over). Set by `InputCmd::SetMonitors`.
+    pub rect: Rect,
+    pub output_w: u32,
+    pub output_h: u32,
+    /// LOCAL to this monitor (0,0 origin) — everything that reads this
+    /// (click math, cursor blit, pick_focus) already only ever deals in
+    /// monitor-local coordinates, so keeping it local here means none of
+    /// that code needs to change across the whole multi-monitor project.
+    pub pointer_pos: (f64, f64),
+    pub fullscreen: Option<WlSurface>,
+    pub layout: Layout,
+    pub workspace_layouts: [Layout; veil_config::WORKSPACE_COUNT as usize],
+    pub active_workspace: u8,
+    pub layout_rects: Vec<Rect>,
+    pub bar_hitboxes: Vec<(Rect, String)>,
+    pub composite_buf: Vec<u8>,
+    pub damage: Option<Rect>,
+    pub last_composite: Option<Instant>,
+    /// The Arc we handed to frame_tx last time for THIS monitor. See the
+    /// field doc on the old flat `State.prev_frame` — same reclaim trick,
+    /// now one slot per monitor since each sends its own Frame.
+    pub prev_frame: Option<Arc<Vec<u8>>>,
+}
+
+impl Monitor {
+    /// A monitor's `pointer_pos`, `layout`, and `layout_rects` all start
+    /// empty/default; workspace 0 (workspace "1") starts active, same as
+    /// the old flat `State` defaults did.
+    fn new(width: u32, height: u32, origin_x: i32) -> Self {
+        Self {
+            rect: Rect { x: origin_x, y: 0, w: width, h: height },
+            output_w: width,
+            output_h: height,
+            pointer_pos: (0.0, 0.0),
+            fullscreen: None,
+            layout: Layout::default(),
+            workspace_layouts: Default::default(),
+            active_workspace: 0,
+            layout_rects: Vec::new(),
+            bar_hitboxes: Vec::new(),
+            composite_buf: Vec::new(),
+            damage: None,
+            last_composite: None,
+            prev_frame: None,
+        }
+    }
+}
+
 pub struct State {
     pub compositor_state:  CompositorState,
     pub xdg_shell_state:   XdgShellState,
@@ -251,17 +318,24 @@ pub struct State {
     pub keyboard:          KeyboardHandle<Self>,
     pub pointer:           PointerHandle<Self>,
     pub output:            Output,
-    pub output_w:          u32,
-    pub output_h:          u32,
-    /// Last absolute pointer position; pointer.motion() needs an absolute
-    /// location, so we keep track of it across button/scroll events.
-    pub pointer_pos:       (f64, f64),
+    /// One entry per physical display, side by side left-to-right in
+    /// detection order (see `InputCmd::SetMonitors`). `monitors[0]` is what
+    /// the old flat `output_w`/`output_h`/`pointer_pos`/`fullscreen`/
+    /// `layout`/`workspace_layouts`/`active_workspace`/`layout_rects`/
+    /// `bar_hitboxes`/`composite_buf`/`damage`/`last_composite`/
+    /// `prev_frame` fields used to be. See `Monitor` and
+    /// `active_monitor_idx`. Starts as exactly one entry (a startup guess,
+    /// terminal-mode-shaped) and gets rebuilt to match reality once
+    /// `SetMonitors` arrives with real sizes from output detection.
+    pub monitors:          Vec<Monitor>,
+    /// Pointer position in the shared virtual arrangement space that spans
+    /// every monitor's `rect` — NOT any single monitor's local coordinates
+    /// (see `Monitor::pointer_pos` for that). The only thing every monitor
+    /// shares: "where is the cursor right now, across the whole
+    /// arrangement." `active_monitor_idx` resolves which monitor that
+    /// falls inside; `InputCmd::PointerMotionAbs` is what updates it.
+    pub pointer_global:    (f64, f64),
     pub toplevels:         Vec<Window>,
-    /// The one window currently fullscreen, if any — identified by
-    /// wl_surface rather than a toplevels index, since indices shift on
-    /// insert/remove but a WlSurface identity doesn't. relayout() looks up
-    /// its current position each call rather than trusting a stored index.
-    pub fullscreen:        Option<WlSurface>,
     /// Override-redirect X11 windows (menus, tooltips, Steam's own popups) —
     /// unmanaged, positioned absolutely by the client itself, never tiled.
     /// Painted last (topmost) every composite. See mapped_override_redirect_window.
@@ -271,23 +345,6 @@ pub struct State {
     /// isn't installed).
     pub xwm:               Option<X11Wm>,
     pub xwayland_shell_state: XWaylandShellState,
-    /// Dwindle tiling state (focus + split orientation) for the ACTIVE
-    /// workspace only. Swapped out to/from `workspace_layouts` on
-    /// `SwitchWorkspace` — see `dispatch_action`. This split (rather than
-    /// always indexing `workspace_layouts[active_workspace]` everywhere)
-    /// keeps every existing `state.layout.*` call site working unchanged.
-    pub layout:            Layout,
-    /// Per-workspace tiling state for the 9 workspaces, INCLUDING the
-    /// active one's slot (kept in sync on every switch, not read from
-    /// directly while its workspace is active — `layout` above is the live
-    /// copy then). Index 0 == workspace 1, matching `active_workspace`.
-    pub workspace_layouts: [Layout; veil_config::WORKSPACE_COUNT as usize],
-    /// 0-indexed active workspace (workspace 1 == 0). Super+1..9 switches
-    /// this; new windows are tagged with whatever this is at creation time.
-    pub active_workspace:  u8,
-    /// Per-window rects, indexed to match the live-toplevel order. Recomputed
-    /// by `relayout` whenever the window set or output size changes.
-    pub layout_rects:      Vec<Rect>,
     /// Parsed `keybinds` config (Combo 4). Super+/ (hardcoded, not itself
     /// configurable) toggles `show_help`.
     pub keybinds:          veil_config::Keybinds,
@@ -300,15 +357,12 @@ pub struct State {
     /// `veil_config::Theme`. Swapped wholesale on `reload_config`.
     pub theme:              veil_config::Theme,
     pub bar:                veil_config::BarConfig,
-    /// Screen-space rects of the bar's clickable app tiles, keyed to their
-    /// `exec` command — rebuilt every time `draw_bar` runs (once per
-    /// composite tick when the bar's on screen; cheap, a handful of rects).
-    /// `PointerButton` consults this before falling through to normal
-    /// click-to-focus/forwarding.
-    pub bar_hitboxes:       Vec<(Rect, String)>,
     /// `<mod_key>+D` app launcher — `Some` while the modal is open. See
     /// `crate::launcher`. Not itself a `keybinds` config entry, same as help.
     pub launcher:          Option<Launcher>,
+    /// `<mod_key>+P` power menu — `Some` while the modal is open. Same
+    /// intercept-all-input shape as `launcher`, see `crate::powermenu`.
+    pub power_menu:        Option<PowerMenu>,
     /// Own Wayland socket name, so launcher-spawned clients can connect back
     /// into us (`WAYLAND_DISPLAY=<this>`).
     pub socket_name:       String,
@@ -316,14 +370,6 @@ pub struct State {
     pub surface_buffers:   HashMap<ObjectId, SurfaceBuf>,
     pub cursor_status:     CursorImageStatus,
     pub dirty:             bool,
-    /// Union of changed regions since the last composite. `None` alongside
-    /// `dirty == true` shouldn't happen in practice (every dirty=true site
-    /// also sets this via `mark_dirty_rect`/`mark_dirty_full`) but composite
-    /// treats `None` as "assume full frame" rather than panicking, so a
-    /// future call site that forgets to set it degrades to the old
-    /// always-full-redraw behavior instead of drawing nothing.
-    pub damage:            Option<Rect>,
-    pub last_composite:    Option<Instant>,
     pub frame_tx:          mpsc::Sender<Frame>,
     pub serial_counter:    u32,
     pub frame_serial:      u64,
@@ -338,11 +384,6 @@ pub struct State {
     pub clipboard_rx:         mpsc::Receiver<String>,
     pub pending_copy_out:     bool,
     pub client_has_selection: bool,
-    pub composite_buf:        Vec<u8>,
-    /// The Arc we handed to frame_tx last time. Checked next composite via
-    /// Arc::try_unwrap — if the render thread has already dropped its
-    /// clone, we reclaim the allocation instead of allocating fresh.
-    pub prev_frame:           Option<Arc<Vec<u8>>>,
     pub config_path:          Option<std::path::PathBuf>,
     pub config_mtime:         Option<std::time::SystemTime>,
     pub last_config_check:    Instant,
@@ -514,8 +555,8 @@ impl CompositorHandler for State {
                     tracing::info!("commit {} → surface_buffers {}x{}", surface.id(), w, h);
                     self.surface_buffers.insert(surface.id(), SurfaceBuf { rgba: dest, w, h });
                     match toplevel_rect_for(self, surface) {
-                        Some(r) => mark_dirty_rect(self, r),
-                        None    => mark_dirty_full(self), // subsurface/popup/cursor — no precise rect
+                        Some((m, r)) => mark_dirty_rect(self, m, r),
+                        None         => mark_dirty_full(self), // subsurface/popup/cursor — no precise rect
                     }
                 } else {
                     tracing::warn!("commit {} — unsupported buffer type, skipping", surface.id());
@@ -537,8 +578,8 @@ impl CompositorHandler for State {
             Assign::Removed => {
                 self.surface_buffers.remove(&surface.id());
                 match toplevel_rect_for(self, surface) {
-                    Some(r) => mark_dirty_rect(self, r),
-                    None    => mark_dirty_full(self),
+                    Some((m, r)) => mark_dirty_rect(self, m, r),
+                    None         => mark_dirty_full(self),
                 }
             }
             Assign::None => {
@@ -557,8 +598,8 @@ impl CompositorHandler for State {
     fn destroyed(&mut self, surface: &WlSurface) {
         if self.surface_buffers.remove(&surface.id()).is_some() {
             match toplevel_rect_for(self, surface) {
-                Some(r) => mark_dirty_rect(self, r),
-                None    => mark_dirty_full(self),
+                Some((m, r)) => mark_dirty_rect(self, m, r),
+                None         => mark_dirty_full(self),
             }
         }
     }
@@ -579,11 +620,16 @@ impl XdgShellHandler for State {
         let kb = self.keyboard.clone();
         kb.set_focus(self, Some(wl), serial);
 
-        self.toplevels.push(Window::new(WindowSurface::Xdg(surface), self.active_workspace));
+        // New windows land on whichever monitor is active right now — the
+        // dumb-multi-monitor placement rule (see MULTI_MONITOR_SCOPE.md):
+        // "wherever the cursor is" decides both the monitor AND (below) the
+        // workspace a new window is tagged with.
+        let idx = active_monitor_idx(self);
+        let ws = self.monitors[idx].active_workspace;
+        self.toplevels.push(Window::new(WindowSurface::Xdg(surface), idx, ws));
         // New window takes focus; retile so every window gets its rect + size.
-        let ws = self.active_workspace;
-        let n = self.toplevels.iter().filter(|t| t.alive() && t.workspace == ws).count();
-        self.layout.focused = n.saturating_sub(1);
+        let n = self.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).count();
+        self.monitors[idx].layout.focused = n.saturating_sub(1);
         relayout(self);
     }
 
@@ -601,20 +647,31 @@ impl XdgShellHandler for State {
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<wl_output::WlOutput>) {
         let wl = surface.wl_surface().clone();
-        let ws = self.active_workspace;
-        if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
+        let idx = active_monitor_idx(self);
+        let ws = self.monitors[idx].active_workspace;
+        if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
             .position(|t| t.wl_surface().as_ref() == Some(&wl))
         {
-            self.layout.focused = i;
+            self.monitors[idx].layout.focused = i;
         }
-        self.fullscreen = Some(wl);
+        self.monitors[idx].fullscreen = Some(wl);
         relayout(self);
         refocus_keyboard(self);
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        if self.fullscreen.as_ref() == Some(surface.wl_surface()) {
-            self.fullscreen = None;
+        // Client-initiated, not keyboard-triggered — don't assume this is
+        // the active (cursor) monitor. Look up which monitor actually has
+        // this window fullscreen instead. Known 2a/2b limitation: relayout()
+        // below still only ever retiles the ACTIVE monitor internally (see
+        // its doc), so if this window's monitor isn't the active one, its
+        // own retile is delayed until that monitor next goes dirty for some
+        // other reason. Invisible with one monitor (today); a real fix
+        // means relayout() accepting an explicit monitor instead of always
+        // resolving its own — noted for Phase 2b/3, not fixed here.
+        let wl = surface.wl_surface().clone();
+        if let Some(idx) = self.monitors.iter().position(|m| m.fullscreen.as_ref() == Some(&wl)) {
+            self.monitors[idx].fullscreen = None;
             relayout(self);
         }
     }
@@ -1310,62 +1367,111 @@ pub fn reload_config(state: &mut State) {
     mark_dirty_full(state);
 }
 
+/// Which monitor is "active" right now — every keyboard-triggered action,
+/// relayout, and dirty-mark resolves this fresh rather than trusting a
+/// stored index. Matches the dumb model exactly: whichever monitor the
+/// cursor is currently over IS the active one, full stop, no separate
+/// concept of "focused monitor" that could drift out of sync with the
+/// cursor.
+///
+/// Resolved fresh every call from `pointer_global` against each monitor's
+/// `rect` (side-by-side virtual arrangement — see `InputCmd::SetMonitors`).
+/// Falls back to monitor 0 if the point somehow lands outside every rect
+/// (shouldn't happen — `pointer_global` is clamped to the combined
+/// bounding box wherever it's written — but a safe default beats a panic
+/// if some future caller ever writes an out-of-range value).
+fn active_monitor_idx(state: &State) -> usize {
+    let (gx, gy) = state.pointer_global;
+    state.monitors.iter()
+        .position(|m| m.rect.contains(gx as i32, gy as i32))
+        .unwrap_or(0)
+}
+
 /// Run a Combo-4 keybind action against the live layout, then re-tile and
 /// re-focus so the client sees the result immediately.
+/// Alt+Tab / Alt+Shift+Tab: advance `layout.focused` through live windows
+/// on the active workspace, wrapping. Same filter + index space every other
+/// per-window action (Close, ToggleFullscreen, Swap) already uses — no MRU
+/// stack, just a straight cycle through `toplevels` order. `forward` false
+/// means Alt+Shift+Tab (reverse).
+fn cycle_focus(state: &mut State, forward: bool) {
+    let idx = active_monitor_idx(state);
+    let ws = state.monitors[idx].active_workspace;
+    let n = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).count();
+    if n == 0 {
+        return;
+    }
+    let focused = state.monitors[idx].layout.focused;
+    state.monitors[idx].layout.focused = if forward {
+        (focused + 1) % n
+    } else {
+        (focused + n - 1) % n
+    };
+    relayout(state);
+    refocus_keyboard(state);
+}
+
 fn dispatch_action(state: &mut State, action: veil_config::Action) {
     use veil_config::Action::*;
-    let ws = state.active_workspace; // pulled out once; every filter below needs it
+    let idx = active_monitor_idx(state);
+    let ws = state.monitors[idx].active_workspace; // pulled out once; every filter below needs it
     match action {
-        FocusLeft  => state.layout.focus(&state.layout_rects, crate::layout::Dir::Left),
-        FocusRight => state.layout.focus(&state.layout_rects, crate::layout::Dir::Right),
-        FocusUp    => state.layout.focus(&state.layout_rects, crate::layout::Dir::Up),
-        FocusDown  => state.layout.focus(&state.layout_rects, crate::layout::Dir::Down),
+        FocusLeft  => { let r = state.monitors[idx].layout_rects.clone(); state.monitors[idx].layout.focus(&r, crate::layout::Dir::Left); }
+        FocusRight => { let r = state.monitors[idx].layout_rects.clone(); state.monitors[idx].layout.focus(&r, crate::layout::Dir::Right); }
+        FocusUp    => { let r = state.monitors[idx].layout_rects.clone(); state.monitors[idx].layout.focus(&r, crate::layout::Dir::Up); }
+        FocusDown  => { let r = state.monitors[idx].layout_rects.clone(); state.monitors[idx].layout.focus(&r, crate::layout::Dir::Down); }
         Swap => {
-            // swap_next's indices are positions among LIVE toplevels ON THE
-            // ACTIVE WORKSPACE; map them back to real Vec indices in case a
-            // dead-but-unpruned or other-workspace entry sits between live
-            // ones.
+            // swap_next's indices are positions among LIVE toplevels ON THIS
+            // MONITOR'S ACTIVE WORKSPACE; map them back to real Vec indices
+            // in case a dead-but-unpruned or other-workspace/monitor entry
+            // sits between live ones.
             let live_idx: Vec<usize> = state.toplevels.iter().enumerate()
-                .filter(|(_, t)| t.alive() && t.workspace == ws)
+                .filter(|(_, t)| t.alive() && t.monitor == idx && t.workspace == ws)
                 .map(|(i, _)| i)
                 .collect();
-            if let Some((a, b)) = state.layout.swap_next(live_idx.len()) {
+            if let Some((a, b)) = state.monitors[idx].layout.swap_next(live_idx.len()) {
                 state.toplevels.swap(live_idx[a], live_idx[b]);
             }
         }
-        Rotate => state.layout.rotate_split(),
+        Rotate => state.monitors[idx].layout.rotate_split(),
         Close => {
-            if let Some(tl) = state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws).nth(state.layout.focused) {
+            let focused = state.monitors[idx].layout.focused;
+            if let Some(tl) = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).nth(focused) {
                 tl.close_window();
             }
         }
-        ResizeGrow   => state.layout.resize_grow(),
-        ResizeShrink => state.layout.resize_shrink(),
-        ToggleLayout => state.layout.toggle_mode(),
+        ResizeGrow   => state.monitors[idx].layout.resize_grow(),
+        ResizeShrink => state.monitors[idx].layout.resize_shrink(),
+        ToggleLayout => state.monitors[idx].layout.toggle_mode(),
         ToggleFullscreen => {
-            let focused_wl = state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
-                .nth(state.layout.focused)
+            let focused = state.monitors[idx].layout.focused;
+            let focused_wl = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+                .nth(focused)
                 .and_then(|t| t.wl_surface());
-            match (&state.fullscreen, &focused_wl) {
+            match (&state.monitors[idx].fullscreen, &focused_wl) {
                 // Already fullscreen on the focused window — toggle off.
-                (Some(fs), Some(f)) if fs == f => state.fullscreen = None,
+                (Some(fs), Some(f)) if fs == f => state.monitors[idx].fullscreen = None,
                 // Nothing focused-fullscreen yet (including: something ELSE
                 // is fullscreen and you've since focused a different
                 // window) — fullscreen whichever window has focus now.
-                (_, Some(f)) => state.fullscreen = Some(f.clone()),
+                (_, Some(f)) => state.monitors[idx].fullscreen = Some(f.clone()),
                 (_, None) => {}
             }
         }
         ReloadConfig => reload_config(state),
         SwitchWorkspace(n) => {
             let target = n.saturating_sub(1).min(veil_config::WORKSPACE_COUNT - 1);
-            if target != state.active_workspace {
+            if target != state.monitors[idx].active_workspace {
                 // Save the outgoing workspace's tiling state and restore the
                 // target's, so hopping back later finds it exactly as left —
-                // not reset to the dwindle default.
-                state.workspace_layouts[state.active_workspace as usize] = state.layout;
-                state.layout = state.workspace_layouts[target as usize];
-                state.active_workspace = target;
+                // not reset to the dwindle default. Scoped to THIS monitor —
+                // monitor 1's workspace 3 and monitor 0's workspace 3 are
+                // unrelated, each monitor has its own 9-slot array.
+                let cur_ws = state.monitors[idx].active_workspace;
+                let cur_layout = state.monitors[idx].layout;
+                state.monitors[idx].workspace_layouts[cur_ws as usize] = cur_layout;
+                state.monitors[idx].layout = state.monitors[idx].workspace_layouts[target as usize];
+                state.monitors[idx].active_workspace = target;
                 state.show_osd(format!("WORKSPACE {}", target + 1), "", None, Duration::from_millis(900));
                 mark_dirty_full(state);
             }
@@ -1373,20 +1479,26 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
         MoveToWorkspace(n) => {
             let target = n.saturating_sub(1).min(veil_config::WORKSPACE_COUNT - 1);
             // Real Vec index of whatever's focused right now, found the same
-            // way Close/ToggleFullscreen do — `state.layout.focused` is a
-            // position among LIVE ACTIVE-WORKSPACE windows, not a raw index.
+            // way Close/ToggleFullscreen do — `layout.focused` is a
+            // position among LIVE ACTIVE-WORKSPACE windows on THIS monitor,
+            // not a raw index.
+            let focused = state.monitors[idx].layout.focused;
             let real_idx = state.toplevels.iter().enumerate()
-                .filter(|(_, t)| t.alive() && t.workspace == ws)
-                .nth(state.layout.focused)
+                .filter(|(_, t)| t.alive() && t.monitor == idx && t.workspace == ws)
+                .nth(focused)
                 .map(|(i, _)| i);
-            if let (Some(idx), true) = (real_idx, target != ws) {
-                state.toplevels[idx].workspace = target;
+            if let (Some(w_idx), true) = (real_idx, target != ws) {
+                state.toplevels[w_idx].workspace = target;
                 // Follow the window: same swap-in/out as SwitchWorkspace, so
                 // the workspace we land on keeps its own layout state
-                // instead of inheriting whatever the old one had.
-                state.workspace_layouts[state.active_workspace as usize] = state.layout;
-                state.layout = state.workspace_layouts[target as usize];
-                state.active_workspace = target;
+                // instead of inheriting whatever the old one had. Still
+                // entirely within this one monitor — "move to workspace"
+                // never crosses monitors, that's a separate future action.
+                let cur_ws = state.monitors[idx].active_workspace;
+                let cur_layout = state.monitors[idx].layout;
+                state.monitors[idx].workspace_layouts[cur_ws as usize] = cur_layout;
+                state.monitors[idx].layout = state.monitors[idx].workspace_layouts[target as usize];
+                state.monitors[idx].active_workspace = target;
                 state.show_osd(format!("MOVED TO WORKSPACE {}", target + 1), "", None, Duration::from_millis(900));
                 mark_dirty_full(state);
             }
@@ -1537,6 +1649,66 @@ fn launch_selected(state: &mut State) {
     spawn_command(&state.socket_name, &exec);
 }
 
+/// Per-keystroke handling while the power menu modal is open. Up/Down move
+/// the selection, Enter executes it, Escape cancels — same shape as
+/// `handle_launcher_key` minus the query text (nothing to type here).
+fn handle_power_menu_key(state: &mut State, mods: &ModifiersState, keysym: KeysymHandle<'_>) {
+    let sym = keysym.modified_sym().raw();
+
+    // <mod_key>+P closes the menu too — same chord opens and closes it.
+    let mod_held = match state.keybinds.mod_key {
+        veil_config::ModKey::Super => mods.logo,
+        veil_config::ModKey::Ctrl  => mods.ctrl,
+        veil_config::ModKey::Alt   => mods.alt,
+        veil_config::ModKey::Shift => mods.shift,
+    };
+    if mod_held && matches!(sym, keysyms::KEY_p | keysyms::KEY_P) {
+        state.power_menu = None;
+        mark_dirty_full(state);
+        return;
+    }
+
+    if sym == keysyms::KEY_Escape {
+        state.power_menu = None;
+        mark_dirty_full(state);
+        return;
+    }
+    if sym == keysyms::KEY_Return || sym == keysyms::KEY_KP_Enter {
+        execute_power_menu_selection(state);
+        return;
+    }
+    if sym == keysyms::KEY_Up {
+        if let Some(m) = state.power_menu.as_mut() {
+            m.selected = m.selected.saturating_sub(1);
+            mark_dirty_full(state);
+        }
+        return;
+    }
+    if sym == keysyms::KEY_Down {
+        if let Some(m) = state.power_menu.as_mut() {
+            m.selected = (m.selected + 1).min(crate::powermenu::POWER_ACTIONS.len() - 1);
+            mark_dirty_full(state);
+        }
+        return;
+    }
+}
+
+/// Run whatever's selected — fires immediately, no confirmation step (same
+/// no-bloat call as the launcher: one Enter press, no "are you sure?").
+/// Poweroff/Reboot shell out to systemd the same way `Launch` does; Logout
+/// reuses the exact graceful-quit path Shift+Alt+E already uses — there's
+/// no session manager here, so "logout" just means "stop veil-host".
+fn execute_power_menu_selection(state: &mut State) {
+    let Some(menu) = state.power_menu.take() else { return };
+    mark_dirty_full(state);
+
+    match menu.selected_action() {
+        PowerAction::Poweroff => spawn_command(&state.socket_name, "systemctl poweroff"),
+        PowerAction::Reboot   => spawn_command(&state.socket_name, "systemctl reboot"),
+        PowerAction::Logout   => state.stop.store(true, Ordering::Relaxed),
+    }
+}
+
 /// Fixed bar height in pixels: one line of the built-in 5x7 font at scale 1
 /// (7px glyph) plus 5px padding — see draw_bar(). Not configurable; the
 /// three-column layout it implies (16/8/rest chars) is sized against this
@@ -1547,26 +1719,30 @@ const BAR_HEIGHT: u32 = 12;
 /// whenever the live window set or the output size changes. Also marks the
 /// focused window Activated (others deactivated) so clients render focus state.
 fn relayout(state: &mut State) {
-    let ws = state.active_workspace;
-    let n = state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws).count();
-    if state.layout.focused >= n {
-        state.layout.focused = n.saturating_sub(1);
+    let idx = active_monitor_idx(state);
+    let ws = state.monitors[idx].active_workspace;
+    let n = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).count();
+    if state.monitors[idx].layout.focused >= n {
+        state.monitors[idx].layout.focused = n.saturating_sub(1);
     }
-    let focused = state.layout.focused;
+    let focused = state.monitors[idx].layout.focused;
 
-    // Same alive-and-active-workspace sequence configure/composite/pick_focus
-    // all already use — index into THIS, not the raw toplevels vec. Windows
-    // on other workspaces are simply absent here, so they never get a
-    // configure_size call and never enter layout_rects/composite below —
-    // that's what actually hides them, no separate visibility flag needed.
-    let alive: Vec<&Window> = state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws).collect();
+    // Same alive-and-active-workspace-and-monitor sequence
+    // configure/composite/pick_focus all already use — index into THIS, not
+    // the raw toplevels vec. Windows on other workspaces or other monitors
+    // are simply absent here, so they never get a configure_size call and
+    // never enter layout_rects/composite below — that's what actually hides
+    // them, no separate visibility flag needed.
+    let alive: Vec<&Window> = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).collect();
 
     // Which (alive-sequence) index, if any, is the fullscreen window right
     // now. Looked up by identity every call rather than cached, since
-    // `state.fullscreen` only stores a WlSurface, not a position.
-    let fs_idx = state.fullscreen.as_ref().and_then(|fs| {
+    // `fullscreen` only stores a WlSurface, not a position.
+    let fs_idx = state.monitors[idx].fullscreen.as_ref().and_then(|fs| {
         alive.iter().position(|t| t.wl_surface().as_ref() == Some(fs))
     });
+
+    let (output_w, output_h) = (state.monitors[idx].output_w, state.monitors[idx].output_h);
 
     // Bar reserves a strip of the output — tiled windows only ever see
     // what's left. A fullscreen window still overrides to the FULL output
@@ -1574,11 +1750,11 @@ fn relayout(state: &mut State) {
     // too, and composite() skips drawing the bar while something's
     // fullscreen, so nothing's left peeking out from underneath it.
     let (tile_h, tile_y) = if state.bar.enabled {
-        let h = state.output_h.saturating_sub(BAR_HEIGHT);
+        let h = output_h.saturating_sub(BAR_HEIGHT);
         let y = if state.bar.position == veil_config::BarPosition::Top { BAR_HEIGHT as i32 } else { 0 };
         (h, y)
     } else {
-        (state.output_h, 0)
+        (output_h, 0)
     };
 
     // Everyone tiles exactly as if nothing were fullscreen — this is what
@@ -1589,12 +1765,12 @@ fn relayout(state: &mut State) {
     // rects depend on it for viewport position — both are what caused
     // windows to visibly jump/shrink/shift left on fullscreen toggle).
     // The fullscreen window's rect is simply overridden afterward.
-    let mut rects = state.layout.rects(n, state.output_w, tile_h);
+    let mut rects = state.monitors[idx].layout.rects(n, output_w, tile_h);
     for r in rects.iter_mut() {
         r.y += tile_y;
     }
     if let Some(fs_i) = fs_idx {
-        rects[fs_i] = Rect { x: 0, y: 0, w: state.output_w, h: state.output_h };
+        rects[fs_i] = Rect { x: 0, y: 0, w: output_w, h: output_h };
     }
 
     for (i, tl) in alive.iter().enumerate() {
@@ -1606,17 +1782,18 @@ fn relayout(state: &mut State) {
         tl.configure_size(rects[i], activated, is_fs);
     }
 
-    state.layout_rects = rects;
+    state.monitors[idx].layout_rects = rects;
     mark_dirty_full(state);
 }
 
 /// Point the keyboard at whichever live toplevel is currently focused (or
 /// nothing, if there are no windows left).
 fn refocus_keyboard(state: &mut State) {
-    let ws = state.active_workspace;
+    let idx = active_monitor_idx(state);
+    let ws = state.monitors[idx].active_workspace;
     let target = state.toplevels.iter()
-        .filter(|t| t.alive() && t.workspace == ws)
-        .nth(state.layout.focused)
+        .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+        .nth(state.monitors[idx].layout.focused)
         .and_then(|t| t.wl_surface());
     let serial = state.next_serial();
     let kb = state.keyboard.clone();
@@ -1631,60 +1808,83 @@ fn refocus_keyboard(state: &mut State) {
 /// straight into it), and under-detecting here only costs a full-frame
 /// redraw instead of a partial one — it can never cause a stale-pixel bug,
 /// since full-frame damage always covers whatever a precise rect would have.
-fn toplevel_rect_for(state: &State, surface: &WlSurface) -> Option<Rect> {
+fn toplevel_rect_for(state: &State, surface: &WlSurface) -> Option<(usize, Rect)> {
     let i = state.toplevels.iter().position(|t| t.wl_surface().as_ref() == Some(surface))?;
-    state.layout_rects.get(i).copied()
+    let monitor = state.toplevels[i].monitor;
+    let rect = state.monitors.get(monitor)?.layout_rects.get(i).copied()?;
+    Some((monitor, rect))
 }
 
-/// Marks the whole output as needing repaint — the safe default for any
-/// dirty event without a precise on-screen rect (resize, cursor motion,
-/// overlay toggles, relayout, anything not going through
+/// Marks every monitor's whole output as needing repaint — the safe default
+/// for any dirty event without a precise on-screen rect (resize, cursor
+/// motion, overlay toggles, relayout, anything not going through
 /// `toplevel_rect_for`). Over-damaging can only cost extra redraw work, never
-/// leave stale pixels, so this is always a legal fallback.
+/// leave stale pixels, so this is always a legal fallback. Deliberately
+/// whole-COMPOSITOR, not just the active monitor: a caller with no specific
+/// surface/monitor in hand (e.g. a config reload, a global theme change)
+/// has no way to know which monitor(s) it actually affects, so marking all
+/// of them is the only safe choice — same reasoning as before this had more
+/// than one monitor to worry about, just applied to each of them now.
 fn mark_dirty_full(state: &mut State) {
     state.dirty = true;
-    let full = Rect { x: 0, y: 0, w: state.output_w, h: state.output_h };
-    state.damage = Some(match state.damage.take() {
-        Some(d) => d.union(&full),
-        None => full,
-    });
-}
-
-/// Marks just `rect` as needing repaint, unioned with whatever's already
-/// pending this tick (multiple surfaces can go dirty between composites).
-fn mark_dirty_rect(state: &mut State, rect: Rect) {
-    state.dirty = true;
-    state.damage = Some(match state.damage.take() {
-        Some(d) => d.union(&rect),
-        None => rect,
-    });
-}
-
-/// Composite all live toplevels + their popups + the cursor into a single
-/// RGBA frame and ship it. Called from the periodic tick when `dirty`.
-fn composite_and_send(state: &mut State) {
-    if !state.dirty { return; }
-    let now = Instant::now();
-    if let Some(t) = state.last_composite {
-        if now.duration_since(t) < state.composite_interval { return; }
+    for m in state.monitors.iter_mut() {
+        let full = Rect { x: 0, y: 0, w: m.output_w, h: m.output_h };
+        m.damage = Some(match m.damage.take() {
+            Some(d) => d.union(&full),
+            None => full,
+        });
     }
-    state.last_composite = Some(now);
-    state.dirty = false;
-    // Snapshot + reset this tick's damage now, before any of the drawing
-    // below — so damage that arrives *during* composite (shouldn't happen on
-    // this single-threaded loop, but keeps the invariant obviously true
-    // rather than relying on ordering elsewhere) accumulates for next tick
-    // instead of being silently dropped.
-    let frame_damage = state.damage.take()
-        .unwrap_or(Rect { x: 0, y: 0, w: state.output_w, h: state.output_h })
-        .clamp_to(state.output_w, state.output_h);
-    tracing::info!("compositing frame (buffers={})", state.surface_buffers.len());
+}
 
-    let w = state.output_w;
-    let h = state.output_h;
+/// Marks just `rect` on one specific monitor as needing repaint, unioned
+/// with whatever's already pending on that monitor this tick (multiple
+/// surfaces can go dirty between composites). `monitor` is a property of
+/// whatever triggered this (which window's surface committed, e.g.), not
+/// resolved from cursor position — a window on a monitor you're not
+/// currently looking at can still legitimately go dirty.
+fn mark_dirty_rect(state: &mut State, monitor: usize, rect: Rect) {
+    state.dirty = true;
+    if let Some(m) = state.monitors.get_mut(monitor) {
+        m.damage = Some(match m.damage.take() {
+            Some(d) => d.union(&rect),
+            None => rect,
+        });
+    }
+}
+
+/// Composite one monitor's live toplevels + popups + cursor (if active) +
+/// overlays into its own RGBA frame and ship it. Pulled out of
+/// `composite_and_send` so that function can stay a simple per-tick loop
+/// over every monitor. `active_idx`, `show_help`, `launcher_present`, and
+/// `power_menu_present` are resolved once per tick by the caller rather
+/// than once per monitor — none of them vary by monitor.
+fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_help: bool, launcher_present: bool, power_menu_present: bool) {
+    let now = Instant::now();
+    // One `&mut Monitor` borrow, reused for every monitor-scoped field
+    // access below via `m.field` — NOT re-indexing `state.monitors[idx]`
+    // repeatedly, which the borrow checker can't prove disjoint across
+    // separate field accesses through the same runtime index. `state.X`
+    // accesses elsewhere in this function (toplevels, surface_buffers,
+    // floating, theme, ...) are all different top-level `State` fields,
+    // disjoint from `state.monitors` and so compatible with `m` staying
+    // alive throughout — same disjoint-field-borrow pattern the original
+    // single-monitor version already relied on (`back = &mut
+    // state.composite_buf` alongside reads of other `state.*` fields).
+    let m = &mut state.monitors[idx];
+    m.last_composite = Some(now);
+    let (w, h) = (m.output_w, m.output_h);
+    // Snapshot + reset this monitor's damage now, before any drawing below
+    // — so damage that arrives *during* composite (shouldn't happen on this
+    // single-threaded loop, but keeps the invariant obviously true rather
+    // than relying on ordering elsewhere) accumulates for next tick instead
+    // of being silently dropped.
+    let frame_damage = m.damage.take()
+        .unwrap_or(Rect { x: 0, y: 0, w, h })
+        .clamp_to(w, h);
+
     let needed = (w as usize) * (h as usize) * 4;
-    if state.composite_buf.len() != needed {
-        state.composite_buf.resize(needed, 0);
+    if m.composite_buf.len() != needed {
+        m.composite_buf.resize(needed, 0);
     }
 
     // Fast background fill: write the 4-byte RGBA color as a u32 across the
@@ -1696,35 +1896,32 @@ fn composite_and_send(state: &mut State) {
     // max_align_t-aligned (≥ 8 bytes on all supported platforms), so the
     // cast is safe for the in-bounds slice. bytemuck would be cleaner but
     // this avoids an extra dep; the debug assert catches any future breakage.
-    debug_assert!(state.composite_buf.as_ptr().align_offset(4) == 0);
+    debug_assert!(m.composite_buf.as_ptr().align_offset(4) == 0);
     {
-        let (pre, u32s, post) = unsafe { state.composite_buf.align_to_mut::<u32>() };
+        let (pre, u32s, post) = unsafe { m.composite_buf.align_to_mut::<u32>() };
         for b in pre.chunks_exact_mut(4) { b.copy_from_slice(&bg); }
         u32s.fill(bg_u32);
         for b in post.chunks_exact_mut(4) { b.copy_from_slice(&bg); }
     }
 
-    let show_help = state.show_help;
-    let launcher_present = state.launcher.is_some();
-    let ws = state.active_workspace;
-
-    let back = &mut state.composite_buf;
+    let ws = m.active_workspace;
+    let back = &mut m.composite_buf;
 
     // Toplevels (root buffer + subsurfaces) then their popups, each at its
     // tiled rect origin. Popups are positioned relative to their toplevel.
     // Collected as Option so index i still lines up with layout_rects[i] —
     // an X11 window not yet paired with a wl_surface has nothing to blit,
     // but it still occupies a tiled slot and must not shift later indices.
-    // Filtered to the active workspace — this MUST produce the same
-    // alive-and-active-workspace sequence relayout() used to build
-    // layout_rects, or index i here won't line up with rects[i] anymore.
+    // Filtered to THIS monitor's active workspace — this MUST produce the
+    // same alive-and-monitor-and-active-workspace sequence relayout() used
+    // to build layout_rects, or index i here won't line up with rects[i].
     let toplevels: Vec<Option<WlSurface>> = state.toplevels.iter()
-        .filter(|t| t.alive() && t.workspace == ws)
+        .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
         .map(|t| t.wl_surface())
         .collect();
     for (i, surf_opt) in toplevels.iter().enumerate() {
         let Some(surf) = surf_opt else { continue };
-        let r = state.layout_rects.get(i).copied()
+        let r = m.layout_rects.get(i).copied()
             .unwrap_or(Rect { x: 0, y: 0, w, h });
         blit_subtree(back, w, h, &state.surface_buffers, surf, (r.x, r.y));
         for (popup, off) in PopupManager::popups_for_surface(surf) {
@@ -1739,14 +1936,15 @@ fn composite_and_send(state: &mut State) {
     // happens to iterate after the fullscreen window in `toplevels` order
     // could paint its own small rect right over part of it.
     //
-    // Workspace-filtered too: `state.fullscreen` is only ever set from a
-    // window that was active-workspace at the time (dispatch_action's
-    // ToggleFullscreen and the xdg fullscreen_request handler both look up
-    // the focused window the same filtered way), so a fullscreen window on
-    // a workspace you've since switched away from correctly stops matching
-    // here and this block becomes a no-op until you switch back.
-    if let Some(fs) = &state.fullscreen {
-        if let Some(surf) = state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
+    // Monitor- and workspace-filtered too: `m.fullscreen` is only ever set
+    // from a window that was this-monitor-active-workspace at the time
+    // (dispatch_action's ToggleFullscreen and the xdg fullscreen_request
+    // handler both look up the focused window the same filtered way), so a
+    // fullscreen window on a workspace you've since switched away from (on
+    // this monitor) correctly stops matching here and this block becomes a
+    // no-op until you switch back.
+    if let Some(fs) = &m.fullscreen {
+        if let Some(surf) = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
             .find(|t| t.wl_surface().as_ref() == Some(fs))
             .and_then(|t| t.wl_surface())
         {
@@ -1759,64 +1957,86 @@ fn composite_and_send(state: &mut State) {
     }
 
     // Override-redirect windows (menus, tooltips, dropdowns) — absolute
-    // position from the X server, not a tiled rect. Always on top of tiled
-    // content; smithay updates X11Surface's internal geometry before
-    // configure_notify fires, so .geometry() here is always current, no
-    // caching needed on our side.
+    // position from the X server, not a tiled rect. Drawn on every
+    // monitor's pass unconditionally for now, same as before this had more
+    // than one monitor to worry about: XWayland's coordinate space isn't
+    // (yet) monitor-aware here, so there's no correct per-monitor filter to
+    // apply — a real fix means tagging floating X11Surfaces with their
+    // parent toplevel's monitor and translating into that monitor's local
+    // space, which is real follow-up work, not part of this pass. With one
+    // monitor (today) this is exactly the old behavior; with more than one
+    // it'll over-draw rather than mis-draw, which is the safer failure mode.
     for f in state.floating.iter().filter(|f| f.alive()) {
         let Some(surf) = f.wl_surface() else { continue };
         let g = f.geometry();
         blit_subtree(back, w, h, &state.surface_buffers, &surf, (g.loc.x, g.loc.y));
     }
 
-    // Cursor on top.
-    match &state.cursor_status {
-        CursorImageStatus::Surface(cs) => {
-            let hotspot = with_states(cs, |s| {
-                s.data_map.get::<std::sync::Mutex<CursorImageAttributes>>()
-                    .map(|m| m.lock().unwrap().hotspot)
-                    .unwrap_or_default()
-            });
-            let cx = state.pointer_pos.0 as i32 - hotspot.x;
-            let cy = state.pointer_pos.1 as i32 - hotspot.y;
-            blit_subtree(back, w, h, &state.surface_buffers, cs, (cx, cy));
+    // Cursor on top — only on the monitor the pointer is actually over.
+    // Every other monitor renders with no cursor overlay this tick.
+    if idx == active_idx {
+        match &state.cursor_status {
+            CursorImageStatus::Surface(cs) => {
+                let hotspot = with_states(cs, |s| {
+                    s.data_map.get::<std::sync::Mutex<CursorImageAttributes>>()
+                        .map(|m| m.lock().unwrap().hotspot)
+                        .unwrap_or_default()
+                });
+                let cx = m.pointer_pos.0 as i32 - hotspot.x;
+                let cy = m.pointer_pos.1 as i32 - hotspot.y;
+                blit_subtree(back, w, h, &state.surface_buffers, cs, (cx, cy));
+            }
+            CursorImageStatus::Named(_) => {
+                // Client wants a themed cursor (default arrow etc) — we don't
+                // load themes. Draw a tiny built-in arrow so the user can see
+                // where their pointer is.
+                draw_fallback_cursor(
+                    back, w, h,
+                    m.pointer_pos.0 as i32,
+                    m.pointer_pos.1 as i32,
+                );
+            }
+            CursorImageStatus::Hidden => {}
         }
-        CursorImageStatus::Named(_) => {
-            // Client wants a themed cursor (default arrow etc) — we don't
-            // load themes. Draw a tiny built-in arrow so the user can see
-            // where their pointer is.
-            draw_fallback_cursor(
-                back, w, h,
-                state.pointer_pos.0 as i32,
-                state.pointer_pos.1 as i32,
-            );
-        }
-        CursorImageStatus::Hidden => {}
     }
 
     // Only clone keybinds/launcher when the overlays are actually on screen.
     // `theme` is `Copy` (plain color bytes) so pulling it out ahead of the
     // `back` borrow costs nothing.
     let theme = state.theme;
-    if state.bar.enabled && state.fullscreen.is_none() {
+    if state.bar.enabled && m.fullscreen.is_none() {
+        // Occupancy is THIS monitor's own — a window on another monitor's
+        // workspace 3 has no bearing on what this monitor's bar shows for
+        // its own workspace 3. Matches the dumb-separation model: each
+        // monitor's bar is exactly as if it were the only monitor.
         let mut occupancy = [0u8; veil_config::WORKSPACE_COUNT as usize];
-        for t in state.toplevels.iter().filter(|t| t.alive()) {
-            let idx = t.workspace as usize;
-            if idx < occupancy.len() {
-                occupancy[idx] += 1;
+        for t in state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx) {
+            let occ_idx = t.workspace as usize;
+            if occ_idx < occupancy.len() {
+                occupancy[occ_idx] += 1;
             }
         }
-        let active_ws = state.active_workspace;
+        let active_ws = m.active_workspace;
         let hitboxes = draw_bar(&theme, &state.bar, &state.keybinds, active_ws, &occupancy, back, w, h);
-        state.bar_hitboxes = hitboxes;
+        m.bar_hitboxes = hitboxes;
     } else {
         // Fullscreen hides the bar entirely (conventional — see relayout()'s
         // note on why the fullscreen rect ignores the bar's reserved strip)
         // and a disabled bar obviously has nothing to draw. Either way, old
         // hitboxes must go or a click could "launch" through a bar that
         // isn't there anymore.
-        state.bar_hitboxes.clear();
+        m.bar_hitboxes.clear();
     }
+    // Modals (help/launcher/power-menu/OSD) only ever open on whichever
+    // monitor was active at the moment they were triggered — see the
+    // `<mod_key>+D`/`<mod_key>+P`/`/` handlers, which all go through
+    // `mark_dirty_full` (whole-compositor) rather than a specific monitor,
+    // so today these draw on every monitor's pass. That's a real "dumb"
+    // simplification worth flagging for 2b: a modal opened while looking at
+    // monitor 0 currently also renders (inertly — Escape/Enter still only
+    // affect the modal's single shared state) on monitor 1's screen too.
+    // With one monitor (today) this is invisible; harmless but worth fixing
+    // once a second monitor is actually in the mix.
     if show_help {
         let keybinds = state.keybinds.clone();
         draw_help_overlay(&keybinds, &theme, back, w, h);
@@ -1829,6 +2049,13 @@ fn composite_and_send(state: &mut State) {
             // than fighting the borrow checker with unsafe aliasing.
             let l = l.clone();
             draw_launcher_overlay(&l, mod_key, &theme, back, w, h);
+        }
+    }
+    if power_menu_present {
+        if let Some(ref pm) = state.power_menu {
+            let mod_key = state.keybinds.mod_key;
+            let pm = pm.clone();
+            draw_power_menu_overlay(&pm, mod_key, &theme, back, w, h);
         }
     }
     if let Some(ref osd) = state.osd {
@@ -1844,16 +2071,17 @@ fn composite_and_send(state: &mut State) {
 
     state.frame_serial = state.frame_serial.wrapping_add(1);
 
-    // Zero-copy dispatch: swap composite_buf out, wrap in Arc, hand to the
-    // render thread. For the *next* frame's buffer: try to reclaim the Arc
-    // we sent last time via try_unwrap — if the render thread already
-    // dropped its clone (the common case; it's the bottleneck, not us),
-    // that's a real allocation avoided instead of "one alloc per frame no
-    // matter what."
+    // Zero-copy dispatch: swap this monitor's composite_buf out, wrap in
+    // Arc, hand to the render thread. For the *next* frame's buffer: try to
+    // reclaim the Arc we sent last time for THIS monitor via
+    // Arc::try_unwrap — if the render thread already dropped its clone (the
+    // common case; it's the bottleneck, not us), that's a real allocation
+    // avoided instead of "one alloc per frame no matter what."
+    let m = &mut state.monitors[idx]; // re-borrow: `back`/`theme` above no longer live past their last use
     let mut outgoing = Vec::new();
-    std::mem::swap(&mut state.composite_buf, &mut outgoing);
+    std::mem::swap(&mut m.composite_buf, &mut outgoing);
     let outgoing = Arc::new(outgoing);
-    state.composite_buf = match state.prev_frame.take().map(Arc::try_unwrap) {
+    m.composite_buf = match m.prev_frame.take().map(Arc::try_unwrap) {
         Some(Ok(mut reclaimed)) => {
             reclaimed.clear();
             reclaimed.reserve(needed);
@@ -1863,16 +2091,43 @@ fn composite_and_send(state: &mut State) {
         // the first frame — fall back to a fresh allocation, same as before.
         _ => Vec::with_capacity(needed),
     };
-    state.prev_frame = Some(outgoing.clone());
+    m.prev_frame = Some(outgoing.clone());
     let _ = state.frame_tx.send(crate::sink::Frame {
-        rgba: outgoing, width: w, height: h, serial: state.frame_serial,
+        rgba: outgoing, width: w, height: h, output_id: idx, serial: state.frame_serial,
         damage: frame_damage,
     });
+}
 
-    // Fire frame callbacks now that we've consumed and displayed this frame.
-    // Chromium uses these as vsync: it won't submit the next buffer until
-    // it receives one. Firing here (after composite) caps Chromium's render
-    // rate to our composite_interval instead of the 8ms tick rate.
+/// Composite every monitor + ship each one's frame. Called from the
+/// periodic tick when `dirty`. The dirty/throttle check is whole-compositor
+/// (all monitors composite on the same tick cadence — see `Monitor`'s doc),
+/// not per-monitor; the actual drawing work is delegated to
+/// `composite_one_monitor`, called once per entry in `state.monitors`.
+fn composite_and_send(state: &mut State) {
+    if !state.dirty { return; }
+    let now = Instant::now();
+    if let Some(t) = state.monitors[0].last_composite {
+        if now.duration_since(t) < state.composite_interval { return; }
+    }
+    state.dirty = false;
+    tracing::info!("compositing frame (buffers={})", state.surface_buffers.len());
+
+    let show_help = state.show_help;
+    let launcher_present = state.launcher.is_some();
+    let power_menu_present = state.power_menu.is_some();
+    let active_idx = active_monitor_idx(state);
+
+    for idx in 0..state.monitors.len() {
+        composite_one_monitor(state, idx, active_idx, show_help, launcher_present, power_menu_present);
+    }
+
+    // Fire frame callbacks now that we've consumed and displayed every
+    // monitor's frame this tick. Chromium uses these as vsync: it won't
+    // submit the next buffer until it receives one. Firing here (after all
+    // compositing) caps Chromium's render rate to our composite_interval
+    // instead of the 8ms tick rate. Whole-compositor, not per-monitor — a
+    // client's surface belongs to exactly one monitor, but there's no
+    // reason to fire its callback more than once per tick regardless.
     let time = state.start_time.elapsed().as_millis() as u32;
     let surfaces: Vec<WlSurface> = state.toplevels.iter()
         .filter(|t| t.alive())
@@ -1997,6 +2252,8 @@ fn draw_help_overlay(keybinds: &veil_config::Keybinds, theme: &veil_config::Them
     lines.push(String::new());
     lines.push(format!("{mod_label}+/  TOGGLE THIS MENU"));
     lines.push(format!("{mod_label}+D  APP LAUNCHER"));
+    lines.push(format!("{mod_label}+P  POWER MENU"));
+    lines.push("ALT+TAB  CYCLE WINDOWS".to_string());
     lines.push("SHIFT+ALT+E  QUIT (GRACEFUL)".to_string());
 
     let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u32;
@@ -2095,6 +2352,50 @@ fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, them
     }
 }
 
+/// `<mod_key>+P` power menu modal: fixed 3-row list, same box/font style as
+/// the launcher overlay. Selected row gets a highlight bar.
+fn draw_power_menu_overlay(menu: &PowerMenu, mod_key: veil_config::ModKey, theme: &veil_config::Theme, back: &mut [u8], w: u32, h: u32) {
+    use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
+
+    let scale = 2u32;
+    let advance = (GLYPH_W + 1) * scale;
+    let line_h = (GLYPH_H + 3) * scale;
+    let pad = 12i32;
+
+    let mod_label = mod_key.label().to_ascii_uppercase();
+    let selected = menu.selected.min(crate::powermenu::POWER_ACTIONS.len() - 1);
+
+    let mut lines: Vec<String> = vec![
+        format!("POWER  ({mod_label}+P CLOSE, ENTER SELECT, ESC CANCEL)"),
+        String::new(),
+    ];
+    let header_rows = lines.len();
+    for a in crate::powermenu::POWER_ACTIONS.iter() {
+        lines.push(a.label().to_string());
+    }
+
+    let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(40) as u32;
+    let box_w = text_cols * advance + pad as u32 * 2;
+    let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
+    let x0 = ((w as i32 - box_w as i32) / 2).max(0);
+    let y0 = ((h as i32 - box_h as i32) / 2).max(0);
+
+    let border = 2i32;
+    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), theme.border);
+    fill_rect(back, w, h, x0, y0, box_w, box_h, theme.panel_bg);
+
+    // Highlight bar behind the selected entry row
+    let row = header_rows + selected;
+    let ry = y0 + pad + row as i32 * line_h as i32 - 2;
+    fill_rect(back, w, h, x0 + 2, ry, box_w - 4, line_h, theme.highlight);
+
+    for (i, line) in lines.iter().enumerate() {
+        let ty = y0 + pad + i as i32 * line_h as i32;
+        let color = if i == 0 { theme.header } else { theme.text };
+        draw_text(back, w, h, x0 + pad, ty, scale, line, color);
+    }
+}
+
 fn send_frame_callbacks(surface: &WlSurface, time: u32) {
     with_surface_tree_downward(
         surface,
@@ -2114,10 +2415,10 @@ fn send_frame_callbacks(surface: &WlSurface, time: u32) {
 /// live-order index — matches `layout_rects`/`layout.focused`, NOT a raw
 /// `toplevels` Vec index (see the `live_idx` mapping in `dispatch_action`
 /// and the click-to-focus handling in `apply_input`).
-fn toplevel_at(state: &State, x: f64, y: f64) -> Option<usize> {
+fn toplevel_at(state: &State, monitor: usize, x: f64, y: f64) -> Option<usize> {
     let xi = x as i32;
     let yi = y as i32;
-    state.layout_rects.iter().position(|r| {
+    state.monitors[monitor].layout_rects.iter().position(|r| {
         xi >= r.x && yi >= r.y && xi < r.x + r.w as i32 && yi < r.y + r.h as i32
     })
 }
@@ -2125,7 +2426,7 @@ fn toplevel_at(state: &State, x: f64, y: f64) -> Option<usize> {
 /// Walk all toplevels' popups (newest first) then the toplevel root.
 /// Return the first surface whose cached buffer rect contains (x, y),
 /// along with the cursor's surface-local coordinates.
-fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
+fn pick_focus(state: &State, monitor: usize, x: f64, y: f64) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
     let xi = x as i32;
     let yi = y as i32;
 
@@ -2147,9 +2448,9 @@ fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::util
     // everything else keeps its normal rect (see relayout()) but is
     // visually covered (see composite()), so hit-testing it would let
     // clicks fall through to a window you can't actually see.
-    let ws = state.active_workspace;
-    if let Some(fs) = &state.fullscreen {
-        return state.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
+    let ws = state.monitors[monitor].active_workspace;
+    if let Some(fs) = &state.monitors[monitor].fullscreen {
+        return state.toplevels.iter().filter(|t| t.alive() && t.monitor == monitor && t.workspace == ws)
             .find(|t| t.wl_surface().as_ref() == Some(fs))
             .and_then(|t| t.wl_surface())
             .map(|surf| (surf, (0.0, 0.0).into()));
@@ -2157,16 +2458,18 @@ fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::util
 
     // Live toplevels paired with their tiled rect, topmost (last) first.
     // Option preserves index alignment with layout_rects (see composite()).
-    // Workspace-filtered for the same reason composite()'s copy is — must
-    // match the exact sequence relayout() used to build layout_rects.
+    // Monitor- and workspace-filtered for the same reason composite()'s
+    // copy is — must match the exact sequence relayout() used to build
+    // layout_rects.
     let live: Vec<Option<WlSurface>> = state.toplevels.iter()
-        .filter(|t| t.alive() && t.workspace == ws)
+        .filter(|t| t.alive() && t.monitor == monitor && t.workspace == ws)
         .map(|t| t.wl_surface())
         .collect();
     for (i, root_opt) in live.iter().enumerate().rev() {
         let Some(root) = root_opt else { continue };
-        let r = state.layout_rects.get(i).copied()
-            .unwrap_or(Rect { x: 0, y: 0, w: state.output_w, h: state.output_h });
+        let (out_w, out_h) = (state.monitors[monitor].output_w, state.monitors[monitor].output_h);
+        let r = state.monitors[monitor].layout_rects.get(i).copied()
+            .unwrap_or(Rect { x: 0, y: 0, w: out_w, h: out_h });
 
         // Popups (per-toplevel) — last-added wins on overlap. Positioned at
         // the toplevel rect origin + the popup's toplevel-relative offset.
@@ -2223,6 +2526,13 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                         return FilterResult::Intercept(());
                     }
 
+                    if st.power_menu.is_some() {
+                        if pressed {
+                            handle_power_menu_key(st, mods, keysym);
+                        }
+                        return FilterResult::Intercept(());
+                    }
+
                     if !pressed {
                         return FilterResult::Forward;
                     }
@@ -2256,6 +2566,16 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                             return FilterResult::Intercept(());
                         }
                         _ => {}
+                    }
+
+                    // Alt+Tab / Alt+Shift+Tab: cycle focus among live windows
+                    // on the active workspace. Fixed to literal Alt rather
+                    // than `keybinds.mod_key` — same reasoning as
+                    // Shift+Alt+E below: this chord is muscle memory across
+                    // every DE and shouldn't move if mod_key is remapped.
+                    if sym == keysyms::KEY_Tab && mods.alt {
+                        cycle_focus(st, !mods.shift);
+                        return FilterResult::Intercept(());
                     }
 
                     let Some(ch) = keysym_char(keysym) else {
@@ -2296,6 +2616,11 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                             mark_dirty_full(st);
                             return FilterResult::Intercept(());
                         }
+                        if ch == 'p' {
+                            st.power_menu = Some(PowerMenu::new());
+                            mark_dirty_full(st);
+                            return FilterResult::Intercept(());
+                        }
                         if let Some(action) = st.keybinds.action_for(ch) {
                             dispatch_action(st, action);
                             return FilterResult::Intercept(());
@@ -2307,17 +2632,37 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
         }
 
         InputCmd::PointerMotionAbs { x, y, width, height } => {
-            // Caller works in (width × height) pixel space; rescale to our output.
-            let nx = if width  > 0 { x as f64 * state.output_w as f64 / width  as f64 } else { x as f64 };
-            let ny = if height > 0 { y as f64 * state.output_h as f64 / height as f64 } else { y as f64 };
-            state.pointer_pos = (nx, ny);
+            // Caller (evdev's virtual cursor, or crossterm's terminal-cell
+            // mapping) works in its own (width × height) pixel space —
+            // rescale into OUR shared virtual arrangement (the combined
+            // bounding box of every monitor's rect, side by side). With one
+            // monitor (terminal mode, or a single DRM display) this box is
+            // exactly that monitor's size, so the rescale is a no-op — same
+            // behavior as before this had more than one monitor to place.
+            let total_w: u32 = state.monitors.iter().map(|m| m.output_w).sum();
+            let total_h: u32 = state.monitors.iter().map(|m| m.output_h).max().unwrap_or(0);
+            let gx = if width  > 0 { x as f64 * total_w as f64 / width  as f64 } else { x as f64 };
+            let gy = if height > 0 { y as f64 * total_h as f64 / height as f64 } else { y as f64 };
+            let gx = gx.clamp(0.0, total_w.saturating_sub(1) as f64);
+            let gy = gy.clamp(0.0, total_h.saturating_sub(1) as f64);
+            state.pointer_global = (gx, gy);
+
+            // Which monitor that puts us on, then translate into ITS local
+            // space — everything below this point (pick_focus, click math,
+            // cursor blit) only ever deals in monitor-local coordinates, so
+            // none of it needed to change for multi-monitor.
+            let idx = active_monitor_idx(state);
+            let m = &state.monitors[idx];
+            let nx = (gx - m.rect.x as f64).clamp(0.0, m.output_w.saturating_sub(1) as f64);
+            let ny = (gy - m.rect.y as f64).clamp(0.0, m.output_h.saturating_sub(1) as f64);
+            state.monitors[idx].pointer_pos = (nx, ny);
             mark_dirty_full(state);
 
             // Resolve focus: prefer the topmost popup under the cursor,
             // else the toplevel. Surface-local coords are (global - origin).
-            let focus = pick_focus(state, nx, ny);
+            let focus = pick_focus(state, idx, nx, ny);
             if focus.is_none() {
-                tracing::debug!("motion ({:.0},{:.0}) → no focus (toplevels={}, buffers={})",
+                tracing::debug!("motion ({:.0},{:.0}) on monitor {idx} → no focus (toplevels={}, buffers={})",
                     nx, ny, state.toplevels.len(), state.surface_buffers.len());
             }
             let ptr = state.pointer.clone();
@@ -2328,6 +2673,7 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
         }
 
         InputCmd::PointerButton { button, pressed } => {
+            let idx = active_monitor_idx(state);
             let bs = if pressed { BState::Pressed } else { BState::Released };
             const BTN_LEFT: u32 = 0x110;
 
@@ -2336,8 +2682,8 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // so it takes a completely separate path from the click-to-
             // focus/forwarding below rather than falling through into it.
             let bar_hit = if pressed && button == BTN_LEFT {
-                let (px, py) = (state.pointer_pos.0 as i32, state.pointer_pos.1 as i32);
-                state.bar_hitboxes.iter()
+                let (px, py) = (state.monitors[idx].pointer_pos.0 as i32, state.monitors[idx].pointer_pos.1 as i32);
+                state.monitors[idx].bar_hitboxes.iter()
                     .find(|(r, _)| px >= r.x && py >= r.y && px < r.x + r.w as i32 && py < r.y + r.h as i32)
                     .map(|(_, exec)| exec.clone())
             } else {
@@ -2354,12 +2700,13 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // for). Keeps `layout.focused` in sync with clicks so keyboard
             // nav/close (Alt+H/J/K/L/Q) act on whatever you last clicked,
             // not whatever keyboard nav last visited. A click inside the
-            // already-focused tile hits `idx == layout.focused` and no-ops,
+            // already-focused tile hits `t_idx == layout.focused` and no-ops,
             // so ordinary clicks/typing inside an app are unaffected.
             if pressed && button == BTN_LEFT {
-                if let Some(idx) = toplevel_at(state, state.pointer_pos.0, state.pointer_pos.1) {
-                    if idx != state.layout.focused {
-                        state.layout.focused = idx;
+                let (px, py) = state.monitors[idx].pointer_pos;
+                if let Some(t_idx) = toplevel_at(state, idx, px, py) {
+                    if t_idx != state.monitors[idx].layout.focused {
+                        state.monitors[idx].layout.focused = t_idx;
                         relayout(state);
                         refocus_keyboard(state);
                     }
@@ -2369,7 +2716,7 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             let focus = state.pointer.current_focus();
             tracing::info!(
                 "button 0x{:x} pressed={} pos=({:.0},{:.0}) focus={:?}",
-                button, pressed, state.pointer_pos.0, state.pointer_pos.1,
+                button, pressed, state.monitors[idx].pointer_pos.0, state.monitors[idx].pointer_pos.1,
                 focus.as_ref().map(|s| s.id()),
             );
             let ptr = state.pointer.clone();
@@ -2378,14 +2725,21 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
         }
 
         InputCmd::Resize { width, height } => {
+            // Terminal-mode-only event (window resize) — terminal output is
+            // always exactly one monitor, so this always targets
+            // monitors[0] unconditionally rather than resolving
+            // active_monitor_idx.
+            let m = &mut state.monitors[0];
             // Rescale existing pointer position into the new pixel space so the
             // cursor doesn't jump on resize.
-            if state.output_w > 0 && state.output_h > 0 {
-                state.pointer_pos.0 = state.pointer_pos.0 * width  as f64 / state.output_w as f64;
-                state.pointer_pos.1 = state.pointer_pos.1 * height as f64 / state.output_h as f64;
+            if m.output_w > 0 && m.output_h > 0 {
+                m.pointer_pos.0 = m.pointer_pos.0 * width  as f64 / m.output_w as f64;
+                m.pointer_pos.1 = m.pointer_pos.1 * height as f64 / m.output_h as f64;
             }
-            state.output_w = width;
-            state.output_h = height;
+            m.output_w = width;
+            m.output_h = height;
+            m.rect.w = width;
+            m.rect.h = height;
             let mode = OutputMode {
                 size: (width as i32, height as i32).into(),
                 refresh: 60_000,
@@ -2393,6 +2747,60 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             state.output.change_current_state(Some(mode), None, None, None);
             // Retile everyone into the new output extent.
             relayout(state);
+        }
+
+        InputCmd::SetMonitors { sizes } => {
+            if sizes.is_empty() {
+                tracing::warn!("SetMonitors: empty sizes list, ignoring");
+                return;
+            }
+            let mut origin_x = 0i32;
+            for (i, &(w, h)) in sizes.iter().enumerate() {
+                match state.monitors.get_mut(i) {
+                    // Already exists — almost always monitor 0, built from
+                    // main.rs's startup guess before real output detection
+                    // finished. Resize in place rather than replace, so
+                    // anything already tiled on it (a window spawned in the
+                    // brief window before this arrived) survives instead of
+                    // being silently discarded.
+                    Some(m) => {
+                        m.rect = Rect { x: origin_x, y: 0, w, h };
+                        m.output_w = w;
+                        m.output_h = h;
+                        m.pointer_pos.0 = m.pointer_pos.0.clamp(0.0, w.saturating_sub(1) as f64);
+                        m.pointer_pos.1 = m.pointer_pos.1.clamp(0.0, h.saturating_sub(1) as f64);
+                    }
+                    // Genuinely new monitor — nothing was ever tiled on it
+                    // (it didn't exist until this call), so a fresh default
+                    // Monitor is exactly correct, not a discard of anything.
+                    None => state.monitors.push(Monitor::new(w, h, origin_x)),
+                }
+                origin_x += w as i32;
+            }
+            // Only ever grows in practice (one SetMonitors call, once, at
+            // startup) — truncate defensively rather than leave stale
+            // entries with windows nothing would route to again, in case
+            // this is ever called a second time with a smaller list.
+            state.monitors.truncate(sizes.len());
+
+            // Single shared wl_output global still reports monitor 0's mode
+            // — see the note on `State.output`, this is a known
+            // simplification (real per-monitor wl_output globals are
+            // follow-up work, not part of this pass).
+            let m0 = &state.monitors[0];
+            let mode = OutputMode {
+                size: (m0.output_w as i32, m0.output_h as i32).into(),
+                refresh: 60_000,
+            };
+            state.output.change_current_state(Some(mode), None, None, None);
+
+            // Newly added monitors have nothing tiled yet, so there's
+            // nothing for relayout() to do on them — but they DO need their
+            // first composite pass (background fill) so DRM actually shows
+            // something instead of leaving their dumb buffer at its
+            // startup-cleared state. mark_dirty_full covers every monitor.
+            relayout(state);
+            mark_dirty_full(state);
         }
 
         InputCmd::Scroll { v120 } => {
@@ -2407,6 +2815,16 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                     mark_dirty_full(state);
                     return;
                 }
+            }
+            if let Some(m) = state.power_menu.as_mut() {
+                let count = crate::powermenu::POWER_ACTIONS.len();
+                if v120 < 0 {
+                    m.selected = (m.selected + 1).min(count - 1);
+                } else if v120 > 0 {
+                    m.selected = m.selected.saturating_sub(1);
+                }
+                mark_dirty_full(state);
+                return;
             }
 
             // v120 = 120 per notch (Windows convention). Convert to a 15px-per-notch
@@ -2442,8 +2860,8 @@ pub struct LoopData {
 /// the time an unmap/destroy notification arrives.
 fn remove_x11_window(state: &mut State, window: &X11Surface) {
     if let Some(wl) = window.wl_surface() {
-        if state.fullscreen.as_ref() == Some(&wl) {
-            state.fullscreen = None;
+        if let Some(idx) = state.monitors.iter().position(|m| m.fullscreen.as_ref() == Some(&wl)) {
+            state.monitors[idx].fullscreen = None;
         }
     }
 
@@ -2487,10 +2905,11 @@ impl XwmHandler for State {
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_mapped(true);
         let wl = window.wl_surface();
-        self.toplevels.push(Window::new(WindowSurface::X11(window), self.active_workspace));
-        let ws = self.active_workspace;
-        let n = self.toplevels.iter().filter(|t| t.alive() && t.workspace == ws).count();
-        self.layout.focused = n.saturating_sub(1);
+        let idx = active_monitor_idx(self);
+        let ws = self.monitors[idx].active_workspace;
+        self.toplevels.push(Window::new(WindowSurface::X11(window), idx, ws));
+        let n = self.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).count();
+        self.monitors[idx].layout.focused = n.saturating_sub(1);
         // Only if already paired with a wl_surface (usually is, by this
         // point) — if not yet, it'll pick up focus on the next natural
         // refocus_keyboard call (prune tick, next window open/close, etc).
@@ -2559,15 +2978,17 @@ impl XwmHandler for State {
         // gets the size it asked for but keeps its old tiled x/y (position
         // is never honored for managed windows, see above), so it renders
         // output-sized but offset — visibly "half on screen".
-        if !or && w == Some(self.output_w) && h == Some(self.output_h) {
+        let idx = active_monitor_idx(self);
+        let (out_w, out_h) = (self.monitors[idx].output_w, self.monitors[idx].output_h);
+        if !or && w == Some(out_w) && h == Some(out_h) {
             if let Some(wl) = window.wl_surface() {
-                let ws = self.active_workspace;
-                if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
+                let ws = self.monitors[idx].active_workspace;
+                if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
                     .position(|t| t.wl_surface().as_ref() == Some(&wl))
                 {
-                    self.layout.focused = i;
+                    self.monitors[idx].layout.focused = i;
                 }
-                self.fullscreen = Some(wl);
+                self.monitors[idx].fullscreen = Some(wl);
                 relayout(self);
                 refocus_keyboard(self);
                 return; // relayout already configured this window correctly
@@ -2602,21 +3023,24 @@ impl XwmHandler for State {
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let Some(wl) = window.wl_surface() else { return };
-        let ws = self.active_workspace;
-        if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.workspace == ws)
+        let idx = active_monitor_idx(self);
+        let ws = self.monitors[idx].active_workspace;
+        if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
             .position(|t| t.wl_surface().as_ref() == Some(&wl))
         {
-            self.layout.focused = i;
+            self.monitors[idx].layout.focused = i;
         }
-        self.fullscreen = Some(wl);
+        self.monitors[idx].fullscreen = Some(wl);
         relayout(self);
         refocus_keyboard(self);
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        // Client-initiated — search rather than assume active monitor, same
+        // reasoning as the xdg-shell unfullscreen_request above.
         if let Some(wl) = window.wl_surface() {
-            if self.fullscreen.as_ref() == Some(&wl) {
-                self.fullscreen = None;
+            if let Some(idx) = self.monitors.iter().position(|m| m.fullscreen.as_ref() == Some(&wl)) {
+                self.monitors[idx].fullscreen = None;
                 relayout(self);
             }
         }
@@ -2807,33 +3231,31 @@ pub fn run(
         _pointer_constraints, _relative_pointer, _idle_inhibit, _kb_inhibit, _tablet,
         seat, keyboard, pointer,
         output,
-        output_w: width, output_h: height,
-        pointer_pos: (0.0, 0.0),
+        // Startup guess — one monitor, sized to the terminal cell estimate
+        // or CLI -w/-h. Rebuilt to match reality shortly after by
+        // `InputCmd::SetMonitors` once main.rs's output detection
+        // completes (that happens after Host::spawn, so this can't just
+        // be sized correctly from the start).
+        monitors: vec![Monitor::new(width, height, 0)],
+        pointer_global: (width as f64 / 2.0, height as f64 / 2.0),
         toplevels: Vec::new(),
-        fullscreen: None,
         floating: Vec::new(),
         xwm: None,
         xwayland_shell_state,
-        layout: Layout::default(),
-        workspace_layouts: [Layout::default(); veil_config::WORKSPACE_COUNT as usize],
-        active_workspace: 0,
-        layout_rects: Vec::new(),
         keybinds,
         show_help: false,
         background: [background[0], background[1], background[2], 255],
         theme,
         bar,
-        bar_hitboxes: Vec::new(),
         // No anchor client to spawn into (`veil-host start`) → open straight
         // to the launcher instead of an empty screen with no hint of what to press.
         launcher: if spawn.is_none() { Some(Launcher::new()) } else { None },
+        power_menu: None,
         socket_name: socket_name.to_string(),
         popups:           PopupManager::default(),
         surface_buffers:  HashMap::new(),
         cursor_status:    CursorImageStatus::default_named(),
         dirty:            false,
-        damage:           None,
-        last_composite:   None,
         frame_tx,
         serial_counter: 0,
         frame_serial:   0,
@@ -2845,8 +3267,6 @@ pub fn run(
         clipboard_rx,
         pending_copy_out:     false,
         client_has_selection: false,
-        composite_buf:        Vec::new(),
-        prev_frame:           None,
         config_path,
         config_mtime,
         last_config_check: Instant::now(),
@@ -2951,10 +3371,13 @@ pub fn run(
         // If the fullscreen window was among those just pruned, don't leave
         // `fullscreen` pointing at a dead surface — relayout() already
         // treats a not-found fullscreen surface as "nothing fullscreen", so
-        // this is tidiness (no stale handle retained), not a correctness fix.
-        if let Some(wl) = &data.state.fullscreen {
-            if !data.state.toplevels.iter().any(|t| t.wl_surface().as_ref() == Some(wl)) {
-                data.state.fullscreen = None;
+        // this is tidiness (no stale handle retained), not a correctness
+        // fix. Every monitor has its own slot to check now.
+        for m in data.state.monitors.iter_mut() {
+            if let Some(wl) = &m.fullscreen {
+                if !data.state.toplevels.iter().any(|t| t.wl_surface().as_ref() == Some(wl)) {
+                    m.fullscreen = None;
+                }
             }
         }
 

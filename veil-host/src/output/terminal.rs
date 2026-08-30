@@ -45,8 +45,8 @@ impl TerminalOutput {
             stdout_ref,
             terminal::EnterAlternateScreen,
             terminal::Clear(ClearType::All),
-            cursor::Hide,
-            cursor::MoveTo(0, 0),
+                 cursor::Hide,
+                 cursor::MoveTo(0, 0),
         )?;
 
         // Enable mouse: only any-event + SGR modes (avoid URXVT dup events)
@@ -78,7 +78,7 @@ impl TerminalOutput {
             rows,
             gpu,
             stable_luma: Vec::new(),
-            render_buf: String::with_capacity(render_cap),
+           render_buf: String::with_capacity(render_cap),
         })
     }
 
@@ -208,7 +208,11 @@ impl TerminalOutput {
 }
 
 impl OutputBackend for TerminalOutput {
-    fn render_frame(&mut self, rgba: &[u8], width: u32, height: u32, _damage: crate::layout::Rect) -> io::Result<()> {
+    fn render_frame(&mut self, _monitor: usize, rgba: &[u8], width: u32, height: u32, _damage: crate::layout::Rect) -> io::Result<()> {
+        // _monitor unused: a terminal is inherently one viewport, so the
+        // default `monitor_count() == 1` applies and this is always called
+        // with `0`.
+        //
         // _damage unused: halfblock/ascii/kitty encoding walks the full cell
         // grid every call today (see render_output below), no partial-region
         // path yet. That's real, separate follow-up work — not silently
@@ -226,7 +230,7 @@ impl OutputBackend for TerminalOutput {
         Ok(())
     }
 
-    fn get_size(&self) -> (u32, u32) {
+    fn get_size(&self, _monitor: usize) -> (u32, u32) {
         (self.width, self.height)
     }
 

@@ -26,6 +26,15 @@ impl Rect {
         (self.x + self.w as i32 / 2, self.y + self.h as i32 / 2)
     }
 
+    /// Whether the point `(x, y)` falls within this rect — right/bottom
+    /// edges excluded, matching every other hit-test in this file (click
+    /// focus, popup bounds). Used for pointer-to-monitor routing: which
+    /// `Monitor::rect` the shared virtual pointer position currently falls
+    /// inside.
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x && y >= self.y && x < self.x + self.w as i32 && y < self.y + self.h as i32
+    }
+
     /// Smallest rect containing both `self` and `other`. Used to accumulate
     /// damage: each changed region gets unioned into a running bounding box
     /// rather than tracked as an exact list, so composite only needs to

@@ -21,6 +21,15 @@ pub enum InputCmd {
     /// Terminal window resized — new compositor output dimensions in pixels.
     Resize { width: u32, height: u32 },
 
+    /// Real monitor layout from output detection (Phase 1's `monitor_count()`
+    /// / `get_size()`), sent once shortly after startup once the output
+    /// backend is known. Rebuilds `State.monitors` from scratch — side by
+    /// side, left to right, in the given order (the "dumb" arrangement, see
+    /// MULTI_MONITOR_SCOPE.md). `sizes.len() == 1` for terminal mode or a
+    /// single DRM display; unremarkable in that case, same effect as the
+    /// old single-output `Resize`-based retarget it replaces.
+    SetMonitors { sizes: Vec<(u32, u32)> },
+
     /// Display an On-Screen Display (OSD) popup overlay.
     Osd { title: String, body: String, progress: Option<u8> },
 }

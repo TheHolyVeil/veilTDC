@@ -2,7 +2,8 @@
 //!
 //! Two implementations:
 //! - TerminalOutput: Kitty graphics protocol, halfblock, ASCII (current terminal rendering)
-//! - DrmOutput: Direct framebuffer via DRM/KMS on bare TTY
+//! - DrmOutput: Direct framebuffer via DRM/KMS on bare TTY — one independent
+//!   pipeline per connected display, see `monitor_count()`
 
 pub mod terminal;
 pub mod drm;
@@ -18,20 +19,33 @@ pub use drm::DrmOutput;
 /// Not `Send`: `DrmOutput` owns a libseat handle (a raw pointer) and lives on
 /// the main thread for its whole lifetime. The frame loop never moves it.
 pub trait OutputBackend {
-    /// Render an RGBA frame. Blocks until complete or error.
-    ///
-    /// `damage`: bounding box of what changed since the last frame (always
-    /// present, may equal the full frame). Backends that can cheaply skip
-    /// unchanged regions (DRM's dumb-buffer copy) should use it; backends
-    /// that can't (terminal cell encoding, today) are free to ignore it and
-    /// redraw everything, same as before this parameter existed.
-    fn render_frame(&mut self, rgba: &[u8], width: u32, height: u32, damage: Rect) -> io::Result<()>;
+    /// How many independent physical displays this backend is driving.
+    /// `1` for everything except a multi-connector `DrmOutput` — default
+    /// covers `TerminalOutput` (a terminal is inherently one viewport) with
+    /// no override needed.
+    fn monitor_count(&self) -> usize {
+        1
+    }
 
-    /// Get current output dimensions in pixels.
-    fn get_size(&self) -> (u32, u32);
+    /// Render an RGBA frame to one monitor. Blocks until complete or error.
+    ///
+    /// `monitor`: which display this frame is for, `0..monitor_count()`.
+    /// Backends with only one display (`TerminalOutput`) ignore it.
+    ///
+    /// `damage`: bounding box of what changed since the last frame *on this
+    /// monitor* (always present, may equal the full frame). Backends that
+    /// can cheaply skip unchanged regions (DRM's dumb-buffer copy) should
+    /// use it; backends that can't (terminal cell encoding, today) are free
+    /// to ignore it and redraw everything, same as before this parameter
+    /// existed.
+    fn render_frame(&mut self, monitor: usize, rgba: &[u8], width: u32, height: u32, damage: Rect) -> io::Result<()>;
+
+    /// Get one monitor's current output dimensions in pixels.
+    fn get_size(&self, monitor: usize) -> (u32, u32);
 
     /// Called when VT is being switched away (suspend output, release resources).
-    /// Only relevant for DrmOutput; TerminalOutput can no-op this.
+    /// Only relevant for DrmOutput; TerminalOutput can no-op this. Whole-seat,
+    /// not per-monitor — a VT switch suspends/resumes every display at once.
     fn on_vt_switch(&mut self, switch_in: bool) -> io::Result<()>;
 
     /// Called when the terminal is resized (new columns and rows). Allows the

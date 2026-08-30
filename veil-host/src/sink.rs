@@ -20,6 +20,10 @@ pub struct Frame {
     pub rgba:   Arc<Vec<u8>>,
     pub width:  u32,
     pub height: u32,
+    /// Which monitor this frame is for — index into whatever the output
+    /// backend's `monitor_count()` reports. `0` for terminal mode (always
+    /// exactly one) and for the common single-DRM-display case.
+    pub output_id: usize,
     /// Monotonic frame counter from the compositor. Useful for skip detection.
     pub serial: u64,
     /// Bounding box of what actually changed since the last frame — always

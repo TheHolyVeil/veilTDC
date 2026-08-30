@@ -277,20 +277,28 @@ fn main() -> std::io::Result<()> {
 
     // ── Create output backend (auto-detect terminal vs DRM/KMS) ────────────────
     let mut output = veil_host::output::detect(vcfg.output)?;
-    let (out_w, out_h) = output.get_size();
-    eprintln!("[veil-host] output backend initialized: {}x{}", out_w, out_h);
+    let n_monitors = output.monitor_count();
+    let sizes: Vec<(u32, u32)> = (0..n_monitors).map(|i| output.get_size(i)).collect();
+    eprintln!("[veil-host] output backend initialized: {} display(s) detected: {:?}", n_monitors, sizes);
 
-    // If the output (e.g. DRM display mode) differs from the size the
-    // compositor was spawned at, retarget it so frames arrive at native res
-    // instead of being clipped/letterboxed.
-    if (out_w, out_h) != (comp_w, comp_h) {
-        geom.comp_w.store(out_w, Ordering::Relaxed);
-        geom.comp_h.store(out_h, Ordering::Relaxed);
-        let _ = host.input_sender().send(
-            veil_host::InputCmd::Resize { width: out_w, height: out_h },
-        );
-        eprintln!("[veil-host] retargeting compositor to output size {out_w}x{out_h}");
-    }
+    // Compositor started against a startup guess (terminal cell size, or
+    // nothing DRM-specific yet — see `comp_w`/`comp_h` above); now that
+    // real output detection is done, sync `state.monitors` to match. Side
+    // by side left-to-right (the dumb arrangement) — see
+    // MULTI_MONITOR_SCOPE.md Phase 2b. Also updates `geom`'s tracked
+    // dimensions to the COMBINED virtual bounding box (sum of widths, max
+    // height): this is the one thing that makes evdev's cursor accumulator
+    // multi-monitor-aware — it already clamps against `geom.comp_w`/
+    // `comp_h` (see evdev_input.rs), so widening what those numbers mean is
+    // the whole fix on that side, no changes needed to evdev_input.rs itself.
+    let total_w: u32 = sizes.iter().map(|(w, _)| *w).sum();
+    let total_h: u32 = sizes.iter().map(|(_, h)| *h).max().unwrap_or(0);
+    geom.comp_w.store(total_w, Ordering::Relaxed);
+    geom.comp_h.store(total_h, Ordering::Relaxed);
+    let _ = host.input_sender().send(
+        veil_host::InputCmd::SetMonitors { sizes },
+    );
+    eprintln!("[veil-host] retargeting compositor: {n_monitors} monitor(s), virtual space {total_w}x{total_h}");
 
     // ── frame loop ────────────────────────────────────────────────────────────
     let mut fps_frame_count = 0u32;
@@ -300,14 +308,35 @@ fn main() -> std::io::Result<()> {
     let mut last_term_cols = init_cols;
     let mut last_term_rows = init_rows;
 
+    // One slot per monitor — the compositor sends one Frame per monitor per
+    // composited tick (see composite_and_send's per-tick loop), tagged with
+    // `output_id`. Draining the channel down to "just the single latest
+    // frame" (the old single-monitor logic) would silently drop every
+    // monitor but whichever one happened to send last under backlog; this
+    // tracks the latest *per monitor* instead. `n_monitors` was fixed at
+    // startup (Phase 1's `monitor_count()`), so a plain indexed Vec is
+    // enough — no hotplug to grow it mid-run (see MULTI_MONITOR_SCOPE.md's
+    // explicitly-out-of-scope list).
+    let mut latest: Vec<Option<veil_host::Frame>> = vec![None; n_monitors];
+    let store_frame = |latest: &mut Vec<Option<veil_host::Frame>>, f: veil_host::Frame| {
+        if let Some(slot) = latest.get_mut(f.output_id) {
+            *slot = Some(f);
+        }
+        // else: output_id out of range — shouldn't happen (SetMonitors and
+        // the compositor's own `state.monitors` are built from the same
+        // `monitor_count()`), drop rather than panic if it somehow does.
+    };
+
     while running.load(Ordering::Relaxed) {
-        let mut frame = match host.frames().recv_timeout(Duration::from_millis(200)) {
-            Ok(f) => f,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+        let mut got_any = false;
+        match host.frames().recv_timeout(Duration::from_millis(200)) {
+            Ok(f) => { got_any = true; store_frame(&mut latest, f); }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        // Drain the channel — skip to latest frame if compositor is ahead.
-        while let Ok(f) = host.frames().try_recv() { frame = f; }
+        // Drain the channel — collect every monitor's latest, not just one.
+        while let Ok(f) = host.frames().try_recv() { got_any = true; store_frame(&mut latest, f); }
+        if !got_any { continue; }
 
         // Propagate terminal resize to the output backend so it can update
         // its cached cols/rows without a syscall on every rendered frame.
@@ -319,15 +348,28 @@ fn main() -> std::io::Result<()> {
             output.on_resize(cur_cols, cur_rows);
         }
 
-        // Render via output backend (Arc<Vec<u8>> derefs to &[u8])
-        output.render_frame(&frame.rgba, frame.width, frame.height, frame.damage)?;
+        // Render every monitor that has a frame waiting (Arc<Vec<u8>>
+        // derefs to &[u8]). A monitor with no frame yet this pass (e.g. one
+        // SetMonitors just added, before its first composite tick) is
+        // simply skipped, not rendered blank — DRM leaves its last scanned-
+        // out content (background fill from its first real composite, once
+        // that arrives) rather than flashing empty.
+        let mut logged_w = 0;
+        let mut logged_h = 0;
+        for (id, slot) in latest.iter().enumerate() {
+            if let Some(frame) = slot {
+                output.render_frame(id, &frame.rgba, frame.width, frame.height, frame.damage)?;
+                if id == 0 { logged_w = frame.width; logged_h = frame.height; }
+            }
+        }
 
-        // FPS stats logging every second
+        // FPS stats logging every second — monitor 0's dimensions, same as
+        // before this had more than one monitor to report on.
         fps_frame_count += 1;
         let elapsed = fps_last.elapsed();
         if elapsed.as_secs_f32() >= 1.0 {
             let fps = fps_frame_count as f32 / elapsed.as_secs_f32();
-            eprintln!("[veil-host] fps: {:.0}  compositor: {}x{}px", fps, frame.width, frame.height);
+            eprintln!("[veil-host] fps: {:.0}  compositor: {}x{}px", fps, logged_w, logged_h);
             fps_frame_count = 0;
             fps_last = std::time::Instant::now();
         }
