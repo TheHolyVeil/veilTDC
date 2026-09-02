@@ -40,6 +40,7 @@ component ThemedInput inherits Rectangle {
     in-out property <string> text;
     in property <bool> password: false;
     in property <bool> caps-lock-on: false;
+    in property <string> icon: "";
     property <bool> reveal: false;
     callback accepted();
     callback edited(string);
@@ -49,15 +50,27 @@ component ThemedInput inherits Rectangle {
 
     height: 44px;
     border-radius: 12px;
-    background: #18211a;
+    background: ti.has-focus ? #1c271f : #18211a;
     border-width: 1px;
     border-color: ti.has-focus ? #9db08a : #9db08a33;
-    animate border-color { duration: 150ms; }
+    drop-shadow-blur: ti.has-focus ? 8px : 0px;
+    drop-shadow-color: #9db08a44;
+    animate border-color, background { duration: 150ms; }
     clip: true;
 
+    if root.icon != "" : Text {
+        x: 12px;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.icon;
+        color: ti.has-focus ? #9db08a : #9db08a77;
+        font-size: 15px;
+        animate color { duration: 150ms; }
+    }
+
     ti := TextInput {
-        x: 16px;
-        width: parent.width - 32px - (root.password ? 28px : 0px) - (root.password && root.caps-lock-on ? 55px : 0px);
+        x: root.icon != "" ? 38px : 16px;
+        width: parent.width - (root.icon != "" ? 50px : 32px) - (root.password ? 28px : 0px) - (root.password && root.caps-lock-on ? 55px : 0px);
         height: parent.height;
         vertical-alignment: center;
         color: root.password && !root.reveal ? transparent : #e4e9dd;
@@ -74,7 +87,7 @@ component ThemedInput inherits Rectangle {
     }
 
     Text {
-        x: 16px;
+        x: root.icon != "" ? 38px : 16px;
         height: 100%;
         vertical-alignment: center;
         text: root.placeholder;
@@ -85,10 +98,10 @@ component ThemedInput inherits Rectangle {
     }
 
     if root.password && root.caps-lock-on : Text {
-        x: parent.width - 82px;
+        x: parent.width - 92px;
         height: 100%;
         vertical-alignment: center;
-        text: "⇪ CAPS";
+        text: "CAPS LOCK";
         color: #e06c75;
         font-size: 11px;
         font-family: "Inconsolata";
@@ -100,8 +113,8 @@ component ThemedInput inherits Rectangle {
     // parenthesization bug in Slint 1.17's generated code.)
     property <int> mask-len: root.text.character-count;
     if root.password && !root.reveal : Rectangle {
-        x: 16px;
-        width: parent.width - 32px - 28px - (root.caps-lock-on ? 55px : 0px);
+        x: root.icon != "" ? 38px : 16px;
+        width: parent.width - (root.icon != "" ? 50px : 32px) - 42px - (root.caps-lock-on ? 65px : 0px);
         height: parent.height;
         clip: true;
         for i in root.mask-len : Rectangle {
@@ -126,8 +139,8 @@ component ThemedInput inherits Rectangle {
     }
 
     if root.password : TouchArea {
-        x: parent.width - 30px;
-        width: 28px;
+        x: parent.width - 44px;
+        width: 40px;
         height: parent.height;
         clicked => { root.reveal = !root.reveal; }
         Text {
@@ -135,13 +148,15 @@ component ThemedInput inherits Rectangle {
             height: 100%;
             horizontal-alignment: center;
             vertical-alignment: center;
-            text: root.reveal ? "🙈" : "👁";
-            font-size: 14px;
+            text: root.reveal ? "HIDE" : "SHOW";
+            color: #9db08aaa;
+            font-size: 11px;
+            font-family: "Inconsolata";
         }
     }
 
     TouchArea {
-        width: parent.width - (root.password ? 28px : 0px);
+        width: parent.width - (root.password ? 44px : 0px);
         clicked => { ti.focus(); }
     }
 }
@@ -199,7 +214,7 @@ export component LoginWindow inherits Window {
     in property <string> clock-time: "--:--:--";
     in property <string> clock-date: "";
     in property <int> cooldown-secs: 0;
-    in property <int> tty-target: 4;
+    in property <int> current-tty: 1;
     in-out property <length> shake-offset: 0px;
     in-out property <bool> caps-lock-on: false;
     // true when the username was restored from last-user — hides the
@@ -210,7 +225,7 @@ export component LoginWindow inherits Window {
     callback login(string, string, int);       // username, password, session idx
     callback poweroff();
     callback reboot();
-    callback to-tty();                         // switch to a text VT (tty4)
+    callback switch-tty(int);                  // switch to a specific text VT (1..6)
     callback username-edited(string);          // live — reloads avatar
     callback vk-key(int, string);              // field (0=user,1=pass), char
     callback vk-backspace(int);
@@ -332,26 +347,30 @@ export component LoginWindow inherits Window {
             }
         }
 
-        // Right side badges: TTY target
+        // Right side badges: TTY switcher badge
         HorizontalLayout {
             spacing: 8px;
             Rectangle {
                 height: 28px;
                 border-radius: 14px;
-                background: #121a1499;
+                background: tty-badge-ta.has-hover ? #9db08a33 : #121a1499;
                 border-width: 1px;
-                border-color: #9db08a33;
+                border-color: tty-badge-ta.has-hover ? #9db08aaa : #9db08a33;
+                animate background, border-color { duration: 150ms; }
                 HorizontalLayout {
                     padding-left: 10px;
                     padding-right: 10px;
                     alignment: center;
                     Text {
-                        text: "TTY\{root.tty-target}";
-                        color: #9db08aaa;
+                        text: "TTY " + root.current-tty + " [v]";
+                        color: tty-badge-ta.has-hover ? #e4e9dd : #9db08aaa;
                         font-size: 12px;
                         font-family: "Inconsolata";
                         vertical-alignment: center;
                     }
+                }
+                tty-badge-ta := TouchArea {
+                    clicked => { root.confirm-action = 3; }
                 }
             }
         }
@@ -388,6 +407,16 @@ export component LoginWindow inherits Window {
         opacity: root.stage == 1 ? 1 : 0;
         animate opacity { duration: 380ms; easing: cubic-bezier(0.16, 1, 0.3, 1); }
         animate y { duration: 380ms; easing: cubic-bezier(0.16, 1, 0.3, 1); }
+        clip: true;
+
+        // Top edge accent gradient sheen
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 2px;
+            background: @linear-gradient(90deg, transparent 0%, #9db08a66 25%, #e4e9dddd 50%, #9db08a66 75%, transparent 100%);
+        }
 
         VerticalLayout {
             padding: 28px;
@@ -501,6 +530,7 @@ export component LoginWindow inherits Window {
             user-input := ThemedInput {
                 placeholder: "username";
                 text <=> root.username;
+                icon: "@";
                 height: root.user-known ? 0px : 44px;
                 opacity: root.user-known ? 0 : 1;
                 animate height, opacity { duration: 300ms; easing: ease-out; }
@@ -514,6 +544,7 @@ export component LoginWindow inherits Window {
                 placeholder: "password";
                 text <=> root.password;
                 password: true;
+                icon: "*";
                 caps-lock-on: root.caps-lock-on;
                 height: root.pass-visible ? 44px : 0px;
                 opacity: root.pass-visible ? 1 : 0;
@@ -522,58 +553,79 @@ export component LoginWindow inherits Window {
                 focus-gained => { root.active-field = 1; }
             }
 
-            // session picker  ‹ Veil ›
+            // session picker pill < Veil >
             HorizontalLayout {
-                spacing: 8px;
                 alignment: center;
                 height: 34px;
 
                 Rectangle {
-                    width: 30px;
-                    Text {
-                        width: 100%;
-                        height: 100%;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        text: "‹";
-                        color: #b7c9a3;
-                        font-size: 22px;
-                    }
-                    TouchArea {
-                        clicked => {
-                            root.session-index =
-                                root.session-index == 0
-                                    ? root.sessions.length - 1
-                                    : root.session-index - 1;
+                    height: 32px;
+                    border-radius: 16px;
+                    background: sess-pill-ta.has-hover ? #1c271f : #141d16;
+                    border-width: 1px;
+                    border-color: sess-pill-ta.has-hover ? #9db08a66 : #9db08a33;
+                    animate background, border-color { duration: 150ms; }
+                    sess-pill-ta := TouchArea { }
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+                        alignment: center;
+
+                        Rectangle {
+                            width: 20px;
+                            height: 20px;
+                            Text {
+                                width: 100%;
+                                height: 100%;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                text: "<";
+                                color: prev-ta.has-hover ? #e4e9dd : #b7c9a3;
+                                font-size: 16px;
+                                font-family: "Inconsolata";
+                            }
+                            prev-ta := TouchArea {
+                                clicked => {
+                                    root.session-index =
+                                        root.session-index == 0
+                                            ? root.sessions.length - 1
+                                            : root.session-index - 1;
+                                }
+                            }
                         }
-                    }
-                }
-                Text {
-                    text: root.sessions[root.session-index];
-                    color: #b7c9a3;
-                    font-size: 15px;
-                    font-family: "Inconsolata";
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
-                    min-width: 140px;
-                }
-                Rectangle {
-                    width: 30px;
-                    Text {
-                        width: 100%;
-                        height: 100%;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        text: "›";
-                        color: #b7c9a3;
-                        font-size: 22px;
-                    }
-                    TouchArea {
-                        clicked => {
-                            root.session-index =
-                                root.session-index >= root.sessions.length - 1
-                                    ? 0
-                                    : root.session-index + 1;
+
+                        Text {
+                            text: "session: " + root.sessions[root.session-index];
+                            color: #e4e9dd;
+                            font-size: 13px;
+                            font-family: "Inconsolata";
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+
+                        Rectangle {
+                            width: 20px;
+                            height: 20px;
+                            Text {
+                                width: 100%;
+                                height: 100%;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                text: ">";
+                                color: next-ta.has-hover ? #e4e9dd : #b7c9a3;
+                                font-size: 16px;
+                                font-family: "Inconsolata";
+                            }
+                            next-ta := TouchArea {
+                                clicked => {
+                                    root.session-index =
+                                        root.session-index >= root.sessions.length - 1
+                                            ? 0
+                                            : root.session-index + 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -583,9 +635,15 @@ export component LoginWindow inherits Window {
             login-btn := Rectangle {
                 height: 44px;
                 border-radius: 12px;
-                background: lta.has-hover && !root.busy && root.cooldown-secs <= 0 ? #9db08a : #9db08acc;
-                opacity: root.busy || root.cooldown-secs > 0 ? 0.5 : 1;
-                animate background, opacity { duration: 120ms; }
+                background: lta.has-hover && !root.busy && root.cooldown-secs <= 0
+                    ? @linear-gradient(135deg, #b7c9a3 0%, #9db08a 100%)
+                    : @linear-gradient(135deg, #9db08a 0%, #7d9369 100%);
+                opacity: root.busy || root.cooldown-secs > 0 ? 0.6 : 1;
+                border-width: 1px;
+                border-color: lta.has-hover ? #e4e9dd88 : #9db08a55;
+                drop-shadow-blur: lta.has-hover ? 12px : 4px;
+                drop-shadow-color: #9db08a44;
+                animate background, opacity, border-color { duration: 150ms; }
 
                 Text {
                     width: 100%;
@@ -593,7 +651,7 @@ export component LoginWindow inherits Window {
                     horizontal-alignment: center;
                     vertical-alignment: center;
                     text: root.cooldown-secs > 0 ? "try again in \{root.cooldown-secs}s"
-                        : root.busy ? "authenticating…" : "login";
+                        : root.busy ? "authenticating..." : "login";
                     color: #0b100c;
                     font-size: 16px;
                     font-family: "Syne";
@@ -679,7 +737,8 @@ export component LoginWindow inherits Window {
     IconButton {
         x: 24px;
         y: parent.height - self.height - 24px;
-        label: "⌨";
+        width: 54px;
+        label: "KBD";
         clicked => { root.vk-visible = !root.vk-visible; }
     }
 
@@ -687,19 +746,22 @@ export component LoginWindow inherits Window {
     IconButton {
         x: parent.width - self.width * 3 - 48px;
         y: parent.height - self.height - 24px;
+        width: 54px;
         label: ">_";
         clicked => { root.confirm-action = 3; }
     }
     IconButton {
         x: parent.width - self.width * 2 - 36px;
         y: parent.height - self.height - 24px;
-        label: "↻";
+        width: 54px;
+        label: "RBT";
         clicked => { root.confirm-action = 2; }
     }
     IconButton {
         x: parent.width - self.width - 24px;
         y: parent.height - self.height - 24px;
-        label: "⏻";
+        width: 54px;
+        label: "PWR";
         clicked => { root.confirm-action = 1; }
     }
 
@@ -734,24 +796,24 @@ export component LoginWindow inherits Window {
                 alignment: center;
 
                 VkKey {
-                    label: "⇧";
+                    label: "SHIFT";
                     key-width: 70px;
                     border-color: root.vk-shift ? #b7c9a3 : #9db08a2a;
                     pressed => { root.vk-shift = !root.vk-shift; }
                 }
                 VkKey {
                     label: "space";
-                    key-width: 280px;
+                    key-width: 260px;
                     pressed => { root.vk-key(root.active-field, " "); }
                 }
                 VkKey {
-                    label: "⌫";
+                    label: "DEL";
                     key-width: 70px;
                     pressed => { root.vk-backspace(root.active-field); }
                 }
                 VkKey {
-                    label: "↵";
-                    key-width: 70px;
+                    label: "ENTER";
+                    key-width: 80px;
                     border-color: #b7c9a366;
                     pressed => {
                         if (root.active-field == 0) {
@@ -765,7 +827,7 @@ export component LoginWindow inherits Window {
         }
     }
 
-    // ── confirm overlay (topmost) ───────────────────────────────────────────
+    // ── confirm / TTY switcher overlay (topmost) ────────────────────────────
     if root.confirm-action != 0 : Rectangle {
         width: 100%;
         height: 100%;
@@ -776,7 +838,8 @@ export component LoginWindow inherits Window {
             clicked => { root.confirm-action = 0; }
         }
 
-        Rectangle {
+        // Poweroff (1) & Reboot (2) confirmation dialog
+        if root.confirm-action == 1 || root.confirm-action == 2 : Rectangle {
             width: 320px;
             height: confirm-layout.preferred-height + 48px;
             x: (parent.width - self.width) / 2;
@@ -788,7 +851,6 @@ export component LoginWindow inherits Window {
             drop-shadow-blur: 28px;
             drop-shadow-color: #000000cc;
 
-            // swallow clicks so the backdrop-cancel doesn't fire through
             TouchArea { }
 
             confirm-layout := VerticalLayout {
@@ -796,9 +858,7 @@ export component LoginWindow inherits Window {
                 spacing: 18px;
 
                 Text {
-                    text: root.confirm-action == 1 ? "power off?"
-                        : root.confirm-action == 2 ? "reboot?"
-                        : "switch to tty\{root.tty-target}?";
+                    text: root.confirm-action == 1 ? "power off?" : "reboot?";
                     color: #e4e9dd;
                     font-size: 19px;
                     font-family: "Syne";
@@ -838,9 +898,7 @@ export component LoginWindow inherits Window {
                             height: 100%;
                             horizontal-alignment: center;
                             vertical-alignment: center;
-                            text: root.confirm-action == 1 ? "power off"
-                                : root.confirm-action == 2 ? "reboot"
-                                : "go";
+                            text: root.confirm-action == 1 ? "power off" : "reboot";
                             color: #0b100c;
                             font-size: 14px;
                             font-family: "Syne";
@@ -849,14 +907,156 @@ export component LoginWindow inherits Window {
                             clicked => {
                                 if (root.confirm-action == 1) {
                                     root.poweroff();
-                                } else if (root.confirm-action == 2) {
-                                    root.reboot();
                                 } else {
-                                    root.to-tty();
+                                    root.reboot();
                                 }
                                 root.confirm-action = 0;
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // TTY Switcher dialog (confirm-action == 3)
+        if root.confirm-action == 3 : Rectangle {
+            width: 440px;
+            height: tty-layout.preferred-height + 48px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 20px;
+            background: #121a14;
+            border-width: 1px;
+            border-color: #9db08a55;
+            drop-shadow-blur: 32px;
+            drop-shadow-color: #000000dd;
+
+            TouchArea { }
+
+            tty-layout := VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+
+                Text {
+                    text: "switch Virtual Terminal (TTY)";
+                    color: #e4e9dd;
+                    font-size: 18px;
+                    font-family: "Syne";
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "Select a console VT to switch to:";
+                    color: #9db08aaa;
+                    font-size: 13px;
+                    font-family: "Inconsolata";
+                    horizontal-alignment: center;
+                }
+
+                VerticalLayout {
+                    spacing: 8px;
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        for tty-num in [1, 2, 3] : Rectangle {
+                            height: 52px;
+                            border-radius: 12px;
+                            background: tty-num == root.current-tty
+                                ? #9db08a33
+                                : (t1-ta.has-hover ? #18211a : #0b100c);
+                            border-width: 1px;
+                            border-color: tty-num == root.current-tty
+                                ? #9db08a
+                                : (t1-ta.has-hover ? #9db08a88 : #9db08a22);
+                            animate background, border-color { duration: 120ms; }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: "TTY " + tty-num;
+                                    color: #e4e9dd;
+                                    font-size: 14px;
+                                    font-family: "Inconsolata";
+                                    horizontal-alignment: center;
+                                }
+                                Text {
+                                    text: tty-num == root.current-tty ? "greeter" : "switch";
+                                    color: tty-num == root.current-tty ? #9db08a : #9db08a66;
+                                    font-size: 11px;
+                                    font-family: "Inconsolata";
+                                    horizontal-alignment: center;
+                                }
+                            }
+
+                            t1-ta := TouchArea {
+                                clicked => {
+                                    root.confirm-action = 0;
+                                    root.switch-tty(tty-num);
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        for tty-num in [4, 5, 6] : Rectangle {
+                            height: 52px;
+                            border-radius: 12px;
+                            background: tty-num == root.current-tty
+                                ? #9db08a33
+                                : (t2-ta.has-hover ? #18211a : #0b100c);
+                            border-width: 1px;
+                            border-color: tty-num == root.current-tty
+                                ? #9db08a
+                                : (t2-ta.has-hover ? #9db08a88 : #9db08a22);
+                            animate background, border-color { duration: 120ms; }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: "TTY " + tty-num;
+                                    color: #e4e9dd;
+                                    font-size: 14px;
+                                    font-family: "Inconsolata";
+                                    horizontal-alignment: center;
+                                }
+                                Text {
+                                    text: tty-num == root.current-tty ? "greeter" : "switch";
+                                    color: tty-num == root.current-tty ? #9db08a : #9db08a66;
+                                    font-size: 11px;
+                                    font-family: "Inconsolata";
+                                    horizontal-alignment: center;
+                                }
+                            }
+
+                            t2-ta := TouchArea {
+                                clicked => {
+                                    root.confirm-action = 0;
+                                    root.switch-tty(tty-num);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 40px;
+                    border-radius: 10px;
+                    background: close-tty-ta.has-hover ? #18211a : transparent;
+                    border-width: 1px;
+                    border-color: #9db08a44;
+                    Text {
+                        width: 100%;
+                        height: 100%;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        text: "close";
+                        color: #9db08a;
+                        font-size: 13px;
+                        font-family: "Inconsolata";
+                    }
+                    close-tty-ta := TouchArea {
+                        clicked => { root.confirm-action = 0; }
                     }
                 }
             }

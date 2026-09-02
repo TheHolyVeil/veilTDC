@@ -22,9 +22,17 @@ slint::include_modules!();
 /// Handoff from the auth thread to the main thread across the event-loop quit.
 static PENDING: Mutex<Option<(String, String, usize)>> = Mutex::new(None);
 
-/// VT the "switch to console" button targets — single source of truth so the
-/// confirm dialog's label can't drift from what switch_vt() actually does.
-const TTY_TARGET: i32 = 4;
+fn detect_current_tty() -> i32 {
+    if let Ok(active) = std::fs::read_to_string("/sys/class/tty/tty0/active") {
+        let active = active.trim();
+        if let Some(num_str) = active.strip_prefix("tty") {
+            if let Ok(num) = num_str.parse::<i32>() {
+                return num;
+            }
+        }
+    }
+    1
+}
 
 fn check_prerequisites(dry_run: bool) {
     if dry_run {
@@ -106,7 +114,8 @@ fn main() {
         load_avatar(&ui, first_user);
     }
 
-    ui.set_tty_target(TTY_TARGET);
+    let current_tty = detect_current_tty();
+    ui.set_current_tty(current_tty);
 
     // Clock for the stage-0 screen; ticks fast enough that seconds never skip.
     let clock_timer = slint::Timer::default();
@@ -137,7 +146,7 @@ fn main() {
 
     ui.on_poweroff(|| power_action("poweroff"));
     ui.on_reboot(|| power_action("reboot"));
-    ui.on_to_tty(|| switch_vt(TTY_TARGET));
+    ui.on_switch_tty(move |tty_num| switch_vt(tty_num));
 
     {
         let weak = ui.as_weak();
