@@ -143,14 +143,13 @@ impl InputBackend for EvdevInput {
                 };
                 let mut moved = false;
                 for ev in events {
-                    if active {
-                        if handle_event(
+                    if active
+                        && handle_event(
                             &tx, ev, &geom, &mut cx, &mut cy, &running, &host_stop,
                             &mut ctrl_held, &mut alt_held,
                         ) {
                             moved = true;
                         }
-                    }
                 }
                 if active && moved {
                     let comp_w = geom.comp_w.load(Ordering::Relaxed) as i32;

@@ -1225,9 +1225,10 @@ fn adjust_volume(up: bool) -> (String, Option<u8>) {
     }
 
     let pactl_arg = if up { "+5%" } else { "-5%" };
-    if let Ok(_) = Command::new("pactl")
+    if Command::new("pactl")
         .args(["set-sink-volume", "@DEFAULT_SINK@", pactl_arg])
         .output()
+        .is_ok()
     {
         return ("ADJUSTED".to_string(), None);
     }
@@ -1236,9 +1237,10 @@ fn adjust_volume(up: bool) -> (String, Option<u8>) {
 }
 
 fn toggle_volume_mute() -> (String, Option<u8>) {
-    if let Ok(_) = Command::new("wpctl")
+    if Command::new("wpctl")
         .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
         .output()
+        .is_ok()
     {
         if let Ok(get_out) = Command::new("wpctl")
             .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
@@ -1290,9 +1292,10 @@ fn adjust_brightness(up: bool) -> (String, Option<u8>) {
     }
 
     let light_flag = if up { "-A" } else { "-U" };
-    if let Ok(_) = Command::new("light")
+    if Command::new("light")
         .args([light_flag, "5"])
         .output()
+        .is_ok()
     {
         if let Ok(get_out) = Command::new("light").output() {
             let s = String::from_utf8_lossy(&get_out.stdout);
@@ -1314,8 +1317,8 @@ fn draw_osd_overlay(osd: &OsdNotification, back: &mut [u8], w: u32, h: u32) {
     let line_h = (GLYPH_H + 3) * scale;
     let pad = 12i32;
 
-    let title_line = format!("{}", osd.title.to_ascii_uppercase());
-    let body_line = format!("{}", osd.body.to_ascii_uppercase());
+    let title_line = osd.title.to_ascii_uppercase().to_string();
+    let body_line = osd.body.to_ascii_uppercase().to_string();
 
     let has_bar = osd.progress.is_some();
     let bar_h = if has_bar { 14i32 } else { 0i32 };
@@ -1721,7 +1724,6 @@ fn handle_power_menu_key(state: &mut State, mods: &ModifiersState, keysym: Keysy
             m.selected = (m.selected + 1).min(crate::powermenu::POWER_ACTIONS.len() - 1);
             mark_dirty_full(state);
         }
-        return;
     }
 }
 
@@ -2210,6 +2212,7 @@ fn composite_and_send(state: &mut State) {
 /// the `•` bullets from the original bar spec — closest available glyph
 /// with real visual weight (`.` renders as a single near-invisible pixel
 /// at this scale).
+#[allow(clippy::too_many_arguments)]
 fn draw_bar(
     theme: &veil_config::Theme,
     bar: &veil_config::BarConfig,

@@ -242,6 +242,7 @@ impl GpuEncoder {
 /// group) and cache that instead. This is the only place new GPU resources
 /// get allocated — everything else in the hot path just writes into what's
 /// already there.
+#[allow(clippy::too_many_arguments)]
 fn ensure_res<'a>(
     device: &wgpu::Device,
     pipeline: &wgpu::ComputePipeline,

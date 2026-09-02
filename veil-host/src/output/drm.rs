@@ -648,6 +648,7 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
 /// `src` is always a complete, correct frame (composite never produces a
 /// partial one), so widening within an already-included row wastes a few
 /// bytes, never risks correctness.
+#[allow(clippy::too_many_arguments)]
 fn blit_rgba_to_xrgb(
     dst: &mut [u8],
     pitch: usize,

@@ -50,7 +50,7 @@ pub fn detect_users() -> Vec<String> {
                 let name = parts[0];
                 let uid: u32 = parts[2].parse().unwrap_or(0);
                 let shell = parts[6];
-                if (uid >= 1000 && uid < 65534)
+                if (1000..65534).contains(&uid)
                     && !shell.contains("nologin")
                     && !shell.contains("false")
                 {

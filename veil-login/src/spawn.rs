@@ -212,7 +212,7 @@ pub fn launch(username: &str, password: &str, entry: &SessionEntry) -> Result<()
     // per-user installs live in ~/.local/bin — make sure it's reachable even
     // before the shell's own profile has run.
     let local_bin = format!("{}/.local/bin", home.to_string_lossy());
-    if let Some(path) = env.get_mut(&b"PATH".to_vec()) {
+    if let Some(path) = env.get_mut(b"PATH".as_slice()) {
         let has_local = std::str::from_utf8(path)
             .map(|p| p.split(':').any(|d| d == local_bin))
             .unwrap_or(false);
