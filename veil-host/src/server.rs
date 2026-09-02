@@ -271,7 +271,7 @@ impl Monitor {
             active_workspace: 0,
             layout_rects: Vec::new(),
             bar_hitboxes: Vec::new(),
-            composite_buf: Vec::new(),
+            composite_buf: Vec::with_capacity((width as usize) * (height as usize) * 4),
             damage: None,
             last_composite: None,
             prev_frame: None,
@@ -368,7 +368,19 @@ pub struct State {
     pub socket_name:       String,
     pub popups:            PopupManager,
     pub surface_buffers:   HashMap<ObjectId, SurfaceBuf>,
+    /// Surfaces whose linux-drm-syncobj acquire-point wait has already timed
+    /// out at least once. See the commit handler for why: once we know a
+    /// client's sync points don't actually resolve against this compositor,
+    /// re-attempting the wait on every subsequent commit is pure blocking
+    /// cost with no chance of success — skip it instead of paying it again.
+    pub sync_wait_broken:  std::collections::HashSet<ObjectId>,
     pub cursor_status:     CursorImageStatus,
+    /// Cache for the last `pick_focus` result. Stores the surface, its origin
+    /// in compositor space, and the tight bounding rect that was hit-tested.
+    /// Invalidated when windows open/close/resize (relayout clears it) and
+    /// on every tick where focus changes. If the cursor is still inside
+    /// `focus_cache_rect` the tree walk is skipped entirely.
+    pub focus_cache: Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>, Rect)>,
     pub dirty:             bool,
     pub frame_tx:          mpsc::Sender<Frame>,
     pub serial_counter:    u32,
@@ -504,11 +516,31 @@ impl CompositorHandler for State {
                     (cur.acquire_point.clone(), cur.release_point.clone())
                 });
                 if let Some(pt) = &acquire_pt {
-                    if let Err(e) = pt.wait(16_000_000) {
+                    let id = surface.id();
+                    if self.sync_wait_broken.contains(&id) {
+                        // Already know this surface's acquire points don't
+                        // resolve against us — every previous wait here
+                        // timed out, and the buffer gets composited either
+                        // way (see below), so re-waiting bought nothing
+                        // except blocking the whole single-threaded
+                        // compositor for the timeout's full duration, on
+                        // every single commit. Skip straight to using the
+                        // buffer, same as we did after the last timeout.
+                    } else if let Err(e) = pt.wait(2_000_000) {
+                        // Was 16ms (roughly a full 60Hz frame) — a client
+                        // whose sync genuinely works signals near-instantly,
+                        // not in "almost a whole frame", so 2ms is still
+                        // generous for the honest case while capping the
+                        // worst-case stall for a client that never signals
+                        // at 1/8th of what it was. First failure marks the
+                        // surface broken so we don't pay this repeatedly —
+                        // see the `contains` check above.
                         tracing::warn!(
-                            "commit {} — syncobj acquire wait failed/timed out: {e}",
-                            surface.id()
+                            "commit {} — syncobj acquire wait failed/timed out: {e} \
+                             (compositor will stop waiting on this surface's sync points)",
+                            id
                         );
+                        self.sync_wait_broken.insert(id);
                     }
                 }
 
@@ -1719,6 +1751,7 @@ const BAR_HEIGHT: u32 = 12;
 /// whenever the live window set or the output size changes. Also marks the
 /// focused window Activated (others deactivated) so clients render focus state.
 fn relayout(state: &mut State) {
+    state.focus_cache = None;
     let idx = active_monitor_idx(state);
     let ws = state.monitors[idx].active_workspace;
     let n = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).count();
@@ -1782,8 +1815,25 @@ fn relayout(state: &mut State) {
         tl.configure_size(rects[i], activated, is_fs);
     }
 
-    state.monitors[idx].layout_rects = rects;
-    mark_dirty_full(state);
+    let old_rects = std::mem::replace(&mut state.monitors[idx].layout_rects, rects);
+    // If geometry didn't change (focus-only), dirty just the two affected tiles.
+    // If it did change (window added/removed/resized), dirty the whole monitor.
+    let new_focused = state.monitors[idx].layout.focused;
+    let new_rects = &state.monitors[idx].layout_rects;
+    if old_rects == *new_rects && !old_rects.is_empty() {
+        // Only the `activated` state changed on two windows — dirty their rects.
+        let prev_rect = old_rects.get(focused).copied();
+        let next_rect = new_rects.get(new_focused).copied();
+        let dirty_rect = match (prev_rect, next_rect) {
+            (Some(a), Some(b)) if a == b => a,
+            (Some(a), Some(b)) => a.union(&b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => Rect { x: 0, y: 0, w: state.monitors[idx].output_w, h: state.monitors[idx].output_h },
+        };
+        mark_dirty_rect(state, idx, dirty_rect);
+    } else {
+        mark_dirty_full(state);
+    }
 }
 
 /// Point the keyboard at whichever live toplevel is currently focused (or
@@ -2639,6 +2689,14 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // monitor (terminal mode, or a single DRM display) this box is
             // exactly that monitor's size, so the rescale is a no-op — same
             // behavior as before this had more than one monitor to place.
+
+            // Captured BEFORE `state.pointer_global` is overwritten below —
+            // this is "which monitor/position the cursor was actually drawn
+            // at last frame", needed to damage exactly the region it's
+            // leaving instead of the whole screen.
+            let old_idx = active_monitor_idx(state);
+            let old_pos = state.monitors[old_idx].pointer_pos;
+
             let total_w: u32 = state.monitors.iter().map(|m| m.output_w).sum();
             let total_h: u32 = state.monitors.iter().map(|m| m.output_h).max().unwrap_or(0);
             let gx = if width  > 0 { x as f64 * total_w as f64 / width  as f64 } else { x as f64 };
@@ -2656,7 +2714,30 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             let nx = (gx - m.rect.x as f64).clamp(0.0, m.output_w.saturating_sub(1) as f64);
             let ny = (gy - m.rect.y as f64).clamp(0.0, m.output_h.saturating_sub(1) as f64);
             state.monitors[idx].pointer_pos = (nx, ny);
-            mark_dirty_full(state);
+
+            // Recompositing itself always redraws the whole frame regardless
+            // of the damage rect (see composite_one_monitor) — `damage` here
+            // only controls how much of the ALREADY-correct recomposited
+            // buffer gets forwarded to the output backend. So a cursor-sized
+            // rect is exactly as correct as the whole screen, just far
+            // cheaper to blit. Margin is generous (not measured from the
+            // actual cursor surface/hotspot) to safely cover the built-in
+            // 12×16 fallback arrow and typical client cursor themes alike;
+            // an unusually large custom client cursor could in principle
+            // exceed it and leave a stale edge pixel behind — a cosmetic
+            // edge case, not a correctness or crash issue.
+            fn cursor_bbox(pos: (f64, f64)) -> Rect {
+                Rect { x: pos.0 as i32 - 16, y: pos.1 as i32 - 16, w: 64, h: 64 }
+            }
+            if old_idx == idx {
+                mark_dirty_rect(state, idx, cursor_bbox(old_pos).union(&cursor_bbox((nx, ny))));
+            } else {
+                // Cursor crossed onto a different monitor this event (rare —
+                // only right at a monitor's edge): erase it from where it
+                // was, draw it where it is now.
+                mark_dirty_rect(state, old_idx, cursor_bbox(old_pos));
+                mark_dirty_rect(state, idx, cursor_bbox((nx, ny)));
+            }
 
             // Resolve focus: prefer the topmost popup under the cursor,
             // else the toplevel. Surface-local coords are (global - origin).
@@ -3254,7 +3335,9 @@ pub fn run(
         socket_name: socket_name.to_string(),
         popups:           PopupManager::default(),
         surface_buffers:  HashMap::new(),
+        sync_wait_broken: std::collections::HashSet::new(),
         cursor_status:    CursorImageStatus::default_named(),
+        focus_cache:      None,
         dirty:            false,
         frame_tx,
         serial_counter: 0,
@@ -3359,7 +3442,11 @@ pub fn run(
     let stop_t = stop.clone();
     let loop_signal_t = loop_signal.clone();
     let tick = Timer::immediate();
+    let tick_trace = std::env::var("VEIL_TICK_TRACE").is_ok();
+    if tick_trace { eprintln!("[veil-tick] VEIL_TICK_TRACE on — phase timing every 120th tick (~1s)"); }
+    let mut tick_n: u32 = 0;
     handle.insert_source(tick, move |_, _, data| {
+        let t_start = tick_trace.then(std::time::Instant::now);
         // Prune toplevels that the client has destroyed. If any closed, retile
         // the survivors and move keyboard focus onto one of them.
         let before = data.state.toplevels.len();
@@ -3391,9 +3478,11 @@ pub fn run(
         }
 
         // Drain input cmds.
+        let t_pre_input = tick_trace.then(std::time::Instant::now);
         while let Ok(cmd) = input_rx.try_recv() {
             apply_input(&mut data.state, cmd);
         }
+        let t_post_input = tick_trace.then(std::time::Instant::now);
 
         // Copy-out: hosted client set clipboard → push to host compositor.
         // Deferred one tick because Smithay updates seat_data after new_selection returns.
@@ -3458,10 +3547,35 @@ pub fn run(
 
         // Composite all dirty surfaces into one RGBA frame and ship it.
         // Frame callbacks are fired inside composite_and_send after the frame is sent.
+        let t_pre_composite = tick_trace.then(std::time::Instant::now);
+        let was_dirty = data.state.dirty;
         composite_and_send(&mut data.state);
+        let t_post_composite = tick_trace.then(std::time::Instant::now);
 
         // Flush outgoing wayland messages.
         let _ = data.display.flush_clients();
+        let t_end = tick_trace.then(std::time::Instant::now);
+
+        if tick_trace {
+            tick_n = tick_n.wrapping_add(1);
+            if tick_n.is_multiple_of(120) {
+                if let (Some(s), Some(pi), Some(pai), Some(pc), Some(poc), Some(e))
+                    = (t_start, t_pre_input, t_post_input, t_pre_composite, t_post_composite, t_end)
+                {
+                    eprintln!(
+                        "[veil-tick] total={:.2}ms  prelude={:.2}ms input={:.2}ms \
+                         pre_composite_misc={:.2}ms composite={:.2}ms(dirty={}) flush={:.2}ms",
+                        (e - s).as_secs_f64() * 1000.0,
+                        (pi - s).as_secs_f64() * 1000.0,
+                        (pai - pi).as_secs_f64() * 1000.0,
+                        (pc - pai).as_secs_f64() * 1000.0,
+                        (poc - pc).as_secs_f64() * 1000.0,
+                        was_dirty,
+                        (e - poc).as_secs_f64() * 1000.0,
+                    );
+                }
+            }
+        }
 
         if stop_t.load(Ordering::Relaxed) || !data.state.running {
             loop_signal_t.stop();

@@ -1,6 +1,13 @@
 use flate2::{write::ZlibEncoder, Compression};
-use image::{imageops, DynamicImage, RgbaImage};
+use image::imageops;
 use std::io::Write as _;
+
+/// Zero-copy view over an already-owned RGBA buffer for feeding into
+/// `image::imageops::resize`, which only needs `GenericImageView` — it
+/// doesn't care whether the backing storage is owned or borrowed. Used by
+/// `render_kitty_frame`'s downscale path so we don't have to clone the full
+/// source frame just to hand ownership to an `ImageBuffer`.
+type BorrowedRgba<'a> = image::ImageBuffer<image::Rgba<u8>, &'a [u8]>;
 
 /* ── Half-block colour renderer ──────────────────────────────────────────── */
 
@@ -79,18 +86,34 @@ pub fn render_chars(frame: &TermFrame) -> Vec<char> {
 
 // ── GUI path ──────────────────────────────────────────────────────────────────
 
+/// Compute per-cell luma via nearest-neighbour sampling + Rec.601 weights.
+///
+/// Previously this went through the `image` crate: `rgba.to_vec()` (a full
+/// source-frame clone, every frame), then `RgbaImage`, then a `DynamicImage`
+/// wrap, then a Triangle-filter `resize_exact` (a convolution over a support
+/// window — real work per output pixel), then `.to_luma8()` (yet another
+/// full-size intermediate buffer) before finally collecting into the `Vec<u8>`
+/// we actually wanted. None of that was necessary: we only need one sample
+/// per cell, exactly like `rgba_to_halfblocks` above already does for the
+/// halfblock path. This also now matches `luma.wgsl`'s GPU sampling exactly
+/// (nearest-neighbour, same 77/150/29 Rec.601 fixed-point weights), so output
+/// no longer depends on which path (GPU vs CPU) happened to render it.
 pub fn compute_luma(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -> Vec<u8> {
-    let full = cols as usize * rows as usize;
-    let img = match RgbaImage::from_raw(src_w, src_h, rgba.to_vec()) {
-        Some(i) => i,
-        None    => return vec![0; full],
-    };
-    DynamicImage::ImageRgba8(img)
-        .resize_exact(cols as u32, rows as u32, imageops::FilterType::Triangle)
-        .to_luma8()
-        .pixels()
-        .map(|p| p[0])
-        .collect()
+    let cols_u = (cols as u32).max(1);
+    let rows_u = (rows as u32).max(1);
+    let mut out = Vec::with_capacity(cols as usize * rows as usize);
+    for row in 0..rows_u {
+        let px_y = row * src_h / rows_u;
+        for col in 0..cols_u {
+            let px_x = col * src_w / cols_u;
+            let rgb = sample_rgb(rgba, src_w, px_x, px_y);
+            // Rec.601 luma, fixed-point weights summing to 256 — identical
+            // formula to luma.wgsl's `0.299/0.587/0.114` (just scaled).
+            let luma = (rgb[0] as u32 * 77 + rgb[1] as u32 * 150 + rgb[2] as u32 * 29) >> 8;
+            out.push(luma as u8);
+        }
+    }
+    out
 }
 
 pub fn apply_hysteresis(stable: &mut [u8], current: &[u8], threshold: u8) -> bool {
@@ -202,31 +225,33 @@ pub fn render_kitty_frame(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: 
 
     if rgba.is_empty() || src_w == 0 || src_h == 0 { return String::new(); }
 
-    let (iw, ih, buf);
-    if src_w > MAX_W || src_h > MAX_H {
-        let img = match RgbaImage::from_raw(src_w, src_h, rgba.to_vec()) {
+    // `iw`/`ih`/`buf` used to always clone the full source frame via
+    // `rgba.to_vec()` even in the common case (no downscale needed) purely
+    // to unify the type before compression — every frame, whether or not
+    // any resize work was actually happening. `buf` is now a `Cow`: the
+    // common path borrows `rgba` directly (zero-copy) and only the
+    // downscale path produces an owned buffer (unavoidable — resizing
+    // writes new pixels). The downscale path itself is also zero-copy on
+    // input now: `BorrowedRgba` reads straight out of `rgba` instead of
+    // `.to_vec()`-ing it first just to feed the resizer.
+    let (iw, ih, buf): (u32, u32, std::borrow::Cow<[u8]>) = if src_w > MAX_W || src_h > MAX_H {
+        let img: BorrowedRgba = match image::ImageBuffer::from_raw(src_w, src_h, rgba) {
             Some(i) => i,
             None    => return String::new(),
         };
-        let scaled = DynamicImage::ImageRgba8(img)
-            .resize(MAX_W, MAX_H, imageops::FilterType::Triangle)
-            .to_rgba8();
-        let dims = scaled.dimensions();
-        iw  = dims.0;
-        ih  = dims.1;
-        buf = scaled.into_raw();
+        let scaled = imageops::resize(&img, MAX_W, MAX_H, imageops::FilterType::Triangle);
+        let (w, h) = scaled.dimensions();
+        (w, h, std::borrow::Cow::Owned(scaled.into_raw()))
     } else {
-        iw  = src_w;
-        ih  = src_h;
-        buf = rgba.to_vec();
-    }
+        (src_w, src_h, std::borrow::Cow::Borrowed(rgba))
+    };
 
     // Zlib-compress before base64 — typical UI content compresses 4-6x,
     // bringing 1.5MB frames down to ~300KB and making real-time feasible.
     let compressed = {
         let mut enc = ZlibEncoder::new(Vec::with_capacity(buf.len() / 4), Compression::fast());
         let _ = enc.write_all(&buf);
-        enc.finish().unwrap_or(buf)
+        enc.finish().unwrap_or_else(|_| buf.into_owned())
     };
 
     let b64 = base64_encode(&compressed);

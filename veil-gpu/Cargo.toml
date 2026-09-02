@@ -8,7 +8,7 @@ edition = "2021"
 # offloading halfblock/luma sampling from the CPU.
 
 [dependencies]
-wgpu        = { version = "29", default-features = false, features = ["vulkan", "wgsl"] }
-pollster    = "0.4"
+wgpu        = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
+pollster    = "1"
 bytemuck    = { version = "1.25", features = ["derive"] }
 veil-render = { path = "../veil-render" }

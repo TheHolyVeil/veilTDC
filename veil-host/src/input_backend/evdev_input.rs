@@ -141,13 +141,21 @@ impl InputBackend for EvdevInput {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Err(e) => { eprintln!("[veil-host] evdev read error: {e}"); continue; }
                 };
+                let mut moved = false;
                 for ev in events {
                     if active {
-                        handle_event(
+                        if handle_event(
                             &tx, ev, &geom, &mut cx, &mut cy, &running, &host_stop,
                             &mut ctrl_held, &mut alt_held,
-                        );
+                        ) {
+                            moved = true;
+                        }
                     }
+                }
+                if active && moved {
+                    let comp_w = geom.comp_w.load(Ordering::Relaxed) as i32;
+                    let comp_h = geom.comp_h.load(Ordering::Relaxed) as i32;
+                    send_motion(&tx, cx, cy, comp_w, comp_h);
                 }
             }
         }
@@ -166,11 +174,12 @@ fn handle_event(
     host_stop: &std::sync::atomic::AtomicBool,
     ctrl_held: &mut bool,
     alt_held: &mut bool,
-) {
+) -> bool {
+    let mut moved = false;
     match ev.destructure() {
         EventSummary::Key(_, key, value) => {
             // value: 0 = release, 1 = press, 2 = repeat (Wayland drives repeat).
-            if value == 2 { return; }
+            if value == 2 { return false; }
             let pressed = value == 1;
             let code = key.code();
 
@@ -185,7 +194,7 @@ fn handle_event(
             if *ctrl_held && *alt_held && pressed {
                 if let Some(vt) = vt_for_fkey(code) {
                     crate::seat::request_vt_switch(vt);
-                    return;
+                    return false;
                 }
             }
 
@@ -197,7 +206,7 @@ fn handle_event(
                 crate::vt::emergency_restore();
                 running.store(false, Ordering::Relaxed);
                 host_stop.store(true, Ordering::Relaxed);
-                return;
+                return false;
             }
 
             if is_button(key) {
@@ -215,12 +224,14 @@ fn handle_event(
             let comp_h = geom.comp_h.load(Ordering::Relaxed) as i32;
             match axis {
                 RelativeAxisCode::REL_X => {
+                    let old = *cx;
                     *cx = (*cx + value).clamp(0, comp_w.max(1) - 1);
-                    send_motion(tx, *cx, *cy, comp_w, comp_h);
+                    if *cx != old { moved = true; }
                 }
                 RelativeAxisCode::REL_Y => {
+                    let old = *cy;
                     *cy = (*cy + value).clamp(0, comp_h.max(1) - 1);
-                    send_motion(tx, *cx, *cy, comp_w, comp_h);
+                    if *cy != old { moved = true; }
                 }
                 RelativeAxisCode::REL_WHEEL => {
                     // evdev: +1 = wheel up. InputCmd: +120 = scroll down.
@@ -231,6 +242,7 @@ fn handle_event(
         }
         _ => {}
     }
+    moved
 }
 
 fn send_motion(tx: &std::sync::mpsc::Sender<InputCmd>, x: i32, y: i32, w: i32, h: i32) {

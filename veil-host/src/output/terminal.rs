@@ -34,7 +34,12 @@ pub struct TerminalOutput {
 }
 
 impl TerminalOutput {
-    pub fn new() -> io::Result<Self> {
+    /// `gpu_render`: mirrors config.lua's `gpu_render` (default true). Was
+    /// previously ignored entirely — this constructor always tried to spin
+    /// up a GpuEncoder regardless of what the user set. Now `false` skips
+    /// GPU init outright, same effect as if no Vulkan adapter existed, and
+    /// the CPU path in veil-render is used instead.
+    pub fn new(gpu_render: bool) -> io::Result<Self> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let stdout = std::io::stdout();
 
@@ -56,8 +61,10 @@ impl TerminalOutput {
         // Detect terminal capabilities for render mode
         let mode = Self::detect_mode();
 
-        // Try to init GPU encoder (only useful for halfblock/ascii modes)
-        let gpu = if matches!(mode, TerminalMode::Kitty) {
+        // Try to init GPU encoder (only useful for halfblock/ascii modes) —
+        // gated on config.lua's gpu_render, and skipped for Kitty mode
+        // (which never used the GPU path to begin with).
+        let gpu = if matches!(mode, TerminalMode::Kitty) || !gpu_render {
             None
         } else {
             GpuEncoder::new()
@@ -132,7 +139,7 @@ impl TerminalOutput {
                 out.push_str(&render_kitty_frame(rgba, self.width, self.height, cols, usable_rows));
             }
             TerminalMode::Halfblock => {
-                let cells = if let Some(ref g) = self.gpu {
+                let cells = if let Some(ref mut g) = self.gpu {
                     g.encode_halfblock(rgba, self.width, self.height, cols, usable_rows)
                 } else {
                     rgba_to_halfblocks(rgba, self.width, self.height, cols, usable_rows)
@@ -140,7 +147,7 @@ impl TerminalOutput {
                 Self::emit_halfblocks(out, &cells, cols, usable_rows);
             }
             TerminalMode::Ascii => {
-                let luma = if let Some(ref g) = self.gpu {
+                let luma = if let Some(ref mut g) = self.gpu {
                     g.encode_luma(rgba, self.width, self.height, cols, usable_rows)
                 } else {
                     compute_luma(rgba, self.width, self.height, cols, usable_rows)
@@ -149,7 +156,7 @@ impl TerminalOutput {
                 Self::emit_chars_vec(out, &chars, cols, usable_rows);
             }
             TerminalMode::AsciiEdge => {
-                let luma = if let Some(ref g) = self.gpu {
+                let luma = if let Some(ref mut g) = self.gpu {
                     g.encode_luma(rgba, self.width, self.height, cols, usable_rows)
                 } else {
                     compute_luma(rgba, self.width, self.height, cols, usable_rows)

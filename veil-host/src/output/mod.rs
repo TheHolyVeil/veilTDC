@@ -52,6 +52,17 @@ pub trait OutputBackend {
     /// backend to update cached dimensions without querying the OS on every frame.
     /// Default: no-op (DrmOutput ignores terminal resize events).
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
+
+    /// Whether any output device has a page flip in progress.
+    fn has_flip_pending(&self) -> bool {
+        false
+    }
+
+    /// Poll for output backend events (e.g. DRM VBLANK completion).
+    /// Returns Ok(true) if an event was processed.
+    fn poll_events(&mut self, _timeout: std::time::Duration) -> io::Result<bool> {
+        Ok(false)
+    }
 }
 
 #[derive(PartialEq)]
@@ -94,7 +105,11 @@ fn is_bare_tty() -> bool {
 }
 
 /// Auto-detect best output backend for current environment.
-pub fn detect(pref: veil_config::OutputPref) -> io::Result<Box<dyn OutputBackend>> {
+///
+/// `gpu_render` is config.lua's `gpu_render` flag, forwarded straight to
+/// `TerminalOutput::new` — it has no effect on `DrmOutput`, which doesn't
+/// use `veil-gpu` at all.
+pub fn detect(pref: veil_config::OutputPref, gpu_render: bool) -> io::Result<Box<dyn OutputBackend>> {
     let force = match std::env::var("VEIL_OUTPUT").ok().as_deref() {
         Some("drm") | Some("kms")  => Some(Force::Drm),
         Some("terminal") | Some("term") => Some(Force::Terminal),
@@ -103,7 +118,7 @@ pub fn detect(pref: veil_config::OutputPref) -> io::Result<Box<dyn OutputBackend
 
     if force == Some(Force::Terminal) {
         eprintln!("[veil-host] VEIL_OUTPUT=terminal → terminal output");
-        return Ok(Box::new(TerminalOutput::new()?));
+        return Ok(Box::new(TerminalOutput::new(gpu_render)?));
     }
 
     if force == Some(Force::Drm) {
@@ -132,12 +147,12 @@ pub fn detect(pref: veil_config::OutputPref) -> io::Result<Box<dyn OutputBackend
     // If running under a Wayland/X11 compositor, use terminal output.
     if std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("DISPLAY").is_ok() {
         eprintln!("[veil-host] detected compositor via env, using terminal output");
-        return Ok(Box::new(TerminalOutput::new()?));
+        return Ok(Box::new(TerminalOutput::new(gpu_render)?));
     }
 
     if pref == veil_config::OutputPref::Terminal {
         eprintln!("[veil-host] config.lua output=terminal → terminal output");
-        return Ok(Box::new(TerminalOutput::new()?));
+        return Ok(Box::new(TerminalOutput::new(gpu_render)?));
     }
 
     if pref == veil_config::OutputPref::Drm {
@@ -148,7 +163,7 @@ pub fn detect(pref: veil_config::OutputPref) -> io::Result<Box<dyn OutputBackend
     // If SSH session (and not on a bare TTY console), use terminal output
     if std::env::var("SSH_CLIENT").is_ok() || std::env::var("SSH_TTY").is_ok() {
         eprintln!("[veil-host] detected SSH session, using terminal output");
-        return Ok(Box::new(TerminalOutput::new()?));
+        return Ok(Box::new(TerminalOutput::new(gpu_render)?));
     }
 
     // Fallback: try DRM/KMS
@@ -163,7 +178,7 @@ pub fn detect(pref: veil_config::OutputPref) -> io::Result<Box<dyn OutputBackend
                 return Err(e);
             }
             eprintln!("[veil-host] falling back to terminal output");
-            Ok(Box::new(TerminalOutput::new()?))
+            Ok(Box::new(TerminalOutput::new(gpu_render)?))
         }
     }
 }

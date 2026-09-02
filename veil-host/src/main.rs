@@ -276,7 +276,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // ── Create output backend (auto-detect terminal vs DRM/KMS) ────────────────
-    let mut output = veil_host::output::detect(vcfg.output)?;
+    let mut output = veil_host::output::detect(vcfg.output, vcfg.gpu_render)?;
     let n_monitors = output.monitor_count();
     let sizes: Vec<(u32, u32)> = (0..n_monitors).map(|i| output.get_size(i)).collect();
     eprintln!("[veil-host] output backend initialized: {} display(s) detected: {:?}", n_monitors, sizes);
@@ -318,8 +318,25 @@ fn main() -> std::io::Result<()> {
     // enough — no hotplug to grow it mid-run (see MULTI_MONITOR_SCOPE.md's
     // explicitly-out-of-scope list).
     let mut latest: Vec<Option<veil_host::Frame>> = vec![None; n_monitors];
-    let store_frame = |latest: &mut Vec<Option<veil_host::Frame>>, f: veil_host::Frame| {
+    let store_frame = |latest: &mut Vec<Option<veil_host::Frame>>, mut f: veil_host::Frame| {
         if let Some(slot) = latest.get_mut(f.output_id) {
+            if let Some(prev) = slot.take() {
+                // `prev` never made it to `output.render_frame` — the render
+                // loop fell behind the compositor's tick rate and we're
+                // about to overwrite it with something newer. `prev.damage`
+                // still represents real changes that were never applied to
+                // the destination buffer. Dropping it here was invisible
+                // back when every frame's damage was unconditionally
+                // full-screen (`mark_dirty_full`) — the surviving frame's
+                // damage was always "everything" regardless, so losing an
+                // intermediate frame lost nothing. Now that motion sends a
+                // small cursor-sized rect per event, losing a frame here
+                // means losing the record of "the cursor used to be here
+                // too" — exactly what was leaving stale cursor ghosts
+                // behind on fast/circular motion, where several frames get
+                // coalesced down to one between render calls.
+                f.damage = f.damage.union(&prev.damage);
+            }
             *slot = Some(f);
         }
         // else: output_id out of range — shouldn't happen (SetMonitors and
@@ -329,14 +346,44 @@ fn main() -> std::io::Result<()> {
 
     while running.load(Ordering::Relaxed) {
         let mut got_any = false;
-        match host.frames().recv_timeout(Duration::from_millis(200)) {
-            Ok(f) => { got_any = true; store_frame(&mut latest, f); }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        // Drain the channel — collect every monitor's latest, not just one.
-        while let Ok(f) = host.frames().try_recv() { got_any = true; store_frame(&mut latest, f); }
-        if !got_any { continue; }
+
+        // Drain any immediately available frames from the channel
+        while let Ok(f) = host.frames().try_recv() {
+            got_any = true;
+            store_frame(&mut latest, f);
+        }
+
+        if !got_any {
+            let timeout = if output.has_flip_pending() {
+                Duration::from_millis(4)
+            } else {
+                Duration::from_millis(100)
+            };
+
+            match host.frames().recv_timeout(timeout) {
+                Ok(f) => {
+                    got_any = true;
+                    store_frame(&mut latest, f);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = output.poll_events(Duration::from_millis(0));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            while let Ok(f) = host.frames().try_recv() {
+                got_any = true;
+                store_frame(&mut latest, f);
+            }
+        }
+
+        if output.has_flip_pending() {
+            let _ = output.poll_events(Duration::from_millis(0));
+        }
+
+        if !got_any && !output.has_flip_pending() {
+            continue;
+        }
 
         // Propagate terminal resize to the output backend so it can update
         // its cached cols/rows without a syscall on every rendered frame.
@@ -348,24 +395,22 @@ fn main() -> std::io::Result<()> {
             output.on_resize(cur_cols, cur_rows);
         }
 
-        // Render every monitor that has a frame waiting (Arc<Vec<u8>>
-        // derefs to &[u8]). A monitor with no frame yet this pass (e.g. one
-        // SetMonitors just added, before its first composite tick) is
-        // simply skipped, not rendered blank — DRM leaves its last scanned-
-        // out content (background fill from its first real composite, once
-        // that arrives) rather than flashing empty.
+        // Render every monitor that has a new frame waiting.
         let mut logged_w = 0;
         let mut logged_h = 0;
-        for (id, slot) in latest.iter().enumerate() {
-            if let Some(frame) = slot {
+        let mut rendered_any = false;
+        for (id, slot) in latest.iter_mut().enumerate() {
+            if let Some(frame) = slot.take() {
                 output.render_frame(id, &frame.rgba, frame.width, frame.height, frame.damage)?;
+                rendered_any = true;
                 if id == 0 { logged_w = frame.width; logged_h = frame.height; }
             }
         }
 
-        // FPS stats logging every second — monitor 0's dimensions, same as
-        // before this had more than one monitor to report on.
-        fps_frame_count += 1;
+        // FPS stats logging every second — monitor 0's dimensions.
+        if rendered_any {
+            fps_frame_count += 1;
+        }
         let elapsed = fps_last.elapsed();
         if elapsed.as_secs_f32() >= 1.0 {
             let fps = fps_frame_count as f32 / elapsed.as_secs_f32();

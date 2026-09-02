@@ -35,13 +35,25 @@ impl InputBackend for CrosstermInput {
         let mut cur_rows = geom.rows.load(Ordering::Relaxed);
         let mut last_event_time = std::time::Instant::now();
 
+        // `event::poll` blocks up to this long but returns *immediately* the
+        // instant a real event is ready — it does not add latency to key
+        // presses or mouse moves. What it *does* govern is how often we wake
+        // up to find nothing waiting. This was 1ms, i.e. up to 1000
+        // wake+syscall+timeout cycles per second even while totally idle —
+        // a full CPU core spent doing nothing, directly competing with the
+        // compositor's render thread for cycles on weak hardware. 50ms still
+        // keeps idle-log ticks reasonably granular, at 5% the wakeups.
+        const IDLE_POLL: Duration = Duration::from_millis(50);
+
         while running.load(Ordering::Relaxed) {
-            match event::poll(Duration::from_millis(1)) {
+            match event::poll(IDLE_POLL) {
                 Ok(true) => { last_event_time = std::time::Instant::now(); }
                 Ok(false) => {
                     tick = tick.wrapping_add(1);
                     let idle_secs = last_event_time.elapsed().as_secs();
-                    if idle_secs > 0 && tick.is_multiple_of(30_000) {
+                    // 600 ticks × 50ms = 30s, same cadence as before the
+                    // poll interval changed (was 30_000 ticks × 1ms).
+                    if idle_secs > 0 && tick.is_multiple_of(600) {
                         eprintln!("[veil-host] input idle {}s", idle_secs);
                     }
                     continue;

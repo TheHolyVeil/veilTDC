@@ -61,6 +61,12 @@ struct Monitor {
     height:   u32,
     bufs:     [DumbBuffer; 2],
     fbs:      [framebuffer::Handle; 2],
+    /// Raw CPU-mapped pointers for `bufs[0]`/`bufs[1]`, established ONCE at
+    /// setup via [`map_persistent`] and kept mapped for the monitor's whole
+    /// lifetime — see that function for why. `map_len` is the mapped byte
+    /// length, identical for both slots since they're the same dimensions.
+    map_ptrs: [*mut u8; 2],
+    map_len:  usize,
     /// Index of the buffer we'll render into next (not currently scanned out).
     back:     usize,
     /// Damage not yet applied to buffer `[i]`, accumulated since that
@@ -70,6 +76,8 @@ struct Monitor {
     pending_damage: [Rect; 2],
     /// A page-flip is queued; its completion event hasn't been drained yet.
     flip_pending: bool,
+    /// A new blitted frame is waiting in `bufs[back]` to be page-flipped as soon as `flip_pending` clears.
+    needs_flip: bool,
     /// Seat activity as of the last `render_frame` call for *this* monitor,
     /// to detect the disable→enable edge (VT switched back to us) and
     /// re-assert this CRTC specifically.
@@ -102,6 +110,16 @@ pub struct DrmOutput {
     /// restores text mode — handing a clean console back to fbcon / the
     /// resuming compositor.
     _vt: VtGuard,
+    /// Set from `VEIL_DRM_TRACE=1`. Prints per-phase timing (drain_flips /
+    /// blit / page_flip) and flip outcome counts (ok / EBUSY / error /
+    /// "skipped, still pending") every 60 `render_frame` calls, plus every
+    /// real page_flip error immediately. Zero cost when unset.
+    trace:   bool,
+    trace_n: u32,
+    flip_ok:      u32,
+    flip_ebusy:   u32,
+    flip_err:     u32,
+    flip_skipped: u32, // render_frame ran but flip_pending was still true
 }
 
 impl Drop for DrmOutput {
@@ -109,6 +127,13 @@ impl Drop for DrmOutput {
         // Best-effort teardown — we're going away regardless.
         for m in &self.monitors {
             let card = &self.cards[m.card_idx];
+            // Unmap before destroying the buffer the mapping points into —
+            // same ordering `DumbMapping`'s own Drop would have enforced.
+            for &ptr in &m.map_ptrs {
+                if !ptr.is_null() {
+                    unsafe { libc::munmap(ptr as *mut libc::c_void, m.map_len) };
+                }
+            }
             for fb in m.fbs {
                 let _ = card.destroy_framebuffer(fb);
             }
@@ -181,7 +206,13 @@ impl DrmOutput {
             }));
         }
 
-        Ok(Self { seat, cards, monitors, _vt: vt })
+        let trace = std::env::var("VEIL_DRM_TRACE").is_ok();
+        if trace { eprintln!("[veil-drm] VEIL_DRM_TRACE on — timing + flip stats every 60th render_frame call"); }
+
+        Ok(Self {
+            seat, cards, monitors, _vt: vt,
+            trace, trace_n: 0, flip_ok: 0, flip_ebusy: 0, flip_err: 0, flip_skipped: 0,
+        })
     }
 
     /// Open one card and mode-set *every* connected connector on it, not
@@ -256,8 +287,14 @@ impl DrmOutput {
                 Ok((db, fb))
             };
             let setup = (|| -> io::Result<Monitor> {
-                let (b0, f0) = make()?;
-                let (b1, f1) = make()?;
+                let (mut b0, f0) = make()?;
+                let (mut b1, f1) = make()?;
+                // Map both buffers ONCE here — not per-frame. See
+                // `map_persistent` for why the per-frame version of this was
+                // the real cause of the slowdown.
+                let (p0, len0) = map_persistent(&card, &mut b0)?;
+                let (p1, len1) = map_persistent(&card, &mut b1)?;
+                debug_assert_eq!(len0, len1, "same-format double buffers must map to the same length");
                 // Initial mode-set scans out buffer 0; we render into buffer 1 first.
                 card.set_crtc(crtc, Some(f0), (0, 0), &[con.handle()], Some(mode))?;
                 let full = Rect { x: 0, y: 0, w: width, h: height };
@@ -270,6 +307,8 @@ impl DrmOutput {
                     height,
                     bufs: [b0, b1],
                     fbs: [f0, f1],
+                    map_ptrs: [p0, p1],
+                    map_len: len0,
                     back: 1,
                     // Both slots start "fully dirty": neither dumb buffer has
                     // real content yet, so the first write to each must be a
@@ -277,6 +316,7 @@ impl DrmOutput {
                     // damage rect says.
                     pending_damage: [full, full],
                     flip_pending: false,
+                    needs_flip: false,
                     was_active: true,
                 })
             })();
@@ -301,26 +341,50 @@ impl DrmOutput {
     }
 
     /// Drain any completed page-flip events for one monitor's card,
-    /// clearing that monitor's `flip_pending`.
-    fn drain_flips(&mut self, idx: usize) -> io::Result<()> {
-        if !self.monitors[idx].flip_pending {
-            return Ok(());
-        }
-        let card = &self.cards[self.monitors[idx].card_idx];
+    /// clearing that monitor's `flip_pending` and presenting any queued frame.
+    fn drain_flips(&mut self, idx: usize) -> io::Result<bool> {
+        let card_idx = self.monitors[idx].card_idx;
+        let card = &self.cards[card_idx];
+        let mut got_event = false;
+
         match card.receive_events() {
             Ok(events) => {
-                let mut got = false;
                 for _ in events {
-                    got = true;
+                    got_event = true;
                 }
-                if got {
-                    self.monitors[idx].flip_pending = false;
-                }
-                Ok(())
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()), // still in flight
-            Err(e) => Err(e),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
         }
+
+        if got_event {
+            self.monitors[idx].flip_pending = false;
+        }
+
+        if !self.monitors[idx].flip_pending && self.monitors[idx].needs_flip {
+            let m = &mut self.monitors[idx];
+            let crtc = m.crtc;
+            let fb = m.fbs[m.back];
+            match self.cards[card_idx].page_flip(crtc, fb, PageFlipFlags::EVENT, None) {
+                Ok(()) => {
+                    m.flip_pending = true;
+                    m.needs_flip = false;
+                    m.back ^= 1;
+                    self.flip_ok += 1;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                    m.needs_flip = true;
+                    self.flip_ebusy += 1;
+                }
+                Err(e) => {
+                    m.needs_flip = false;
+                    self.flip_err += 1;
+                    eprintln!("[veil-host] deferred page_flip failed on monitor {idx}: {e}");
+                }
+            }
+        }
+
+        Ok(got_event)
     }
 }
 
@@ -368,6 +432,7 @@ impl OutputBackend for DrmOutput {
             // again, or it'll EINVAL and (since that error propagates out
             // of the frame loop) take the whole compositor down with it.
             self.monitors[monitor].flip_pending = false;
+            self.monitors[monitor].needs_flip = false;
             match self.reassert_crtc(monitor) {
                 Ok(()) => self.monitors[monitor].was_active = true,
                 Err(e) => eprintln!("[veil-host] VT resume: re-modeset failed on monitor {monitor}, retrying: {e}"),
@@ -382,7 +447,9 @@ impl OutputBackend for DrmOutput {
             return Ok(());
         }
 
-        self.drain_flips(monitor)?;
+        let t_drain0 = self.trace.then(std::time::Instant::now);
+        let _ = self.drain_flips(monitor)?;
+        let t_drain1 = self.trace.then(std::time::Instant::now);
 
         let card_idx = self.monitors[monitor].card_idx;
         let back = self.monitors[monitor].back;
@@ -392,10 +459,18 @@ impl OutputBackend for DrmOutput {
         let y0 = rows.y.max(0) as usize;
         let y1 = ((rows.y + rows.h as i32).max(0) as usize).min(height as usize);
         {
-            let card = &self.cards[card_idx];
-            let mut map = card.map_dumb_buffer(&mut self.monitors[monitor].bufs[back])?;
-            blit_rgba_to_xrgb(map.as_mut(), pitch, width, height, rgba, fw, fh, y0, y1);
+            // Was: `card.map_dumb_buffer(&mut bufs[back])` here, scoped so
+            // the returned `DumbMapping` unmapped itself at the end of this
+            // block — i.e. a full ioctl+mmap/munmap cycle every frame. Now
+            // it's the pointer `map_persistent` set up once at monitor
+            // creation; nothing here touches the kernel at all.
+            let ptr = self.monitors[monitor].map_ptrs[back];
+            let len = self.monitors[monitor].map_len;
+            debug_assert!(!ptr.is_null(), "map_persistent should have failed setup, not left this null");
+            let map: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            blit_rgba_to_xrgb(map, pitch, width, height, rgba, fw, fh, y0, y1);
         }
+        let t_blit1 = self.trace.then(std::time::Instant::now);
         // This slot now matches the source for everything in [y0, y1) — the
         // only rows it was behind on.
         self.monitors[monitor].pending_damage[back] = Rect { x: 0, y: 0, w: 0, h: 0 };
@@ -407,14 +482,45 @@ impl OutputBackend for DrmOutput {
             match card.page_flip(crtc, fb, PageFlipFlags::EVENT, None) {
                 Ok(()) => {
                     self.monitors[monitor].flip_pending = true;
+                    self.monitors[monitor].needs_flip = false;
                     self.monitors[monitor].back ^= 1;
+                    self.flip_ok += 1;
                 }
-                // EBUSY: previous flip not retired yet — drop this frame.
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+                // EBUSY: previous flip not retired yet — defer flip until VBLANK clears flip_pending.
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                    self.monitors[monitor].needs_flip = true;
+                    self.flip_ebusy += 1;
+                }
                 // Anything else (e.g. a stale CRTC state we didn't catch):
                 // drop the frame rather than taking the whole compositor
                 // down over one bad flip.
-                Err(e) => eprintln!("[veil-host] page_flip failed on monitor {monitor}: {e}"),
+                Err(e) => {
+                    self.monitors[monitor].needs_flip = false;
+                    self.flip_err += 1;
+                    eprintln!("[veil-host] page_flip failed on monitor {monitor}: {e}");
+                }
+            }
+        } else {
+            // render_frame ran, blit happened, page_flip deferred until VBLANK clears flip_pending.
+            self.monitors[monitor].needs_flip = true;
+            self.flip_skipped += 1;
+        }
+        let t_flip1 = self.trace.then(std::time::Instant::now);
+
+        if self.trace {
+            self.trace_n = self.trace_n.wrapping_add(1);
+            if self.trace_n.is_multiple_of(60) {
+                if let (Some(d0), Some(d1), Some(b1), Some(f1)) = (t_drain0, t_drain1, t_blit1, t_flip1) {
+                    eprintln!(
+                        "[veil-drm] drain={:.2}ms blit={:.2}ms flip_call={:.2}ms damage_rows={}  \
+                         flip: ok={} ebusy={} err={} skipped_pending={}",
+                        (d1 - d0).as_secs_f64() * 1000.0,
+                        (b1 - d1).as_secs_f64() * 1000.0,
+                        (f1 - b1).as_secs_f64() * 1000.0,
+                        y1.saturating_sub(y0),
+                        self.flip_ok, self.flip_ebusy, self.flip_err, self.flip_skipped,
+                    );
+                }
             }
         }
         Ok(())
@@ -437,6 +543,49 @@ impl OutputBackend for DrmOutput {
         }
         Ok(())
     }
+
+    fn has_flip_pending(&self) -> bool {
+        self.monitors.iter().any(|m| m.flip_pending)
+    }
+
+    fn poll_events(&mut self, timeout: std::time::Duration) -> io::Result<bool> {
+        if self.cards.is_empty() {
+            return Ok(false);
+        }
+
+        let mut pollfds: Vec<libc::pollfd> = self.cards
+            .iter()
+            .map(|c| libc::pollfd {
+                fd: c.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms) };
+
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+
+        if ret == 0 {
+            return Ok(false);
+        }
+
+        let mut processed = false;
+        for i in 0..self.monitors.len() {
+            if self.drain_flips(i)? {
+                processed = true;
+            }
+        }
+
+        Ok(processed)
+    }
 }
 
 impl DrmOutput {
@@ -450,6 +599,31 @@ impl DrmOutput {
         card.set_crtc(m.crtc, Some(m.fbs[front]), (0, 0), &[m.conn], Some(m.mode))?;
         Ok(())
     }
+}
+
+/// Map a dumb buffer's CPU-visible memory ONCE and keep it mapped for the
+/// buffer's whole lifetime — instead of the map→blit→unmap cycle
+/// `render_frame` used to do every single frame.
+///
+/// `map_dumb_buffer` is not cheap: it's a real `DRM_IOCTL_MODE_MAP_DUMB`
+/// ioctl (kernel round-trip to get a fake mmap offset) followed by a fresh
+/// `mmap(2)`. And because it *is* a brand-new mapping every time, the first
+/// write to every page in it faults the page in — at 1920x1080x4 that's
+/// ~2000 minor page faults, on top of the ioctl + mmap/munmap pair, on
+/// *every single frame*. This is almost certainly the real cause of a
+/// regression that only shows up on the DRM/KMS path and never on the
+/// terminal path (which doesn't touch dumb buffers, or mmap, at all).
+///
+/// `mem::forget`s the `DumbMapping` guard to skip its own `Drop` (which
+/// would immediately `munmap` what we just mapped) — we take over
+/// unmapping ourselves, once, in `DrmOutput::drop`, instead of every frame.
+fn map_persistent(card: &Card, db: &mut DumbBuffer) -> io::Result<(*mut u8, usize)> {
+    let mut mapping = card.map_dumb_buffer(db)?;
+    let bytes = mapping.as_mut();
+    let ptr = bytes.as_mut_ptr();
+    let len = bytes.len();
+    std::mem::forget(mapping);
+    Ok((ptr, len))
 }
 
 /// Set O_NONBLOCK on the DRM fd so `receive_events` returns immediately.
