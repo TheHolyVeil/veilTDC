@@ -14,5 +14,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Clean Cache
+        run: cargo clean
       - name: Run clippy
         run: cargo clippy --workspace --all-targets
