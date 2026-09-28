@@ -24,7 +24,7 @@ impl EvdevInput {
         for (path, mut dev) in evdev::enumerate() {
             // Keep keyboards and pointing devices; skip everything else.
             let has_keys = dev.supported_keys().is_some();
-            let has_rel  = dev.supported_relative_axes().is_some();
+            let has_rel = dev.supported_relative_axes().is_some();
             if has_keys || has_rel {
                 match dev.set_nonblocking(true) {
                     Ok(()) => {
@@ -58,9 +58,17 @@ impl InputBackend for EvdevInput {
     }
 
     fn run(self: Box<Self>, ctx: InputCtx) {
-        let InputCtx { tx, running, host_stop, geom } = ctx;
+        let InputCtx {
+            tx,
+            running,
+            host_stop,
+            geom,
+        } = ctx;
         let mut devices = self.devices;
-        eprintln!("[veil-host] input thread started (evdev, {} device(s), event-driven)", devices.len());
+        eprintln!(
+            "[veil-host] input thread started (evdev, {} device(s), event-driven)",
+            devices.len()
+        );
 
         // Virtual cursor, starts centred.
         let mut cx = (geom.comp_w.load(Ordering::Relaxed) / 2) as i32;
@@ -78,8 +86,13 @@ impl InputBackend for EvdevInput {
         // stack — there's no sleep gap for a HOME press to fall into, which is
         // what made the kill key unreliable under load. fds are stable for the
         // device lifetime; -1 masks a device that has gone away (poll ignores it).
-        let mut pfds: Vec<libc::pollfd> = devices.iter()
-            .map(|d| libc::pollfd { fd: d.as_raw_fd(), events: libc::POLLIN, revents: 0 })
+        let mut pfds: Vec<libc::pollfd> = devices
+            .iter()
+            .map(|d| libc::pollfd {
+                fd: d.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
             .collect();
 
         let mut was_active = true;
@@ -87,7 +100,9 @@ impl InputBackend for EvdevInput {
         while running.load(Ordering::Relaxed) {
             let active = crate::seat::session_active();
             if !active && was_active {
-                eprintln!("[veil-host] evdev: session inactive -> releasing device grabs for VT switch");
+                eprintln!(
+                    "[veil-host] evdev: session inactive -> releasing device grabs for VT switch"
+                );
                 for dev in &mut devices {
                     let _ = dev.ungrab();
                 }
@@ -111,13 +126,29 @@ impl InputBackend for EvdevInput {
                 // key is in fact still physically down, the next real event
                 // reasserts it correctly; this only ever clears a phantom.
                 if ctrl_held {
-                    let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL as u32, mods: 0, pressed: false });
-                    let _ = tx.send(InputCmd::Key { keycode: KEY_RIGHTCTRL as u32, mods: 0, pressed: false });
+                    let _ = tx.send(InputCmd::Key {
+                        keycode: KEY_LEFTCTRL as u32,
+                        mods: 0,
+                        pressed: false,
+                    });
+                    let _ = tx.send(InputCmd::Key {
+                        keycode: KEY_RIGHTCTRL as u32,
+                        mods: 0,
+                        pressed: false,
+                    });
                     ctrl_held = false;
                 }
                 if alt_held {
-                    let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT as u32, mods: 0, pressed: false });
-                    let _ = tx.send(InputCmd::Key { keycode: KEY_RIGHTALT as u32, mods: 0, pressed: false });
+                    let _ = tx.send(InputCmd::Key {
+                        keycode: KEY_LEFTALT as u32,
+                        mods: 0,
+                        pressed: false,
+                    });
+                    let _ = tx.send(InputCmd::Key {
+                        keycode: KEY_RIGHTALT as u32,
+                        mods: 0,
+                        pressed: false,
+                    });
                     alt_held = false;
                 }
                 was_active = true;
@@ -125,7 +156,9 @@ impl InputBackend for EvdevInput {
 
             // 200 ms cap so we still notice `running` being cleared by another path.
             let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
-            if n <= 0 { continue; } // 0 = timeout, <0 = EINTR/error → re-check running
+            if n <= 0 {
+                continue;
+            } // 0 = timeout, <0 = EINTR/error → re-check running
             for (i, dev) in devices.iter_mut().enumerate() {
                 let re = pfds[i].revents;
                 pfds[i].revents = 0;
@@ -134,22 +167,35 @@ impl InputBackend for EvdevInput {
                     pfds[i].fd = -1; // poll skips negative fds
                     continue;
                 }
-                if re & libc::POLLIN == 0 { continue; }
+                if re & libc::POLLIN == 0 {
+                    continue;
+                }
 
                 let events = match dev.fetch_events() {
                     Ok(it) => it,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(e) => { eprintln!("[veil-host] evdev read error: {e}"); continue; }
+                    Err(e) => {
+                        eprintln!("[veil-host] evdev read error: {e}");
+                        continue;
+                    }
                 };
                 let mut moved = false;
                 for ev in events {
                     if active
                         && handle_event(
-                            &tx, ev, &geom, &mut cx, &mut cy, &running, &host_stop,
-                            &mut ctrl_held, &mut alt_held,
-                        ) {
-                            moved = true;
-                        }
+                            &tx,
+                            ev,
+                            &geom,
+                            &mut cx,
+                            &mut cy,
+                            &running,
+                            &host_stop,
+                            &mut ctrl_held,
+                            &mut alt_held,
+                        )
+                    {
+                        moved = true;
+                    }
                 }
                 if active && moved {
                     let comp_w = geom.comp_w.load(Ordering::Relaxed) as i32;
@@ -178,12 +224,18 @@ fn handle_event(
     match ev.destructure() {
         EventSummary::Key(_, key, value) => {
             // value: 0 = release, 1 = press, 2 = repeat (Wayland drives repeat).
-            if value == 2 { return false; }
+            if value == 2 {
+                return false;
+            }
             let pressed = value == 1;
             let code = key.code();
 
-            if code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL { *ctrl_held = pressed; }
-            if code == KEY_LEFTALT || code == KEY_RIGHTALT { *alt_held = pressed; }
+            if code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL {
+                *ctrl_held = pressed;
+            }
+            if code == KEY_LEFTALT || code == KEY_RIGHTALT {
+                *alt_held = pressed;
+            }
 
             // VT switch chord: swallow it here rather than forward it — the
             // exclusive grab means the kernel/console never gets a chance to
@@ -210,12 +262,22 @@ fn handle_event(
 
             if is_button(key) {
                 if pressed {
-                    let _ = tx.send(InputCmd::PointerButton { button: code as u32, pressed: true });
+                    let _ = tx.send(InputCmd::PointerButton {
+                        button: code as u32,
+                        pressed: true,
+                    });
                 } else {
-                    let _ = tx.send(InputCmd::PointerButton { button: code as u32, pressed: false });
+                    let _ = tx.send(InputCmd::PointerButton {
+                        button: code as u32,
+                        pressed: false,
+                    });
                 }
             } else {
-                let _ = tx.send(InputCmd::Key { keycode: code as u32, mods: 0, pressed });
+                let _ = tx.send(InputCmd::Key {
+                    keycode: code as u32,
+                    mods: 0,
+                    pressed,
+                });
             }
         }
         EventSummary::RelativeAxis(_, axis, value) => {
@@ -225,12 +287,16 @@ fn handle_event(
                 RelativeAxisCode::REL_X => {
                     let old = *cx;
                     *cx = (*cx + value).clamp(0, comp_w.max(1) - 1);
-                    if *cx != old { moved = true; }
+                    if *cx != old {
+                        moved = true;
+                    }
                 }
                 RelativeAxisCode::REL_Y => {
                     let old = *cy;
                     *cy = (*cy + value).clamp(0, comp_h.max(1) - 1);
-                    if *cy != old { moved = true; }
+                    if *cy != old {
+                        moved = true;
+                    }
                 }
                 RelativeAxisCode::REL_WHEEL => {
                     // evdev: +1 = wheel up. InputCmd: +120 = scroll down.

@@ -3,11 +3,16 @@
 //! Wraps the existing veil-render functions (rgba_to_halfblocks, compute_luma, etc.)
 //! and renders to stdout via escape codes.
 
-use std::io::{self, Write};
+use crossterm::{
+    cursor, execute,
+    terminal::{self, ClearType},
+};
 use std::fmt::Write as _;
-use crossterm::{cursor, execute, terminal::{self, ClearType}};
-use veil_render::{rgba_to_halfblocks, compute_luma, luma_to_chars, apply_hysteresis, render_kitty_frame};
-use veil_gpu::GpuEncoder;
+use std::io::{self, Write};
+use veil_render::gpu::GpuEncoder;
+use veil_render::{
+    apply_hysteresis, compute_luma, luma_to_chars, render_kitty_frame, rgba_to_halfblocks,
+};
 
 use super::OutputBackend;
 
@@ -50,8 +55,8 @@ impl TerminalOutput {
             stdout_ref,
             terminal::EnterAlternateScreen,
             terminal::Clear(ClearType::All),
-                 cursor::Hide,
-                 cursor::MoveTo(0, 0),
+            cursor::Hide,
+            cursor::MoveTo(0, 0),
         )?;
 
         // Enable mouse: only any-event + SGR modes (avoid URXVT dup events)
@@ -85,7 +90,7 @@ impl TerminalOutput {
             rows,
             gpu,
             stable_luma: Vec::new(),
-           render_buf: String::with_capacity(render_cap),
+            render_buf: String::with_capacity(render_cap),
         })
     }
 
@@ -136,7 +141,13 @@ impl TerminalOutput {
 
         match self.mode {
             TerminalMode::Kitty => {
-                out.push_str(&render_kitty_frame(rgba, self.width, self.height, cols, usable_rows));
+                out.push_str(&render_kitty_frame(
+                    rgba,
+                    self.width,
+                    self.height,
+                    cols,
+                    usable_rows,
+                ));
             }
             TerminalMode::Halfblock => {
                 let cells = if let Some(ref mut g) = self.gpu {
@@ -184,8 +195,7 @@ impl TerminalOutput {
                     let _ = write!(
                         out,
                         "\x1b[38;2;{};{};{};48;2;{};{};{}m▀",
-                        fg[0], fg[1], fg[2],
-                        bg[0], bg[1], bg[2]
+                        fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]
                     );
                 }
             }
@@ -215,7 +225,14 @@ impl TerminalOutput {
 }
 
 impl OutputBackend for TerminalOutput {
-    fn render_frame(&mut self, _monitor: usize, rgba: &[u8], width: u32, height: u32, _damage: crate::layout::Rect) -> io::Result<()> {
+    fn render_frame(
+        &mut self,
+        _monitor: usize,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        _damage: crate::layout::Rect,
+    ) -> io::Result<()> {
         // _monitor unused: a terminal is inherently one viewport, so the
         // default `monitor_count() == 1` applies and this is always called
         // with `0`.
@@ -260,10 +277,6 @@ impl OutputBackend for TerminalOutput {
 impl Drop for TerminalOutput {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
-        let _ = execute!(
-            self.stdout,
-            cursor::Show,
-            terminal::LeaveAlternateScreen,
-        );
+        let _ = execute!(self.stdout, cursor::Show, terminal::LeaveAlternateScreen,);
     }
 }

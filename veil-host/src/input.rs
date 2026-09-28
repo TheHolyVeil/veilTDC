@@ -7,10 +7,19 @@
 #[derive(Clone, Debug)]
 pub enum InputCmd {
     /// Raw evdev keycode + active modifier bitmask + press/release.
-    Key { keycode: u32, mods: u32, pressed: bool },
+    Key {
+        keycode: u32,
+        mods: u32,
+        pressed: bool,
+    },
 
     /// Absolute pointer move in logical-output pixels.
-    PointerMotionAbs { x: i32, y: i32, width: u32, height: u32 },
+    PointerMotionAbs {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
 
     /// Pointer button: evdev BTN_* code + press/release.
     PointerButton { button: u32, pressed: bool },
@@ -31,7 +40,11 @@ pub enum InputCmd {
     SetMonitors { sizes: Vec<(u32, u32)> },
 
     /// Display an On-Screen Display (OSD) popup overlay.
-    Osd { title: String, body: String, progress: Option<u8> },
+    Osd {
+        title: String,
+        body: String,
+        progress: Option<u8>,
+    },
 }
 
 // TODO: routing layer that takes an InputCmd and calls into

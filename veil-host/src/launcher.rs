@@ -22,9 +22,9 @@ pub struct DesktopEntry {
 
 #[derive(Clone)]
 pub struct Launcher {
-    pub query:    String,
+    pub query: String,
     pub selected: usize,
-    entries:      Vec<DesktopEntry>,
+    entries: Vec<DesktopEntry>,
 }
 
 impl Default for Launcher {
@@ -35,7 +35,11 @@ impl Default for Launcher {
 
 impl Launcher {
     pub fn new() -> Self {
-        Self { query: String::new(), selected: 0, entries: scan_desktop_entries() }
+        Self {
+            query: String::new(),
+            selected: 0,
+            entries: scan_desktop_entries(),
+        }
     }
 
     /// Entries whose name contains the query (case-insensitive). Empty query
@@ -45,7 +49,10 @@ impl Launcher {
             return self.entries.iter().collect();
         }
         let q = self.query.to_ascii_lowercase();
-        self.entries.iter().filter(|e| e.name.to_ascii_lowercase().contains(&q)).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.name.to_ascii_lowercase().contains(&q))
+            .collect()
     }
 }
 
@@ -64,7 +71,9 @@ fn scan_desktop_entries() -> Vec<DesktopEntry> {
 
     let mut out = Vec::new();
     for dir in &dirs {
-        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
@@ -97,7 +106,9 @@ fn parse_desktop_file(path: &Path) -> Option<DesktopEntry> {
             continue;
         }
         if let Some(v) = line.strip_prefix("Name=") {
-            if name.is_none() { name = Some(v.to_string()); }
+            if name.is_none() {
+                name = Some(v.to_string());
+            }
         } else if let Some(v) = line.strip_prefix("Exec=") {
             exec = Some(v.to_string());
         } else if line == "NoDisplay=true" || line == "Hidden=true" {
@@ -105,10 +116,14 @@ fn parse_desktop_file(path: &Path) -> Option<DesktopEntry> {
         }
     }
 
-    if skip { return None; }
+    if skip {
+        return None;
+    }
     let name = name?;
     let exec = clean_exec(&exec?);
-    if exec.is_empty() { return None; }
+    if exec.is_empty() {
+        return None;
+    }
     Some(DesktopEntry { name, exec })
 }
 

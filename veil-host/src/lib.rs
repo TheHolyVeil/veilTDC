@@ -16,30 +16,30 @@ pub mod input;
 pub mod input_backend;
 pub mod launcher;
 pub mod layout;
-pub mod powermenu;
 pub mod lockfile;
+pub mod output;
+pub mod powermenu;
+pub mod seat;
 pub mod server;
 pub mod sink;
-pub mod output;
-pub mod seat;
 pub mod vt;
 
 pub use input::InputCmd;
 pub use input_backend::{InputBackend, InputCtx, InputGeometry};
-pub use sink::Frame;
 pub use output::OutputBackend;
+pub use sink::Frame;
 
 pub struct HostConfig {
-    pub socket_name:   String,
-    pub width:         u32,
-    pub height:        u32,
-    pub fps:           u32,
-    pub spawn:         Option<Vec<String>>,
+    pub socket_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub spawn: Option<Vec<String>>,
     pub wayland_debug: bool,
-    pub keybinds:      veil_config::Keybinds,
-    pub background:    [u8; 3],
-    pub theme:         veil_config::Theme,
-    pub bar:           veil_config::BarConfig,
+    pub keybinds: veil_config::Keybinds,
+    pub background: [u8; 3],
+    pub theme: veil_config::Theme,
+    pub bar: veil_config::BarConfig,
 }
 
 /// Signal handle returned by [`Host::spawn`]; flip via [`Host::stop`]
@@ -50,24 +50,24 @@ use std::sync::Arc as StdArc;
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
-            socket_name:   "wayland-veil-0".to_string(),
-            width:         1280,
-            height:        720,
-            fps:           60,
-            spawn:         None,
+            socket_name: "wayland-veil-0".to_string(),
+            width: 1280,
+            height: 720,
+            fps: 60,
+            spawn: None,
             wayland_debug: false,
-            keybinds:      veil_config::Keybinds::default(),
-            background:    [0x8c, 0x8c, 0x8c],
-            theme:         veil_config::Theme::for_name(veil_config::ThemeName::Default),
-            bar:           veil_config::BarConfig::default(),
+            keybinds: veil_config::Keybinds::default(),
+            background: [0x8c, 0x8c, 0x8c],
+            theme: veil_config::Theme::for_name(veil_config::ThemeName::Default),
+            bar: veil_config::BarConfig::default(),
         }
     }
 }
 
 pub struct Host {
     frames: mpsc::Receiver<Frame>,
-    input:  mpsc::Sender<InputCmd>,
-    stop:   StdArc<AtomicBool>,
+    input: mpsc::Sender<InputCmd>,
+    stop: StdArc<AtomicBool>,
     _thread: thread::JoinHandle<()>,
 }
 
@@ -100,21 +100,34 @@ impl Host {
                 }
             })?;
 
-        Ok(Self { frames: frame_rx, input: input_tx, stop, _thread: handle })
+        Ok(Self {
+            frames: frame_rx,
+            input: input_tx,
+            stop,
+            _thread: handle,
+        })
     }
 
-    pub fn frames(&self) -> &mpsc::Receiver<Frame> { &self.frames }
+    pub fn frames(&self) -> &mpsc::Receiver<Frame> {
+        &self.frames
+    }
 
     pub fn send_input(&self, cmd: InputCmd) -> Result<(), mpsc::SendError<InputCmd>> {
         self.input.send(cmd)
     }
 
     /// Ask the compositor loop to exit on its next iteration.
-    pub fn stop(&self) { self.stop.store(true, Ordering::Relaxed); }
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 
     /// Clone the input sender for use on another thread.
-    pub fn input_sender(&self) -> mpsc::Sender<InputCmd> { self.input.clone() }
+    pub fn input_sender(&self) -> mpsc::Sender<InputCmd> {
+        self.input.clone()
+    }
 
     /// Clone the stop flag for use on another thread.
-    pub fn stop_flag(&self) -> StdArc<AtomicBool> { self.stop.clone() }
+    pub fn stop_flag(&self) -> StdArc<AtomicBool> {
+        self.stop.clone()
+    }
 }

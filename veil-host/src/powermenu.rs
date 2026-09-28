@@ -19,14 +19,17 @@ impl PowerAction {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Poweroff => "POWER OFF",
-            Self::Reboot   => "REBOOT",
-            Self::Logout   => "LOG OUT",
+            Self::Reboot => "REBOOT",
+            Self::Logout => "LOG OUT",
         }
     }
 }
 
-pub const POWER_ACTIONS: [PowerAction; 3] =
-    [PowerAction::Poweroff, PowerAction::Reboot, PowerAction::Logout];
+pub const POWER_ACTIONS: [PowerAction; 3] = [
+    PowerAction::Poweroff,
+    PowerAction::Reboot,
+    PowerAction::Logout,
+];
 
 #[derive(Clone)]
 pub struct PowerMenu {

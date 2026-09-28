@@ -44,7 +44,12 @@ impl Rect {
         let y0 = self.y.min(other.y);
         let x1 = (self.x + self.w as i32).max(other.x + other.w as i32);
         let y1 = (self.y + self.h as i32).max(other.y + other.h as i32);
-        Rect { x: x0, y: y0, w: (x1 - x0).max(0) as u32, h: (y1 - y0).max(0) as u32 }
+        Rect {
+            x: x0,
+            y: y0,
+            w: (x1 - x0).max(0) as u32,
+            h: (y1 - y0).max(0) as u32,
+        }
     }
 
     /// Clip to `[0,0]..[max_w,max_h]` — defensive against a stale damage
@@ -54,7 +59,12 @@ impl Rect {
         let y0 = self.y.max(0).min(max_h as i32);
         let x1 = (self.x + self.w as i32).max(0).min(max_w as i32);
         let y1 = (self.y + self.h as i32).max(0).min(max_h as i32);
-        Rect { x: x0, y: y0, w: (x1 - x0).max(0) as u32, h: (y1 - y0).max(0) as u32 }
+        Rect {
+            x: x0,
+            y: y0,
+            w: (x1 - x0).max(0) as u32,
+            h: (y1 - y0).max(0) as u32,
+        }
     }
 }
 
@@ -112,7 +122,12 @@ pub struct Layout {
 
 impl Default for Layout {
     fn default() -> Self {
-        Self { focused: 0, flip: false, split_ratio: 0.5, mode: LayoutMode::Dwindle }
+        Self {
+            focused: 0,
+            flip: false,
+            split_ratio: 0.5,
+            mode: LayoutMode::Dwindle,
+        }
     }
 }
 
@@ -122,7 +137,7 @@ impl Layout {
     pub fn rects(&self, n: usize, w: u32, h: u32) -> Vec<Rect> {
         match self.mode {
             LayoutMode::Dwindle => self.rects_dwindle(n, w, h),
-            LayoutMode::Scroll  => self.rects_scroll(n, w, h),
+            LayoutMode::Scroll => self.rects_scroll(n, w, h),
         }
     }
 
@@ -134,7 +149,7 @@ impl Layout {
     pub fn toggle_mode(&mut self) {
         self.mode = match self.mode {
             LayoutMode::Dwindle => LayoutMode::Scroll,
-            LayoutMode::Scroll  => LayoutMode::Dwindle,
+            LayoutMode::Scroll => LayoutMode::Dwindle,
         };
     }
 
@@ -155,7 +170,12 @@ impl Layout {
         let focused = self.focused.min(n - 1);
         let offset = focused as i32 * col_w as i32;
         (0..n)
-            .map(|i| Rect { x: i as i32 * col_w as i32 - offset, y: 0, w: col_w, h })
+            .map(|i| Rect {
+                x: i as i32 * col_w as i32 - offset,
+                y: 0,
+                w: col_w,
+                h,
+            })
             .collect()
     }
 
@@ -185,31 +205,101 @@ impl Layout {
         let mut base: Vec<Rect> = match n {
             1 => vec![full],
             2 if self.flip => vec![
-                Rect { x: 0, y: 0,          w, h: ph },
-                Rect { x: 0, y: ph as i32,  w, h: sh },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w,
+                    h: ph,
+                },
+                Rect {
+                    x: 0,
+                    y: ph as i32,
+                    w,
+                    h: sh,
+                },
             ],
             2 => vec![
-                Rect { x: 0,         y: 0, w: pw, h },
-                Rect { x: pw as i32, y: 0, w: sw, h },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: pw,
+                    h,
+                },
+                Rect {
+                    x: pw as i32,
+                    y: 0,
+                    w: sw,
+                    h,
+                },
             ],
             3 if self.flip => vec![
-                Rect { x: 0,          y: 0,         w,       h: ph },
-                Rect { x: 0,          y: ph as i32, w: hw,   h: sh },
-                Rect { x: hw as i32,  y: ph as i32, w: hw2,  h: sh },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w,
+                    h: ph,
+                },
+                Rect {
+                    x: 0,
+                    y: ph as i32,
+                    w: hw,
+                    h: sh,
+                },
+                Rect {
+                    x: hw as i32,
+                    y: ph as i32,
+                    w: hw2,
+                    h: sh,
+                },
             ],
             3 => vec![
-                Rect { x: 0,          y: 0,          w: pw, h },
-                Rect { x: pw as i32,  y: 0,          w: sw, h: hh },
-                Rect { x: pw as i32,  y: hh as i32,  w: sw, h: hh2 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: pw,
+                    h,
+                },
+                Rect {
+                    x: pw as i32,
+                    y: 0,
+                    w: sw,
+                    h: hh,
+                },
+                Rect {
+                    x: pw as i32,
+                    y: hh as i32,
+                    w: sw,
+                    h: hh2,
+                },
             ],
             // 4+ → 2×2 grid; extras stack on the bottom-right cell below.
             // Grid is NOT split_ratio-adjustable — always fixed 50/50, same
             // as before resize existed.
             _ => vec![
-                Rect { x: 0,         y: 0,         w: hw,  h: hh },
-                Rect { x: hw as i32, y: 0,         w: hw2, h: hh },
-                Rect { x: 0,         y: hh as i32, w: hw,  h: hh2 },
-                Rect { x: hw as i32, y: hh as i32, w: hw2, h: hh2 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: hw,
+                    h: hh,
+                },
+                Rect {
+                    x: hw as i32,
+                    y: 0,
+                    w: hw2,
+                    h: hh,
+                },
+                Rect {
+                    x: 0,
+                    y: hh as i32,
+                    w: hw,
+                    h: hh2,
+                },
+                Rect {
+                    x: hw as i32,
+                    y: hh as i32,
+                    w: hw2,
+                    h: hh2,
+                },
             ],
         };
 
@@ -291,42 +381,142 @@ mod tests {
     #[test]
     fn one_window_is_fullscreen() {
         let l = Layout::default();
-        assert_eq!(l.rects(1, 100, 80), vec![Rect { x: 0, y: 0, w: 100, h: 80 }]);
+        assert_eq!(
+            l.rects(1, 100, 80),
+            vec![Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 80
+            }]
+        );
     }
 
     #[test]
     fn two_windows_split_left_right() {
         let l = Layout::default();
         let r = l.rects(2, 100, 80);
-        assert_eq!(r[0], Rect { x: 0, y: 0, w: 50, h: 80 });
-        assert_eq!(r[1], Rect { x: 50, y: 0, w: 50, h: 80 });
+        assert_eq!(
+            r[0],
+            Rect {
+                x: 0,
+                y: 0,
+                w: 50,
+                h: 80
+            }
+        );
+        assert_eq!(
+            r[1],
+            Rect {
+                x: 50,
+                y: 0,
+                w: 50,
+                h: 80
+            }
+        );
     }
 
     #[test]
     fn flip_splits_top_bottom() {
-        let l = Layout { focused: 0, flip: true, ..Default::default() };
+        let l = Layout {
+            focused: 0,
+            flip: true,
+            ..Default::default()
+        };
         let r = l.rects(2, 100, 80);
-        assert_eq!(r[0], Rect { x: 0, y: 0, w: 100, h: 40 });
-        assert_eq!(r[1], Rect { x: 0, y: 40, w: 100, h: 40 });
+        assert_eq!(
+            r[0],
+            Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 40
+            }
+        );
+        assert_eq!(
+            r[1],
+            Rect {
+                x: 0,
+                y: 40,
+                w: 100,
+                h: 40
+            }
+        );
     }
 
     #[test]
     fn three_windows_corner() {
         let l = Layout::default();
         let r = l.rects(3, 100, 80);
-        assert_eq!(r[0], Rect { x: 0, y: 0, w: 50, h: 80 });
-        assert_eq!(r[1], Rect { x: 50, y: 0, w: 50, h: 40 });
-        assert_eq!(r[2], Rect { x: 50, y: 40, w: 50, h: 40 });
+        assert_eq!(
+            r[0],
+            Rect {
+                x: 0,
+                y: 0,
+                w: 50,
+                h: 80
+            }
+        );
+        assert_eq!(
+            r[1],
+            Rect {
+                x: 50,
+                y: 0,
+                w: 50,
+                h: 40
+            }
+        );
+        assert_eq!(
+            r[2],
+            Rect {
+                x: 50,
+                y: 40,
+                w: 50,
+                h: 40
+            }
+        );
     }
 
     #[test]
     fn four_windows_grid() {
         let l = Layout::default();
         let r = l.rects(4, 100, 80);
-        assert_eq!(r[0], Rect { x: 0, y: 0, w: 50, h: 40 });
-        assert_eq!(r[1], Rect { x: 50, y: 0, w: 50, h: 40 });
-        assert_eq!(r[2], Rect { x: 0, y: 40, w: 50, h: 40 });
-        assert_eq!(r[3], Rect { x: 50, y: 40, w: 50, h: 40 });
+        assert_eq!(
+            r[0],
+            Rect {
+                x: 0,
+                y: 0,
+                w: 50,
+                h: 40
+            }
+        );
+        assert_eq!(
+            r[1],
+            Rect {
+                x: 50,
+                y: 0,
+                w: 50,
+                h: 40
+            }
+        );
+        assert_eq!(
+            r[2],
+            Rect {
+                x: 0,
+                y: 40,
+                w: 50,
+                h: 40
+            }
+        );
+        assert_eq!(
+            r[3],
+            Rect {
+                x: 50,
+                y: 40,
+                w: 50,
+                h: 40
+            }
+        );
     }
 
     #[test]
@@ -393,11 +583,15 @@ mod tests {
     #[test]
     fn resize_clamps_at_bounds() {
         let mut l = Layout::default();
-        for _ in 0..50 { l.resize_grow(); }
+        for _ in 0..50 {
+            l.resize_grow();
+        }
         assert!((l.split_ratio - MAX_RATIO).abs() < f32::EPSILON);
 
         let mut l = Layout::default();
-        for _ in 0..50 { l.resize_shrink(); }
+        for _ in 0..50 {
+            l.resize_shrink();
+        }
         assert!((l.split_ratio - MIN_RATIO).abs() < f32::EPSILON);
     }
 
@@ -406,8 +600,24 @@ mod tests {
         let mut l = Layout::default();
         l.resize_grow();
         let r = l.rects(4, 100, 80);
-        assert_eq!(r[0], Rect { x: 0, y: 0, w: 50, h: 40 });
-        assert_eq!(r[1], Rect { x: 50, y: 0, w: 50, h: 40 });
+        assert_eq!(
+            r[0],
+            Rect {
+                x: 0,
+                y: 0,
+                w: 50,
+                h: 40
+            }
+        );
+        assert_eq!(
+            r[1],
+            Rect {
+                x: 50,
+                y: 0,
+                w: 50,
+                h: 40
+            }
+        );
     }
 
     #[test]
@@ -416,7 +626,7 @@ mod tests {
         l.resize_grow();
         let r = l.rects(3, 100, 80);
         assert!(r[0].w > 50); // primary column grew
-        // secondary (stacked) column's internal top/bottom split stays 50/50
+                              // secondary (stacked) column's internal top/bottom split stays 50/50
         assert_eq!(r[1].h, 40);
         assert_eq!(r[2].h, 40);
     }
@@ -433,18 +643,37 @@ mod tests {
 
     #[test]
     fn scroll_mode_focused_column_left_aligned() {
-        let mut l = Layout { mode: LayoutMode::Scroll, ..Default::default() };
+        let mut l = Layout {
+            mode: LayoutMode::Scroll,
+            ..Default::default()
+        };
         let r = l.rects(5, 100, 80);
         assert_eq!(r.len(), 5);
         // focused defaults to 0 — its column should sit exactly at x=0.
-        assert_eq!(r[0], Rect { x: 0, y: 0, w: 50, h: 80 }); // split_ratio 0.5 → col_w 50
-        assert_eq!(r[1], Rect { x: 50, y: 0, w: 50, h: 80 });
+        assert_eq!(
+            r[0],
+            Rect {
+                x: 0,
+                y: 0,
+                w: 50,
+                h: 80
+            }
+        ); // split_ratio 0.5 → col_w 50
+        assert_eq!(
+            r[1],
+            Rect {
+                x: 50,
+                y: 0,
+                w: 50,
+                h: 80
+            }
+        );
 
         l.focused = 2;
         let r = l.rects(5, 100, 80);
         assert_eq!(r[2].x, 0); // now column 2 is the one left-aligned
         assert_eq!(r[0].x, -100); // columns before it scroll off to the left
-        assert_eq!(r[4].x, 100);  // columns after it sit further right
+        assert_eq!(r[4].x, 100); // columns after it sit further right
     }
 
     #[test]
@@ -452,7 +681,10 @@ mod tests {
         // The actual bug being fixed: dwindle stacks everything past 4 on
         // one cell. Scroll must give every window its own distinct rect
         // regardless of count.
-        let l = Layout { mode: LayoutMode::Scroll, ..Default::default() };
+        let l = Layout {
+            mode: LayoutMode::Scroll,
+            ..Default::default()
+        };
         let r = l.rects(12, 100, 80);
         assert_eq!(r.len(), 12);
         let mut xs: Vec<i32> = r.iter().map(|rect| rect.x).collect();
@@ -463,7 +695,10 @@ mod tests {
 
     #[test]
     fn scroll_mode_resize_changes_column_width() {
-        let mut l = Layout { mode: LayoutMode::Scroll, ..Default::default() };
+        let mut l = Layout {
+            mode: LayoutMode::Scroll,
+            ..Default::default()
+        };
         l.resize_grow();
         let r = l.rects(3, 100, 80);
         assert!(r[0].w > 50); // same split_ratio knob, reused as column width
@@ -474,7 +709,10 @@ mod tests {
         // focus() is untouched/reused as-is for Scroll mode — this proves it
         // still does the right thing when rects are a strict left-to-right
         // strip instead of dwindle's 2D layout.
-        let mut l = Layout { mode: LayoutMode::Scroll, ..Default::default() };
+        let mut l = Layout {
+            mode: LayoutMode::Scroll,
+            ..Default::default()
+        };
         let r = l.rects(5, 100, 80);
         l.focus(&r, Dir::Right);
         assert_eq!(l.focused, 1);

@@ -81,8 +81,7 @@ fn main() {
     };
 
     // ── static setup ────────────────────────────────────────────────────────
-    let names: Vec<slint::SharedString> =
-        sessions.iter().map(|s| s.name.as_str().into()).collect();
+    let names: Vec<slint::SharedString> = sessions.iter().map(|s| s.name.as_str().into()).collect();
     ui.set_sessions(std::rc::Rc::new(slint::VecModel::from(names)).into());
 
     // Session memory: preselect whatever was logged into last (Niri stays Niri).
@@ -146,7 +145,7 @@ fn main() {
 
     ui.on_poweroff(|| power_action("poweroff"));
     ui.on_reboot(|| power_action("reboot"));
-    ui.on_switch_tty(move |tty_num| switch_vt(tty_num));
+    ui.on_switch_tty(switch_vt);
 
     // Oh-shit key (Ctrl+Shift+\, bound in velogin.slint's killswitch
     // FocusScope): bail exactly like closing the dev window — quit the event
@@ -197,8 +196,7 @@ fn main() {
 
     {
         let weak = ui.as_weak();
-        let session_names: Vec<String> =
-            sessions.iter().map(|s| s.name.clone()).collect();
+        let session_names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
         let fail_count = fail_count.clone();
         ui.on_login(move |username, password, session_idx| {
             let Some(ui) = weak.upgrade() else { return };
@@ -237,8 +235,7 @@ fn main() {
                             if let Some(name) = session_names.get(session_idx) {
                                 state::save_last_session(name);
                             }
-                            *PENDING.lock().unwrap() =
-                                Some((username, password, session_idx));
+                            *PENDING.lock().unwrap() = Some((username, password, session_idx));
                             let _ = slint::quit_event_loop();
                         }
                         Err(e) => {
@@ -285,8 +282,14 @@ fn main() {
     let Some((username, password, idx)) = PENDING.lock().unwrap().take() else {
         return; // window closed without login (dev mode)
     };
-    let entry = sessions.get(idx).cloned().unwrap_or_else(|| sessions[0].clone());
-    eprintln!("[velogin] logging {username} into {:?} ({})", entry.name, entry.exec);
+    let entry = sessions
+        .get(idx)
+        .cloned()
+        .unwrap_or_else(|| sessions[0].clone());
+    eprintln!(
+        "[velogin] logging {username} into {:?} ({})",
+        entry.name, entry.exec
+    );
 
     if dry_run {
         eprintln!("[velogin] dry run — would exec: {:?}", entry.exec);
@@ -316,7 +319,11 @@ fn main() {
 /// argv/env, so it can't leak via `ps`/`/proc/<pid>/cmdline`. It must run
 /// *after* close_lingering_fds() (which frees the low fd numbers and releases
 /// the seat) — the pipe then lands on fd 3/4 and survives the exec.
-fn reexec_into_session(username: &str, password: &str, entry: &session::SessionEntry) -> std::io::Error {
+fn reexec_into_session(
+    username: &str,
+    password: &str,
+    entry: &session::SessionEntry,
+) -> std::io::Error {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return std::io::Error::last_os_error();
@@ -335,7 +342,10 @@ fn reexec_into_session(username: &str, password: &str, entry: &session::SessionE
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            unsafe { libc::close(wr); libc::close(rd); }
+            unsafe {
+                libc::close(wr);
+                libc::close(rd);
+            }
             return e;
         }
         off += n as usize;
@@ -389,7 +399,10 @@ fn run_session_helper(argv: &[String]) {
 
     read_pipe_password(rd); // drains and closes the pipe fd; password not re-used (no double-auth)
     let entry = session::SessionEntry { name, exec };
-    eprintln!("[velogin:session] clean helper up, launching {username} into {:?}", entry.name);
+    eprintln!(
+        "[velogin:session] clean helper up, launching {username} into {:?}",
+        entry.name
+    );
     match spawn::launch(&username, &entry) {
         Ok(()) => eprintln!("[velogin:session] session ended, exiting (systemd respawns greeter)"),
         Err(e) => {
@@ -468,8 +481,7 @@ fn load_image(path: &std::path::Path) -> Option<slint::Image> {
     let bytes = std::fs::read(path).ok()?;
     let img = image::load_from_memory(&bytes).ok()?.into_rgba8();
     let (w, h) = img.dimensions();
-    let buf =
-        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(img.as_raw(), w, h);
+    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(img.as_raw(), w, h);
     Some(slint::Image::from_rgba8(buf))
 }
 
@@ -489,11 +501,17 @@ fn switch_vt(n: i32) {
     unsafe {
         let fd = libc::open(c"/dev/tty0".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
         if fd < 0 {
-            eprintln!("[velogin] open /dev/tty0 failed: {}", std::io::Error::last_os_error());
+            eprintln!(
+                "[velogin] open /dev/tty0 failed: {}",
+                std::io::Error::last_os_error()
+            );
             return;
         }
         if libc::ioctl(fd, VT_ACTIVATE as _, n) < 0 {
-            eprintln!("[velogin] VT_ACTIVATE failed: {}", std::io::Error::last_os_error());
+            eprintln!(
+                "[velogin] VT_ACTIVATE failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
         libc::close(fd);
     }
@@ -518,12 +536,16 @@ fn close_lingering_fds() {
     // on drop (which happens after collect()) — so we'd double-close that
     // fd number in the loop, potentially hitting a reused descriptor.
     let dir = unsafe { libc::opendir(c"/proc/self/fd".as_ptr()) };
-    if dir.is_null() { return; }
+    if dir.is_null() {
+        return;
+    }
     let dir_fd = unsafe { libc::dirfd(dir) };
     let mut fds = Vec::new();
     loop {
         let entry = unsafe { libc::readdir(dir) };
-        if entry.is_null() { break; }
+        if entry.is_null() {
+            break;
+        }
         let name = unsafe { (*entry).d_name.as_ptr() };
         if let Ok(s) = unsafe { std::ffi::CStr::from_ptr(name) }.to_str() {
             if let Ok(fd) = s.parse::<i32>() {

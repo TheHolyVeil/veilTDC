@@ -4,8 +4,8 @@
 //! encodes to kitty graphics today; the same Frame stream feeds
 //! /dev/fb0, sixel, iterm2, DRM dumb buffers tomorrow.
 
-use std::sync::Arc;
 use crate::layout::Rect;
+use std::sync::Arc;
 
 /// One rendered frame of the hosted scene.
 ///
@@ -17,8 +17,8 @@ use crate::layout::Rect;
 /// Buffer is tightly packed `width * height * 4` bytes, R-G-B-A order.
 #[derive(Clone)]
 pub struct Frame {
-    pub rgba:   Arc<Vec<u8>>,
-    pub width:  u32,
+    pub rgba: Arc<Vec<u8>>,
+    pub width: u32,
     pub height: u32,
     /// Which monitor this frame is for — index into whatever the output
     /// backend's `monitor_count()` reports. `0` for terminal mode (always

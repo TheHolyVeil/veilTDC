@@ -1,6 +1,8 @@
 use flate2::{write::ZlibEncoder, Compression};
 use image::imageops;
 use std::io::Write as _;
+pub mod gpu;
+pub use gpu::GpuEncoder;
 
 /// Zero-copy view over an already-owned RGBA buffer for feeding into
 /// `image::imageops::resize`, which only needs `GenericImageView` — it
@@ -21,22 +23,31 @@ pub struct ColorCell {
 
 fn sample_rgb(rgba: &[u8], width: u32, x: u32, y: u32) -> [u8; 3] {
     let off = (y * width + x) as usize * 4;
-    if off + 2 < rgba.len() { [rgba[off], rgba[off + 1], rgba[off + 2]] }
-    else { [0, 0, 0] }
+    if off + 2 < rgba.len() {
+        [rgba[off], rgba[off + 1], rgba[off + 2]]
+    } else {
+        [0, 0, 0]
+    }
 }
 
 /// Convert an RGBA frame to half-block `ColorCell` grid.
 ///
 /// Each terminal row maps to two source pixel rows via `▀` (top=fg, bot=bg),
 /// doubling effective vertical resolution. Nearest-neighbour sampling.
-pub fn rgba_to_halfblocks(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -> Vec<ColorCell> {
+pub fn rgba_to_halfblocks(
+    rgba: &[u8],
+    src_w: u32,
+    src_h: u32,
+    cols: u16,
+    rows: u16,
+) -> Vec<ColorCell> {
     let eff_h = rows as u32 * 2;
     let eff_w = cols as u32;
     let mut cells = Vec::with_capacity(cols as usize * rows as usize);
     for row in 0..rows as u32 {
         for col in 0..eff_w {
-            let px_x  = col           * src_w / eff_w;
-            let top_y = (row * 2)     * src_h / eff_h;
+            let px_x = col * src_w / eff_w;
+            let top_y = (row * 2) * src_h / eff_h;
             let bot_y = (row * 2 + 1) * src_h / eff_h;
             cells.push(ColorCell {
                 fg: sample_rgb(rgba, src_w, px_x, top_y),
@@ -48,12 +59,10 @@ pub fn rgba_to_halfblocks(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: 
 }
 
 const LUMA_MAP: &[char] = &[
-    ' ', '.', '\'', '`', '^', '"', ',', ':', ';', 'I', 'l', '!', 'i',
-    '>', '<', '~', '+', '_', '-', '?', ']', '[', '}', '{', '1', ')',
-    '(', '|', '\\', '/', 't', 'f', 'j', 'r', 'x', 'n', 'u', 'v', 'c',
-    'z', 'X', 'Y', 'U', 'J', 'C', 'L', 'Q', '0', 'O', 'Z', 'm', 'w',
-    'q', 'p', 'd', 'b', 'k', 'h', 'a', 'o', '*', '#', 'M', 'W', '&',
-    '8', '%', 'B', '@', '$',
+    ' ', '.', '\'', '`', '^', '"', ',', ':', ';', 'I', 'l', '!', 'i', '>', '<', '~', '+', '_', '-',
+    '?', ']', '[', '}', '{', '1', ')', '(', '|', '\\', '/', 't', 'f', 'j', 'r', 'x', 'n', 'u', 'v',
+    'c', 'z', 'X', 'Y', 'U', 'J', 'C', 'L', 'Q', '0', 'O', 'Z', 'm', 'w', 'q', 'p', 'd', 'b', 'k',
+    'h', 'a', 'o', '*', '#', 'M', 'W', '&', '8', '%', 'B', '@', '$',
 ];
 
 pub fn luma_to_char(luma: u8) -> char {
@@ -70,7 +79,11 @@ pub struct Cell {
 
 impl Cell {
     pub fn rendered(&self) -> char {
-        if self.ch.is_ascii_graphic() { self.ch } else { luma_to_char(self.luma) }
+        if self.ch.is_ascii_graphic() {
+            self.ch
+        } else {
+            luma_to_char(self.luma)
+        }
     }
 }
 
@@ -125,9 +138,9 @@ pub fn compute_luma(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -
             let x0 = col * src_w / cols_u;
             let x1 = ((col + 1) * src_w / cols_u).max(x0 + 1).min(src_w);
 
-            let mut sum:   u32 = 0;
-            let mut min_l: u8  = 255;
-            let mut max_l: u8  = 0;
+            let mut sum: u32 = 0;
+            let mut min_l: u8 = 255;
+            let mut max_l: u8 = 0;
             let mut count: u32 = 0;
 
             for py in y0..y1 {
@@ -135,24 +148,31 @@ pub fn compute_luma(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -
                     let rgb = sample_rgb(rgba, src_w, px, py);
                     // Rec.601 weights (77+150+29 = 256); right-shift is a
                     // fast divide-by-256, identical to luma.wgsl's floats.
-                    let l = ((rgb[0] as u32 * 77
-                            + rgb[1] as u32 * 150
-                            + rgb[2] as u32 * 29) >> 8) as u8;
-                    sum   += l as u32;
-                    if l < min_l { min_l = l; }
-                    if l > max_l { max_l = l; }
+                    let l = ((rgb[0] as u32 * 77 + rgb[1] as u32 * 150 + rgb[2] as u32 * 29) >> 8)
+                        as u8;
+                    sum += l as u32;
+                    if l < min_l {
+                        min_l = l;
+                    }
+                    if l > max_l {
+                        max_l = l;
+                    }
                     count += 1;
                 }
             }
 
-            let avg      = (sum / count) as u8;
+            let avg = (sum / count) as u8;
             let contrast = max_l.saturating_sub(min_l);
 
             // Text-cell: return the ink-side luma.
             //   Light background (avg > 128) → ink is the dark minimum.
             //   Dark  background (avg ≤ 128) → ink is the bright maximum.
             let luma = if contrast >= TEXT_CONTRAST_T {
-                if avg > 128 { min_l } else { max_l }
+                if avg > 128 {
+                    min_l
+                } else {
+                    max_l
+                }
             } else {
                 avg
             };
@@ -204,7 +224,7 @@ pub fn luma_to_chars(luma: &[u8], cols: u16, rows: u16) -> Vec<char> {
             // Horizontal contrast (left→right) → indicates a vertical edge `|`
             let horiz = (get(row, col - 1) as i16 - get(row, col + 1) as i16).unsigned_abs() as u8;
             // Vertical contrast (above→below) → indicates a horizontal edge `-`
-            let vert  = (get(row - 1, col) as i16 - get(row + 1, col) as i16).unsigned_abs() as u8;
+            let vert = (get(row - 1, col) as i16 - get(row + 1, col) as i16).unsigned_abs() as u8;
 
             let ch = if horiz > EDGE_T && vert > EDGE_T {
                 '+'
@@ -228,8 +248,8 @@ pub fn luma_to_chars(luma: &[u8], cols: u16, rows: u16) -> Vec<char> {
 /// Produced by the AT-SPI query and stamped over the luma/edge render.
 #[derive(Clone)]
 pub struct TextCell {
-    pub col:  u16,
-    pub row:  u16,
+    pub col: u16,
+    pub row: u16,
     pub text: String,
 }
 
@@ -270,7 +290,9 @@ pub fn render_kitty_frame(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: 
     const MAX_W: u32 = 960;
     const MAX_H: u32 = 540;
 
-    if rgba.is_empty() || src_w == 0 || src_h == 0 { return String::new(); }
+    if rgba.is_empty() || src_w == 0 || src_h == 0 {
+        return String::new();
+    }
 
     // `iw`/`ih`/`buf` used to always clone the full source frame via
     // `rgba.to_vec()` even in the common case (no downscale needed) purely
@@ -284,7 +306,7 @@ pub fn render_kitty_frame(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: 
     let (iw, ih, buf): (u32, u32, std::borrow::Cow<[u8]>) = if src_w > MAX_W || src_h > MAX_H {
         let img: BorrowedRgba = match image::ImageBuffer::from_raw(src_w, src_h, rgba) {
             Some(i) => i,
-            None    => return String::new(),
+            None => return String::new(),
         };
         let scaled = imageops::resize(&img, MAX_W, MAX_H, imageops::FilterType::Triangle);
         let (w, h) = scaled.dimensions();
@@ -307,7 +329,7 @@ pub fn render_kitty_frame(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: 
     let mut out = String::with_capacity(b64.len() + num_chunks * 80);
 
     for (i, chunk) in b64_bytes.chunks(CHUNK).enumerate() {
-        let s    = std::str::from_utf8(chunk).unwrap_or("");
+        let s = std::str::from_utf8(chunk).unwrap_or("");
         let more = if i + 1 < num_chunks { 1 } else { 0 };
         if i == 0 {
             use std::fmt::Write as _;
@@ -332,11 +354,19 @@ fn base64_encode(data: &[u8]) -> String {
         let b0 = c[0] as u32;
         let b1 = c.get(1).copied().unwrap_or(0) as u32;
         let b2 = c.get(2).copied().unwrap_or(0) as u32;
-        let n  = (b0 << 16) | (b1 << 8) | b2;
+        let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[((n >> 18) & 63) as usize]);
         out.push(T[((n >> 12) & 63) as usize]);
-        out.push(if c.len() > 1 { T[((n >> 6) & 63) as usize] } else { b'=' });
-        out.push(if c.len() > 2 { T[(n & 63) as usize] } else { b'=' });
+        out.push(if c.len() > 1 {
+            T[((n >> 6) & 63) as usize]
+        } else {
+            b'='
+        });
+        out.push(if c.len() > 2 {
+            T[(n & 63) as usize]
+        } else {
+            b'='
+        });
     }
     String::from_utf8(out).unwrap()
 }

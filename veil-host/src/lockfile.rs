@@ -14,11 +14,13 @@ use std::io;
 use std::path::PathBuf;
 
 fn lock_path() -> Option<PathBuf> {
-    std::env::var("XDG_RUNTIME_DIR").ok().map(|d| PathBuf::from(d).join("veil-host.lock"))
+    std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .map(|d| PathBuf::from(d).join("veil-host.lock"))
 }
 
 pub struct LockInfo {
-    pub pid:         i32,
+    pub pid: i32,
     pub socket_name: String,
 }
 
@@ -31,10 +33,17 @@ pub fn read_live() -> Option<LockInfo> {
     let mut pid = None;
     let mut socket_name = None;
     for line in content.lines() {
-        if let Some(v) = line.strip_prefix("pid=") { pid = v.trim().parse::<i32>().ok(); }
-        if let Some(v) = line.strip_prefix("socket=") { socket_name = Some(v.trim().to_string()); }
+        if let Some(v) = line.strip_prefix("pid=") {
+            pid = v.trim().parse::<i32>().ok();
+        }
+        if let Some(v) = line.strip_prefix("socket=") {
+            socket_name = Some(v.trim().to_string());
+        }
     }
-    let info = LockInfo { pid: pid?, socket_name: socket_name? };
+    let info = LockInfo {
+        pid: pid?,
+        socket_name: socket_name?,
+    };
     pid_alive(info.pid).then_some(info)
 }
 
@@ -45,10 +54,12 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 fn write(socket_name: &str) -> io::Result<()> {
-    let path = lock_path().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR unset")
-    })?;
-    std::fs::write(&path, format!("pid={}\nsocket={socket_name}\n", std::process::id()))
+    let path = lock_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR unset"))?;
+    std::fs::write(
+        &path,
+        format!("pid={}\nsocket={socket_name}\n", std::process::id()),
+    )
 }
 
 /// Enforce the single-default-instance rule and write our lock file.

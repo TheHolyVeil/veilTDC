@@ -4,42 +4,42 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Quality {
     Auto,
-    Pixel,      // color halfblock (▀, 24-bit truecolor) — best for GUI apps
-    AsciiLuma,  // greyscale luma chars — works everywhere
-    AsciiEdge,  // luma + edge detection overlay
-    Sixel,      // sixel inline images (not yet implemented)
-    Kitty,      // kitty graphics protocol (not yet implemented)
+    Pixel,     // color halfblock (▀, 24-bit truecolor) — best for GUI apps
+    AsciiLuma, // greyscale luma chars — works everywhere
+    AsciiEdge, // luma + edge detection overlay
+    Sixel,     // sixel inline images (not yet implemented)
+    Kitty,     // kitty graphics protocol (not yet implemented)
 }
 
 impl Quality {
     pub fn parse_str(s: &str) -> Self {
         match s {
-            "auto"       => Self::Auto,
-            "pixel"      => Self::Pixel,
-            "ascii"      => Self::AsciiLuma,
+            "auto" => Self::Auto,
+            "pixel" => Self::Pixel,
+            "ascii" => Self::AsciiLuma,
             "ascii_luma" => Self::AsciiLuma,
             "ascii_edge" => Self::AsciiEdge,
-            "sixel"      => Self::Sixel,
-            "kitty"      => Self::Kitty,
-            _            => Self::Auto,
+            "sixel" => Self::Sixel,
+            "kitty" => Self::Kitty,
+            _ => Self::Auto,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Auto      => "auto",
-            Self::Pixel     => "pixel",
+            Self::Auto => "auto",
+            Self::Pixel => "pixel",
             Self::AsciiLuma => "ascii_luma",
             Self::AsciiEdge => "ascii_edge",
-            Self::Sixel     => "sixel",
-            Self::Kitty     => "kitty",
+            Self::Sixel => "sixel",
+            Self::Kitty => "kitty",
         }
     }
 }
 
 /// Detect the best supported render mode from terminal environment variables.
 pub fn detect_quality() -> Quality {
-    let term      = std::env::var("TERM").unwrap_or_default();
+    let term = std::env::var("TERM").unwrap_or_default();
     let colorterm = std::env::var("COLORTERM").unwrap_or_default();
 
     // Kitty graphics protocol
@@ -100,18 +100,18 @@ pub enum ModKey {
 impl ModKey {
     fn from_str(s: &str) -> Self {
         match s {
-            "ctrl"  => Self::Ctrl,
-            "alt"   => Self::Alt,
+            "ctrl" => Self::Ctrl,
+            "alt" => Self::Alt,
             "shift" => Self::Shift,
-            _       => Self::Super,
+            _ => Self::Super,
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
             Self::Super => "Super",
-            Self::Ctrl  => "Ctrl",
-            Self::Alt   => "Alt",
+            Self::Ctrl => "Ctrl",
+            Self::Alt => "Alt",
             Self::Shift => "Shift",
         }
     }
@@ -155,26 +155,26 @@ pub enum Action {
 impl Action {
     pub fn label(&self) -> String {
         match self {
-            Self::FocusLeft        => "focus left".to_string(),
-            Self::FocusRight       => "focus right".to_string(),
-            Self::FocusUp          => "focus up".to_string(),
-            Self::FocusDown        => "focus down".to_string(),
-            Self::Swap             => "swap with next".to_string(),
-            Self::Rotate           => "rotate split".to_string(),
-            Self::Close            => "close window".to_string(),
-            Self::ResizeGrow       => "resize grow".to_string(),
-            Self::ResizeShrink     => "resize shrink".to_string(),
-            Self::ToggleLayout     => "toggle layout mode".to_string(),
+            Self::FocusLeft => "focus left".to_string(),
+            Self::FocusRight => "focus right".to_string(),
+            Self::FocusUp => "focus up".to_string(),
+            Self::FocusDown => "focus down".to_string(),
+            Self::Swap => "swap with next".to_string(),
+            Self::Rotate => "rotate split".to_string(),
+            Self::Close => "close window".to_string(),
+            Self::ResizeGrow => "resize grow".to_string(),
+            Self::ResizeShrink => "resize shrink".to_string(),
+            Self::ToggleLayout => "toggle layout mode".to_string(),
             Self::ToggleFullscreen => "toggle fullscreen".to_string(),
-            Self::ReloadConfig     => "reload config".to_string(),
+            Self::ReloadConfig => "reload config".to_string(),
             Self::SwitchWorkspace(n) => format!("switch to workspace {n}"),
             Self::MoveToWorkspace(n) => format!("move to workspace {n}"),
-            Self::VolumeUp         => "volume up".to_string(),
-            Self::VolumeDown       => "volume down".to_string(),
-            Self::VolumeMute       => "toggle mute".to_string(),
-            Self::BrightnessUp     => "brightness up".to_string(),
-            Self::BrightnessDown   => "brightness down".to_string(),
-            Self::Launch(cmd)      => format!("launch: {cmd}"),
+            Self::VolumeUp => "volume up".to_string(),
+            Self::VolumeDown => "volume down".to_string(),
+            Self::VolumeMute => "toggle mute".to_string(),
+            Self::BrightnessUp => "brightness up".to_string(),
+            Self::BrightnessDown => "brightness down".to_string(),
+            Self::Launch(cmd) => format!("launch: {cmd}"),
         }
     }
 }
@@ -201,12 +201,15 @@ const SHIFTED_DIGIT_SYMBOLS: [char; 9] = ['!', '@', '#', '$', '%', '^', '&', '*'
 #[derive(Debug, Clone)]
 pub struct Keybinds {
     pub mod_key: ModKey,
-    pub binds:   Vec<(char, Action)>,
+    pub binds: Vec<(char, Action)>,
 }
 
 impl Keybinds {
     pub fn action_for(&self, key: char) -> Option<Action> {
-        self.binds.iter().find(|(k, _)| *k == key).map(|(_, a)| a.clone())
+        self.binds
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, a)| a.clone())
     }
 }
 
@@ -233,12 +236,18 @@ impl Default for Keybinds {
             // need updating if WORKSPACE_COUNT ever changes.
             .into_iter()
             .chain((1..=WORKSPACE_COUNT).map(|n| {
-                (char::from_digit(n as u32, 10).unwrap(), Action::SwitchWorkspace(n))
+                (
+                    char::from_digit(n as u32, 10).unwrap(),
+                    Action::SwitchWorkspace(n),
+                )
             }))
             // Super+Shift+1..9 — move focused window to that workspace and
             // follow it there.
             .chain((1..=WORKSPACE_COUNT).map(|n| {
-                (SHIFTED_DIGIT_SYMBOLS[(n - 1) as usize], Action::MoveToWorkspace(n))
+                (
+                    SHIFTED_DIGIT_SYMBOLS[(n - 1) as usize],
+                    Action::MoveToWorkspace(n),
+                )
             }))
             .collect(),
         }
@@ -251,40 +260,50 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         return default;
     };
 
-    let mod_key = t.get::<String>("mod_key")
+    let mod_key = t
+        .get::<String>("mod_key")
         .map(|s| ModKey::from_str(&s))
         .unwrap_or(default.mod_key);
 
     // (Lua field name, Action) — order here is the help-menu display order.
     const FIELDS: [(&str, Action); 17] = [
-        ("focus_left",      Action::FocusLeft),
-        ("focus_right",     Action::FocusRight),
-        ("focus_up",        Action::FocusUp),
-        ("focus_down",      Action::FocusDown),
-        ("swap",            Action::Swap),
-        ("rotate",          Action::Rotate),
-        ("close",           Action::Close),
-        ("resize_grow",     Action::ResizeGrow),
-        ("resize_shrink",   Action::ResizeShrink),
-        ("toggle_layout",   Action::ToggleLayout),
-        ("fullscreen",      Action::ToggleFullscreen),
-        ("reload_config",   Action::ReloadConfig),
-        ("volume_up",       Action::VolumeUp),
-        ("volume_down",     Action::VolumeDown),
-        ("volume_mute",     Action::VolumeMute),
-        ("brightness_up",   Action::BrightnessUp),
+        ("focus_left", Action::FocusLeft),
+        ("focus_right", Action::FocusRight),
+        ("focus_up", Action::FocusUp),
+        ("focus_down", Action::FocusDown),
+        ("swap", Action::Swap),
+        ("rotate", Action::Rotate),
+        ("close", Action::Close),
+        ("resize_grow", Action::ResizeGrow),
+        ("resize_shrink", Action::ResizeShrink),
+        ("toggle_layout", Action::ToggleLayout),
+        ("fullscreen", Action::ToggleFullscreen),
+        ("reload_config", Action::ReloadConfig),
+        ("volume_up", Action::VolumeUp),
+        ("volume_down", Action::VolumeDown),
+        ("volume_mute", Action::VolumeMute),
+        ("brightness_up", Action::BrightnessUp),
         ("brightness_down", Action::BrightnessDown),
     ];
 
-    let mut binds: Vec<(char, Action)> = FIELDS.iter().filter_map(|(field, action)| {
-        let key = t.get::<String>(*field).ok()
-            .and_then(|s| s.chars().next())
-            .map(|c| c.to_ascii_lowercase())
-            .or_else(|| {
-                default.binds.iter().find(|(_, a)| a == action).map(|(c, _)| *c)
-            })?;
-        Some((key, action.clone()))
-    }).collect();
+    let mut binds: Vec<(char, Action)> = FIELDS
+        .iter()
+        .filter_map(|(field, action)| {
+            let key = t
+                .get::<String>(*field)
+                .ok()
+                .and_then(|s| s.chars().next())
+                .map(|c| c.to_ascii_lowercase())
+                .or_else(|| {
+                    default
+                        .binds
+                        .iter()
+                        .find(|(_, a)| a == action)
+                        .map(|(c, _)| *c)
+                })?;
+            Some((key, action.clone()))
+        })
+        .collect();
 
     // Super+1..9 workspace switch and Super+Shift+1..9 move-to-workspace —
     // not in FIELDS above (no natural single Lua field name for eighteen
@@ -292,12 +311,17 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
     // per-field. Still user-overridable: the `apps` loop below runs after
     // this and will happily replace either if someone wants those keys for
     // something else instead.
-    binds.extend(default.binds.iter()
-        .filter(|(_, a)| matches!(a, Action::SwitchWorkspace(_) | Action::MoveToWorkspace(_)))
-        .cloned());
+    binds.extend(
+        default
+            .binds
+            .iter()
+            .filter(|(_, a)| matches!(a, Action::SwitchWorkspace(_) | Action::MoveToWorkspace(_)))
+            .cloned(),
+    );
 
     // App keybinds: keybinds.apps = { b = "helium", t = "kitty" } or global apps table
-    let app_table = t.get::<mlua::Table>("apps")
+    let app_table = t
+        .get::<mlua::Table>("apps")
         .or_else(|_| gl.get::<mlua::Table>("apps"));
 
     if let Ok(apps) = app_table {
@@ -342,35 +366,35 @@ pub enum ThemeName {
 impl ThemeName {
     fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
-            "nord"                       => Self::Nord,
-            "dracula"                     => Self::Dracula,
-            "catppuccin" | "mocha"       => Self::Catppuccin,
-            "gruvbox"                     => Self::Gruvbox,
-            "everforest"                  => Self::Everforest,
+            "nord" => Self::Nord,
+            "dracula" => Self::Dracula,
+            "catppuccin" | "mocha" => Self::Catppuccin,
+            "gruvbox" => Self::Gruvbox,
+            "everforest" => Self::Everforest,
             "tokyonight" | "tokyo_night" | "tokyo-night" => Self::TokyoNight,
-            "solarized"                   => Self::Solarized,
+            "solarized" => Self::Solarized,
             "rosepine" | "rose_pine" | "rose-pine" => Self::RosePine,
-            "monokai"                     => Self::Monokai,
+            "monokai" => Self::Monokai,
             "onedark" | "one_dark" | "one-dark" => Self::OneDark,
             "deepsage" | "deep_sage" | "deep-sage" | "sage" => Self::DeepSage,
-            _                             => Self::Default,
+            _ => Self::Default,
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Default    => "default",
-            Self::Nord       => "nord",
-            Self::Dracula    => "dracula",
+            Self::Default => "default",
+            Self::Nord => "nord",
+            Self::Dracula => "dracula",
             Self::Catppuccin => "catppuccin",
-            Self::Gruvbox    => "gruvbox",
+            Self::Gruvbox => "gruvbox",
             Self::Everforest => "everforest",
             Self::TokyoNight => "tokyonight",
-            Self::Solarized  => "solarized",
-            Self::RosePine   => "rosepine",
-            Self::Monokai    => "monokai",
-            Self::OneDark    => "onedark",
-            Self::DeepSage   => "deepsage",
+            Self::Solarized => "solarized",
+            Self::RosePine => "rosepine",
+            Self::Monokai => "monokai",
+            Self::OneDark => "onedark",
+            Self::DeepSage => "deepsage",
         }
     }
 }
@@ -385,13 +409,13 @@ pub struct Theme {
     /// `background = "#RRGGBB"` in config.lua still overrides it, same
     /// precedence `background` always had, theme or not.
     pub background: [u8; 3],
-    pub panel_bg:   [u8; 4],
-    pub border:     [u8; 4],
-    pub header:     [u8; 4],
-    pub text:       [u8; 4],
-    pub text_dim:   [u8; 4],
-    pub accent:     [u8; 4],
-    pub highlight:  [u8; 4],
+    pub panel_bg: [u8; 4],
+    pub border: [u8; 4],
+    pub header: [u8; 4],
+    pub text: [u8; 4],
+    pub text_dim: [u8; 4],
+    pub accent: [u8; 4],
+    pub highlight: [u8; 4],
 }
 
 impl Theme {
@@ -399,113 +423,113 @@ impl Theme {
         match name {
             ThemeName::Default => Theme {
                 background: [0x8c, 0x8c, 0x8c],
-                panel_bg:   [10, 0, 16, 245],
-                border:     [199, 146, 234, 255],
-                header:     [255, 215, 0, 255],
-                text:       [199, 146, 234, 255],
-                text_dim:   [150, 150, 180, 255],
-                accent:     [128, 222, 234, 255],
-                highlight:  [65, 35, 85, 255],
+                panel_bg: [10, 0, 16, 245],
+                border: [199, 146, 234, 255],
+                header: [255, 215, 0, 255],
+                text: [199, 146, 234, 255],
+                text_dim: [150, 150, 180, 255],
+                accent: [128, 222, 234, 255],
+                highlight: [65, 35, 85, 255],
             },
             ThemeName::Nord => Theme {
                 background: [0x2e, 0x34, 0x40],
-                panel_bg:   [0x3b, 0x42, 0x52, 245],
-                border:     [0x88, 0xc0, 0xd0, 255],
-                header:     [0xeb, 0xcb, 0x8b, 255],
-                text:       [0xe5, 0xe9, 0xf0, 255],
-                text_dim:   [0x61, 0x6e, 0x88, 255],
-                accent:     [0x81, 0xa1, 0xc1, 255],
-                highlight:  [0x43, 0x4c, 0x5e, 255],
+                panel_bg: [0x3b, 0x42, 0x52, 245],
+                border: [0x88, 0xc0, 0xd0, 255],
+                header: [0xeb, 0xcb, 0x8b, 255],
+                text: [0xe5, 0xe9, 0xf0, 255],
+                text_dim: [0x61, 0x6e, 0x88, 255],
+                accent: [0x81, 0xa1, 0xc1, 255],
+                highlight: [0x43, 0x4c, 0x5e, 255],
             },
             ThemeName::Dracula => Theme {
                 background: [0x28, 0x2a, 0x36],
-                panel_bg:   [0x1e, 0x1f, 0x29, 245],
-                border:     [0xbd, 0x93, 0xf9, 255],
-                header:     [0xf1, 0xfa, 0x8c, 255],
-                text:       [0xf8, 0xf8, 0xf2, 255],
-                text_dim:   [0x62, 0x72, 0xa4, 255],
-                accent:     [0x8b, 0xe9, 0xfd, 255],
-                highlight:  [0x44, 0x47, 0x5a, 255],
+                panel_bg: [0x1e, 0x1f, 0x29, 245],
+                border: [0xbd, 0x93, 0xf9, 255],
+                header: [0xf1, 0xfa, 0x8c, 255],
+                text: [0xf8, 0xf8, 0xf2, 255],
+                text_dim: [0x62, 0x72, 0xa4, 255],
+                accent: [0x8b, 0xe9, 0xfd, 255],
+                highlight: [0x44, 0x47, 0x5a, 255],
             },
             ThemeName::Catppuccin => Theme {
                 background: [0x1e, 0x1e, 0x2e],
-                panel_bg:   [0x18, 0x18, 0x25, 245],
-                border:     [0xcb, 0xa6, 0xf7, 255],
-                header:     [0xf9, 0xe2, 0xaf, 255],
-                text:       [0xcd, 0xd6, 0xf4, 255],
-                text_dim:   [0x6c, 0x70, 0x86, 255],
-                accent:     [0x89, 0xdc, 0xeb, 255],
-                highlight:  [0x31, 0x32, 0x44, 255],
+                panel_bg: [0x18, 0x18, 0x25, 245],
+                border: [0xcb, 0xa6, 0xf7, 255],
+                header: [0xf9, 0xe2, 0xaf, 255],
+                text: [0xcd, 0xd6, 0xf4, 255],
+                text_dim: [0x6c, 0x70, 0x86, 255],
+                accent: [0x89, 0xdc, 0xeb, 255],
+                highlight: [0x31, 0x32, 0x44, 255],
             },
             ThemeName::Gruvbox => Theme {
                 background: [0x28, 0x28, 0x28],
-                panel_bg:   [0x1d, 0x20, 0x21, 245],
-                border:     [0xd3, 0x86, 0x9b, 255],
-                header:     [0xfa, 0xbd, 0x2f, 255],
-                text:       [0xeb, 0xdb, 0xb2, 255],
-                text_dim:   [0x92, 0x83, 0x74, 255],
-                accent:     [0x83, 0xa5, 0x98, 255],
-                highlight:  [0x3c, 0x38, 0x36, 255],
+                panel_bg: [0x1d, 0x20, 0x21, 245],
+                border: [0xd3, 0x86, 0x9b, 255],
+                header: [0xfa, 0xbd, 0x2f, 255],
+                text: [0xeb, 0xdb, 0xb2, 255],
+                text_dim: [0x92, 0x83, 0x74, 255],
+                accent: [0x83, 0xa5, 0x98, 255],
+                highlight: [0x3c, 0x38, 0x36, 255],
             },
             ThemeName::Everforest => Theme {
                 background: [0x2d, 0x35, 0x3b],
-                panel_bg:   [0x23, 0x2a, 0x2e, 245],
-                border:     [0xd6, 0x99, 0xb6, 255],
-                header:     [0xdb, 0xbc, 0x7f, 255],
-                text:       [0xd3, 0xc6, 0xaa, 255],
-                text_dim:   [0x7a, 0x82, 0x87, 255],
-                accent:     [0x7f, 0xbb, 0xb3, 255],
-                highlight:  [0x3d, 0x48, 0x4d, 255],
+                panel_bg: [0x23, 0x2a, 0x2e, 245],
+                border: [0xd6, 0x99, 0xb6, 255],
+                header: [0xdb, 0xbc, 0x7f, 255],
+                text: [0xd3, 0xc6, 0xaa, 255],
+                text_dim: [0x7a, 0x82, 0x87, 255],
+                accent: [0x7f, 0xbb, 0xb3, 255],
+                highlight: [0x3d, 0x48, 0x4d, 255],
             },
             ThemeName::TokyoNight => Theme {
                 background: [0x1a, 0x1b, 0x26],
-                panel_bg:   [0x16, 0x16, 0x1e, 245],
-                border:     [0xbb, 0x9a, 0xf7, 255],
-                header:     [0xe0, 0xaf, 0x68, 255],
-                text:       [0xc0, 0xca, 0xf5, 255],
-                text_dim:   [0x56, 0x5f, 0x89, 255],
-                accent:     [0x7d, 0xcf, 0xff, 255],
-                highlight:  [0x29, 0x2e, 0x42, 255],
+                panel_bg: [0x16, 0x16, 0x1e, 245],
+                border: [0xbb, 0x9a, 0xf7, 255],
+                header: [0xe0, 0xaf, 0x68, 255],
+                text: [0xc0, 0xca, 0xf5, 255],
+                text_dim: [0x56, 0x5f, 0x89, 255],
+                accent: [0x7d, 0xcf, 0xff, 255],
+                highlight: [0x29, 0x2e, 0x42, 255],
             },
             ThemeName::Solarized => Theme {
                 background: [0x00, 0x2b, 0x36],
-                panel_bg:   [0x07, 0x36, 0x42, 245],
-                border:     [0x6c, 0x71, 0xc4, 255],
-                header:     [0xb5, 0x89, 0x00, 255],
-                text:       [0x83, 0x94, 0x96, 255],
-                text_dim:   [0x58, 0x6e, 0x75, 255],
-                accent:     [0x2a, 0xa1, 0x98, 255],
-                highlight:  [0x0a, 0x45, 0x52, 255],
+                panel_bg: [0x07, 0x36, 0x42, 245],
+                border: [0x6c, 0x71, 0xc4, 255],
+                header: [0xb5, 0x89, 0x00, 255],
+                text: [0x83, 0x94, 0x96, 255],
+                text_dim: [0x58, 0x6e, 0x75, 255],
+                accent: [0x2a, 0xa1, 0x98, 255],
+                highlight: [0x0a, 0x45, 0x52, 255],
             },
             ThemeName::RosePine => Theme {
                 background: [0x19, 0x17, 0x24],
-                panel_bg:   [0x1f, 0x1d, 0x2e, 245],
-                border:     [0xc4, 0xa7, 0xe7, 255],
-                header:     [0xf6, 0xc1, 0x77, 255],
-                text:       [0xe0, 0xde, 0xf4, 255],
-                text_dim:   [0x6e, 0x6a, 0x86, 255],
-                accent:     [0x9c, 0xcf, 0xd8, 255],
-                highlight:  [0x26, 0x23, 0x3a, 255],
+                panel_bg: [0x1f, 0x1d, 0x2e, 245],
+                border: [0xc4, 0xa7, 0xe7, 255],
+                header: [0xf6, 0xc1, 0x77, 255],
+                text: [0xe0, 0xde, 0xf4, 255],
+                text_dim: [0x6e, 0x6a, 0x86, 255],
+                accent: [0x9c, 0xcf, 0xd8, 255],
+                highlight: [0x26, 0x23, 0x3a, 255],
             },
             ThemeName::Monokai => Theme {
                 background: [0x27, 0x28, 0x22],
-                panel_bg:   [0x1e, 0x1f, 0x1c, 245],
-                border:     [0xae, 0x81, 0xff, 255],
-                header:     [0xe6, 0xdb, 0x74, 255],
-                text:       [0xf8, 0xf8, 0xf2, 255],
-                text_dim:   [0x75, 0x71, 0x5e, 255],
-                accent:     [0x66, 0xd9, 0xef, 255],
-                highlight:  [0x3e, 0x3d, 0x32, 255],
+                panel_bg: [0x1e, 0x1f, 0x1c, 245],
+                border: [0xae, 0x81, 0xff, 255],
+                header: [0xe6, 0xdb, 0x74, 255],
+                text: [0xf8, 0xf8, 0xf2, 255],
+                text_dim: [0x75, 0x71, 0x5e, 255],
+                accent: [0x66, 0xd9, 0xef, 255],
+                highlight: [0x3e, 0x3d, 0x32, 255],
             },
             ThemeName::OneDark => Theme {
                 background: [0x28, 0x2c, 0x34],
-                panel_bg:   [0x21, 0x25, 0x2b, 245],
-                border:     [0xc6, 0x78, 0xdd, 255],
-                header:     [0xe5, 0xc0, 0x7b, 255],
-                text:       [0xab, 0xb2, 0xbf, 255],
-                text_dim:   [0x5c, 0x63, 0x70, 255],
-                accent:     [0x56, 0xb6, 0xc2, 255],
-                highlight:  [0x2c, 0x31, 0x3a, 255],
+                panel_bg: [0x21, 0x25, 0x2b, 245],
+                border: [0xc6, 0x78, 0xdd, 255],
+                header: [0xe5, 0xc0, 0x7b, 255],
+                text: [0xab, 0xb2, 0xbf, 255],
+                text_dim: [0x5c, 0x63, 0x70, 255],
+                accent: [0x56, 0xb6, 0xc2, 255],
+                highlight: [0x2c, 0x31, 0x3a, 255],
             },
             // Deep Sage — Abyss's own. Desaturated dark green-charcoal base,
             // muted sage border, warm tan-gold header for contrast against
@@ -514,13 +538,13 @@ impl Theme {
             // else's preferences do.
             ThemeName::DeepSage => Theme {
                 background: [0x23, 0x2b, 0x26],
-                panel_bg:   [0x1a, 0x20, 0x1c, 245],
-                border:     [0x87, 0xa0, 0x8d, 255],
-                header:     [0xc9, 0xb4, 0x58, 255],
-                text:       [0xdf, 0xe6, 0xe0, 255],
-                text_dim:   [0x6b, 0x7a, 0x70, 255],
-                accent:     [0x7f, 0xae, 0x9b, 255],
-                highlight:  [0x2f, 0x38, 0x30, 255],
+                panel_bg: [0x1a, 0x20, 0x1c, 245],
+                border: [0x87, 0xa0, 0x8d, 255],
+                header: [0xc9, 0xb4, 0x58, 255],
+                text: [0xdf, 0xe6, 0xe0, 255],
+                text_dim: [0x6b, 0x7a, 0x70, 255],
+                accent: [0x7f, 0xae, 0x9b, 255],
+                highlight: [0x2f, 0x38, 0x30, 255],
             },
         }
     }
@@ -537,13 +561,13 @@ impl BarPosition {
     fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "top" => Self::Top,
-            _     => Self::Bottom,
+            _ => Self::Bottom,
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Top    => "top",
+            Self::Top => "top",
             Self::Bottom => "bottom",
         }
     }
@@ -558,20 +582,26 @@ impl BarPosition {
 /// app never needs declaring twice.
 #[derive(Debug, Clone)]
 pub struct BarConfig {
-    pub enabled:  bool,
+    pub enabled: bool,
     pub position: BarPosition,
 }
 
 impl Default for BarConfig {
     fn default() -> Self {
-        Self { enabled: true, position: BarPosition::Bottom }
+        Self {
+            enabled: true,
+            position: BarPosition::Bottom,
+        }
     }
 }
 
 fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
-    let Ok(bt) = gl.get::<mlua::Table>("bar") else { return default.clone() };
+    let Ok(bt) = gl.get::<mlua::Table>("bar") else {
+        return default.clone();
+    };
     let enabled = bt.get::<bool>("enabled").unwrap_or(default.enabled);
-    let position = bt.get::<String>("position")
+    let position = bt
+        .get::<String>("position")
         .map(|s| BarPosition::from_str(&s))
         .unwrap_or(default.position);
     BarConfig { enabled, position }
@@ -579,46 +609,46 @@ fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
 
 #[derive(Debug, Clone)]
 pub struct VeilConfig {
-    pub quality:           Quality,
-    pub fps:               u32,
+    pub quality: Quality,
+    pub fps: u32,
     pub cage_timeout_secs: u32,
-    pub input:             bool,
+    pub input: bool,
     /// Whether to use GPU compute shaders for frame encoding (halfblock/luma).
     /// Defaults to true. Set `gpu_render = false` in config.lua to disable.
-    pub gpu_render:        bool,
-    pub keybinds:          Keybinds,
-    pub output:            OutputPref,
+    pub gpu_render: bool,
+    pub keybinds: Keybinds,
+    pub output: OutputPref,
     /// Bare background color (RGB), shown wherever no window covers —
     /// otherwise it's plain black, an actual void with zero windows open
     /// (which now happens on purpose, since Alt+D lets you get there).
     /// `background = "#RRGGBB"` in Lua. Defaults to a cement grey.
-    pub background:        [u8; 3],
+    pub background: [u8; 3],
     /// Resolved color set for launcher/help/sidebar chrome. `theme = "..."`
     /// in config.lua selects the preset; `background` above already carries
     /// the resolved override precedence (preset default, unless overridden).
-    pub theme:              Theme,
+    pub theme: Theme,
     /// Which preset `theme` came from — kept alongside the resolved colors
     /// purely for round-tripping to things like `veil-host probe`, which
     /// wants to display the name, not the raw color bytes.
-    pub theme_name:         ThemeName,
+    pub theme_name: ThemeName,
     /// `bar = { ... }` config — see `BarConfig`.
-    pub bar:                BarConfig,
+    pub bar: BarConfig,
 }
 
 impl Default for VeilConfig {
     fn default() -> Self {
         Self {
-            quality:           Quality::Auto,
-            fps:               60,
+            quality: Quality::Auto,
+            fps: 60,
             cage_timeout_secs: 8,
-            input:             true,
-            gpu_render:        true,
-            keybinds:          Keybinds::default(),
-            output:            OutputPref::Auto,
-            background:        [0x8c, 0x8c, 0x8c],
-            theme:             Theme::for_name(ThemeName::Default),
-            theme_name:        ThemeName::Default,
-            bar:               BarConfig::default(),
+            input: true,
+            gpu_render: true,
+            keybinds: Keybinds::default(),
+            output: OutputPref::Auto,
+            background: [0x8c, 0x8c, 0x8c],
+            theme: Theme::for_name(ThemeName::Default),
+            theme_name: ThemeName::Default,
+            bar: BarConfig::default(),
         }
     }
 }
@@ -671,9 +701,7 @@ pub fn config_path() -> Option<std::path::PathBuf> {
 
 /// Load config from default locations (`config_path()`). Falls back to defaults.
 pub fn load_user_config() -> VeilConfig {
-    config_path()
-        .map(|p| load(&p))
-        .unwrap_or_default()
+    config_path().map(|p| load(&p)).unwrap_or_default()
 }
 
 /// Load config from `path`. Returns `Err(error_msg)` on read or parse failure.
@@ -683,7 +711,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
     }
 
     let src = match std::fs::read_to_string(path) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(e) => return Err(format!("Read error: {e}")),
     };
 
@@ -692,34 +720,36 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
         return Err(format!("{e}"));
     }
 
-    let d  = VeilConfig::default();
+    let d = VeilConfig::default();
     let gl = lua.globals();
 
     // Theme resolves first: it supplies the *default* background, which an
     // explicit `background = "#RRGGBB"` key then overrides — same
     // precedence `background` always had, theme or not.
-    let theme_name = gl.get::<String>("theme")
+    let theme_name = gl
+        .get::<String>("theme")
         .map(|s| ThemeName::from_str(&s))
         .unwrap_or(d.theme_name);
     let theme = Theme::for_name(theme_name);
 
     Ok(VeilConfig {
-        quality: gl.get::<String>("quality")
+        quality: gl
+            .get::<String>("quality")
             .map(|s| Quality::parse_str(&s))
             .unwrap_or(d.quality),
-        fps: gl.get::<u32>("fps")
-            .unwrap_or(d.fps),
-        cage_timeout_secs: gl.get::<u32>("cage_timeout_secs")
+        fps: gl.get::<u32>("fps").unwrap_or(d.fps),
+        cage_timeout_secs: gl
+            .get::<u32>("cage_timeout_secs")
             .unwrap_or(d.cage_timeout_secs),
-        input: gl.get::<bool>("input")
-            .unwrap_or(d.input),
-        gpu_render: gl.get::<bool>("gpu_render")
-            .unwrap_or(d.gpu_render),
+        input: gl.get::<bool>("input").unwrap_or(d.input),
+        gpu_render: gl.get::<bool>("gpu_render").unwrap_or(d.gpu_render),
         keybinds: parse_keybinds(&gl),
-        output: gl.get::<String>("output")
+        output: gl
+            .get::<String>("output")
             .map(|s| OutputPref::from_str(&s))
             .unwrap_or(d.output),
-        background: gl.get::<String>("background")
+        background: gl
+            .get::<String>("background")
             .ok()
             .and_then(|s| parse_hex_color(&s))
             .unwrap_or(theme.background),
@@ -733,7 +763,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
 pub fn load(path: &Path) -> VeilConfig {
     match try_load(path) {
         Ok(cfg) => cfg,
-        Err(e)  => {
+        Err(e) => {
             eprintln!("[config] failed to parse {:?}: {}, using defaults", path, e);
             VeilConfig::default()
         }
@@ -770,12 +800,16 @@ mod tests {
     #[test]
     fn parse_custom_reload_keybind() {
         let lua = Lua::new();
-        lua.load(r#"
+        lua.load(
+            r#"
             keybinds = {
                 mod_key = "alt",
                 reload_config = "x",
             }
-        "#).exec().unwrap();
+        "#,
+        )
+        .exec()
+        .unwrap();
         let kb = parse_keybinds(&lua.globals());
         assert_eq!(kb.mod_key, ModKey::Alt);
         assert_eq!(kb.action_for('x'), Some(Action::ReloadConfig));

@@ -23,15 +23,18 @@ use calloop::{
 };
 
 use smithay::{
+    backend::drm::DrmDeviceFd,
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
-    delegate_fractional_scale, delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit,
-    delegate_output, delegate_pointer_constraints, delegate_presentation,
-    delegate_primary_selection, delegate_relative_pointer, delegate_tablet_manager,
-    delegate_seat, delegate_shm, delegate_text_input_manager, delegate_viewporter,
-    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_drm_syncobj, delegate_fractional_scale, delegate_idle_inhibit,
+    delegate_keyboard_shortcuts_inhibit, delegate_output, delegate_pointer_constraints,
+    delegate_presentation, delegate_primary_selection, delegate_relative_pointer, delegate_seat,
+    delegate_shm, delegate_tablet_manager, delegate_text_input_manager, delegate_viewporter,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell, delegate_xwayland_shell,
     desktop::{PopupKind, PopupManager},
     input::{
-        keyboard::{keysyms, FilterResult, KeyboardHandle, KeysymHandle, ModifiersState, XkbConfig},
+        keyboard::{
+            keysyms, FilterResult, KeyboardHandle, KeysymHandle, ModifiersState, XkbConfig,
+        },
         pointer::{
             AxisFrame, ButtonEvent, CursorImageAttributes, CursorImageStatus, MotionEvent,
             PointerHandle,
@@ -48,68 +51,66 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            with_states, with_surface_tree_downward, BufferAssignment,
-            CompositorClientState, CompositorHandler, CompositorState, SubsurfaceCachedState,
-            SurfaceAttributes, TraversalAction,
-        },
-        dmabuf::{
-            get_dmabuf, DmabufFeedback, DmabufFeedbackBuilder,
-            DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
-        },
-        fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState},
-        output::{OutputHandler, OutputManagerState},
-        presentation::PresentationState,
-        selection::{SelectionHandler, SelectionSource, SelectionTarget},
-        selection::data_device::{
-            ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
-            request_data_device_client_selection, set_data_device_focus, set_data_device_selection,
-        },
-        shell::xdg::{
-            decoration::{XdgDecorationHandler, XdgDecorationState},
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+            with_states, with_surface_tree_downward, BufferAssignment, CompositorClientState,
+            CompositorHandler, CompositorState, SubsurfaceCachedState, SurfaceAttributes,
+            TraversalAction,
         },
         cursor_shape::CursorShapeManagerState,
+        dmabuf::{
+            get_dmabuf, DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler,
+            DmabufState, ImportNotifier,
+        },
+        drm_syncobj::{
+            supports_syncobj_eventfd, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState,
+        },
+        fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState},
         idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
-        tablet_manager::{TabletManagerState, TabletSeatHandler},
         keyboard_shortcuts_inhibit::{
             KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
             KeyboardShortcutsInhibitor,
         },
+        output::{OutputHandler, OutputManagerState},
         pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
+        presentation::PresentationState,
         relative_pointer::RelativePointerManagerState,
+        selection::data_device::{
+            request_data_device_client_selection, set_data_device_focus, set_data_device_selection,
+            ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+        },
         selection::primary_selection::{PrimarySelectionHandler, PrimarySelectionState},
+        selection::{SelectionHandler, SelectionSource, SelectionTarget},
+        shell::xdg::{
+            decoration::{XdgDecorationHandler, XdgDecorationState},
+            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+        },
         shm::{with_buffer_contents, ShmHandler, ShmState},
+        socket::ListeningSocketSource,
+        tablet_manager::{TabletManagerState, TabletSeatHandler},
         text_input::{TextInputManagerState, TextInputSeat},
         viewporter::ViewporterState,
         xdg_activation::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
         },
-        socket::ListeningSocketSource,
-        drm_syncobj::{
-            supports_syncobj_eventfd, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState,
-        },
         xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     },
     xwayland::{
-        XWayland, XWaylandClientData, XWaylandEvent, X11Surface, X11Wm, XwmHandler,
         xwm::{Reorder, ResizeEdge, X11Window, XwmId},
+        X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent, XwmHandler,
     },
-    delegate_drm_syncobj, delegate_xwayland_shell,
-    backend::drm::DrmDeviceFd,
 };
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use smithay::backend::allocator::{
-    Buffer as AllocBuffer, Fourcc, Modifier,
     dmabuf::{Dmabuf, DmabufMappingMode},
+    Buffer as AllocBuffer, Fourcc, Modifier,
 };
 
-use crate::{input::InputCmd, sink::Frame};
-use crate::layout::{Layout, Rect};
 use crate::detile::GpuImporter;
 use crate::launcher::Launcher;
-use crate::powermenu::{PowerMenu, PowerAction};
+use crate::layout::{Layout, Rect};
+use crate::powermenu::{PowerAction, PowerMenu};
+use crate::{input::InputCmd, sink::Frame};
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -142,7 +143,11 @@ pub struct Window {
 
 impl Window {
     pub fn new(surface: WindowSurface, monitor: usize, workspace: u8) -> Self {
-        Self { surface, monitor, workspace }
+        Self {
+            surface,
+            monitor,
+            workspace,
+        }
     }
 
     /// False once the client destroys it (xdg) or the X connection drops it.
@@ -207,7 +212,9 @@ impl Window {
     pub fn close_window(&self) {
         match &self.surface {
             WindowSurface::Xdg(t) => t.send_close(),
-            WindowSurface::X11(x) => { let _ = x.close(); }
+            WindowSurface::X11(x) => {
+                let _ = x.close();
+            }
         }
     }
 }
@@ -261,7 +268,12 @@ impl Monitor {
     /// the old flat `State` defaults did.
     fn new(width: u32, height: u32, origin_x: i32) -> Self {
         Self {
-            rect: Rect { x: origin_x, y: 0, w: width, h: height },
+            rect: Rect {
+                x: origin_x,
+                y: 0,
+                w: width,
+                h: height,
+            },
             output_w: width,
             output_h: height,
             pointer_pos: (0.0, 0.0),
@@ -280,44 +292,44 @@ impl Monitor {
 }
 
 pub struct State {
-    pub compositor_state:  CompositorState,
-    pub xdg_shell_state:   XdgShellState,
-    pub shm_state:         ShmState,
-    pub seat_state:        SeatState<Self>,
-    pub xdg_activation:    XdgActivationState,
-    pub output_manager:    OutputManagerState,
-    pub dmabuf_state:      DmabufState,
-    pub _dmabuf_global:    DmabufGlobal,
+    pub compositor_state: CompositorState,
+    pub xdg_shell_state: XdgShellState,
+    pub shm_state: ShmState,
+    pub seat_state: SeatState<Self>,
+    pub xdg_activation: XdgActivationState,
+    pub output_manager: OutputManagerState,
+    pub dmabuf_state: DmabufState,
+    pub _dmabuf_global: DmabufGlobal,
     /// GPU dmabuf importer for tiled/non-linear client buffers. `None` when no
     /// render node / EGL is available — veil then stays CPU-only + linear-only.
-    pub gpu:               Option<GpuImporter>,
+    pub gpu: Option<GpuImporter>,
     /// Whether a DRM render node was found and imports work, per the startup
     /// probe — governs whether gpu_lazy() will attempt (re)creation at all.
-    pub gpu_available:     bool,
+    pub gpu_available: bool,
     /// Whether a DRM render node was found and imports work, per the startup
     /// probe — governs whether gpu_lazy() will attempt (re)creation at all.
     /// `linux-drm-syncobj-v1` explicit sync. `None` when the render node's
     /// kernel/driver doesn't support `syncobj_eventfd` — commit() then skips
     /// the acquire-fence wait entirely and relies on implicit (kernel dma-buf)
     /// sync only, same behavior as before this existed.
-    pub syncobj_state:     Option<DrmSyncobjState>,
-    pub _data_device:      DataDeviceState,
-    pub _xdg_decoration:        XdgDecorationState,
-    pub _viewporter:            ViewporterState,
-    pub _fractional:            FractionalScaleManagerState,
-    pub _presentation:          PresentationState,
-    pub _text_input:            TextInputManagerState,
-    pub _primary_sel:           PrimarySelectionState,
-    pub _cursor_shape:          CursorShapeManagerState,
-    pub _pointer_constraints:   PointerConstraintsState,
-    pub _relative_pointer:      RelativePointerManagerState,
-    pub _idle_inhibit:          IdleInhibitManagerState,
-    pub _kb_inhibit:            KeyboardShortcutsInhibitState,
-    pub _tablet:                TabletManagerState,
-    pub seat:              Seat<Self>,
-    pub keyboard:          KeyboardHandle<Self>,
-    pub pointer:           PointerHandle<Self>,
-    pub output:            Output,
+    pub syncobj_state: Option<DrmSyncobjState>,
+    pub _data_device: DataDeviceState,
+    pub _xdg_decoration: XdgDecorationState,
+    pub _viewporter: ViewporterState,
+    pub _fractional: FractionalScaleManagerState,
+    pub _presentation: PresentationState,
+    pub _text_input: TextInputManagerState,
+    pub _primary_sel: PrimarySelectionState,
+    pub _cursor_shape: CursorShapeManagerState,
+    pub _pointer_constraints: PointerConstraintsState,
+    pub _relative_pointer: RelativePointerManagerState,
+    pub _idle_inhibit: IdleInhibitManagerState,
+    pub _kb_inhibit: KeyboardShortcutsInhibitState,
+    pub _tablet: TabletManagerState,
+    pub seat: Seat<Self>,
+    pub keyboard: KeyboardHandle<Self>,
+    pub pointer: PointerHandle<Self>,
+    pub output: Output,
     /// One entry per physical display, side by side left-to-right in
     /// detection order (see `InputCmd::SetMonitors`). `monitors[0]` is what
     /// the old flat `output_w`/`output_h`/`pointer_pos`/`fullscreen`/
@@ -327,92 +339,102 @@ pub struct State {
     /// `active_monitor_idx`. Starts as exactly one entry (a startup guess,
     /// terminal-mode-shaped) and gets rebuilt to match reality once
     /// `SetMonitors` arrives with real sizes from output detection.
-    pub monitors:          Vec<Monitor>,
+    pub monitors: Vec<Monitor>,
     /// Pointer position in the shared virtual arrangement space that spans
     /// every monitor's `rect` — NOT any single monitor's local coordinates
     /// (see `Monitor::pointer_pos` for that). The only thing every monitor
     /// shares: "where is the cursor right now, across the whole
     /// arrangement." `active_monitor_idx` resolves which monitor that
     /// falls inside; `InputCmd::PointerMotionAbs` is what updates it.
-    pub pointer_global:    (f64, f64),
-    pub toplevels:         Vec<Window>,
+    pub pointer_global: (f64, f64),
+    pub toplevels: Vec<Window>,
     /// Override-redirect X11 windows (menus, tooltips, Steam's own popups) —
     /// unmanaged, positioned absolutely by the client itself, never tiled.
     /// Painted last (topmost) every composite. See mapped_override_redirect_window.
-    pub floating:          Vec<X11Surface>,
+    pub floating: Vec<X11Surface>,
     /// X11 window manager for the XWayland connection — `None` until
     /// XWaylandEvent::Ready fires and start_wm succeeds (or if Xwayland
     /// isn't installed).
-    pub xwm:               Option<X11Wm>,
+    pub xwm: Option<X11Wm>,
     pub xwayland_shell_state: XWaylandShellState,
     /// Parsed `keybinds` config (Combo 4). Super+/ (hardcoded, not itself
     /// configurable) toggles `show_help`.
-    pub keybinds:          veil_config::Keybinds,
-    pub show_help:         bool,
+    pub keybinds: veil_config::Keybinds,
+    pub show_help: bool,
     /// Bare background color (RGBA, alpha always 255) — fills the composite
     /// buffer before any window blit, so uncovered space is a solid color
     /// instead of black.
-    pub background:        [u8; 4],
+    pub background: [u8; 4],
     /// Resolved color set for launcher/help/sidebar chrome — see
     /// `veil_config::Theme`. Swapped wholesale on `reload_config`.
-    pub theme:              veil_config::Theme,
-    pub bar:                veil_config::BarConfig,
+    pub theme: veil_config::Theme,
+    pub bar: veil_config::BarConfig,
     /// `<mod_key>+D` app launcher — `Some` while the modal is open. See
     /// `crate::launcher`. Not itself a `keybinds` config entry, same as help.
-    pub launcher:          Option<Launcher>,
+    pub launcher: Option<Launcher>,
     /// `<mod_key>+P` power menu — `Some` while the modal is open. Same
     /// intercept-all-input shape as `launcher`, see `crate::powermenu`.
-    pub power_menu:        Option<PowerMenu>,
+    pub power_menu: Option<PowerMenu>,
     /// Own Wayland socket name, so launcher-spawned clients can connect back
     /// into us (`WAYLAND_DISPLAY=<this>`).
-    pub socket_name:       String,
-    pub popups:            PopupManager,
-    pub surface_buffers:   HashMap<ObjectId, SurfaceBuf>,
+    pub socket_name: String,
+    pub popups: PopupManager,
+    pub surface_buffers: HashMap<ObjectId, SurfaceBuf>,
     /// Surfaces whose linux-drm-syncobj acquire-point wait has already timed
     /// out at least once. See the commit handler for why: once we know a
     /// client's sync points don't actually resolve against this compositor,
     /// re-attempting the wait on every subsequent commit is pure blocking
     /// cost with no chance of success — skip it instead of paying it again.
-    pub sync_wait_broken:  std::collections::HashSet<ObjectId>,
-    pub cursor_status:     CursorImageStatus,
+    pub sync_wait_broken: std::collections::HashSet<ObjectId>,
+    pub cursor_status: CursorImageStatus,
     /// Cache for the last `pick_focus` result. Stores the surface, its origin
     /// in compositor space, and the tight bounding rect that was hit-tested.
     /// Invalidated when windows open/close/resize (relayout clears it) and
     /// on every tick where focus changes. If the cursor is still inside
     /// `focus_cache_rect` the tree walk is skipped entirely.
-    pub focus_cache: Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>, Rect)>,
-    pub dirty:             bool,
-    pub frame_tx:          mpsc::Sender<Frame>,
-    pub serial_counter:    u32,
-    pub frame_serial:      u64,
-    pub running:           bool,
+    pub focus_cache: Option<(
+        WlSurface,
+        smithay::utils::Point<f64, smithay::utils::Logical>,
+        Rect,
+    )>,
+    pub dirty: bool,
+    pub frame_tx: mpsc::Sender<Frame>,
+    pub serial_counter: u32,
+    pub frame_serial: u64,
+    pub running: bool,
     /// Same `Arc<AtomicBool>` `run()` was handed for external shutdown
     /// (Ctrl-C/SIGTERM/`veil-host stop`) — Shift+Alt+E sets it from the
     /// inside too, same graceful-quit path either direction.
-    pub stop:              Arc<AtomicBool>,
-    pub start_time:        Instant,
-    pub display_handle:       DisplayHandle,
-    pub host_clipboard:       Option<String>,
-    pub clipboard_rx:         mpsc::Receiver<String>,
-    pub pending_copy_out:     bool,
+    pub stop: Arc<AtomicBool>,
+    pub start_time: Instant,
+    pub display_handle: DisplayHandle,
+    pub host_clipboard: Option<String>,
+    pub clipboard_rx: mpsc::Receiver<String>,
+    pub pending_copy_out: bool,
     pub client_has_selection: bool,
-    pub config_path:          Option<std::path::PathBuf>,
-    pub config_mtime:         Option<std::time::SystemTime>,
-    pub last_config_check:    Instant,
-    pub composite_interval:   Duration,
+    pub config_path: Option<std::path::PathBuf>,
+    pub config_mtime: Option<std::time::SystemTime>,
+    pub last_config_check: Instant,
+    pub composite_interval: Duration,
     /// On-Screen Display (OSD) popup notification overlay.
-    pub osd:                  Option<OsdNotification>,
+    pub osd: Option<OsdNotification>,
 }
 
 /// Per-surface RGBA cache entry. We re-blit these every dirty tick.
 pub struct SurfaceBuf {
     pub rgba: Vec<u8>,
-    pub w:    u32,
-    pub h:    u32,
+    pub w: u32,
+    pub h: u32,
 }
 
 impl State {
-    pub fn show_osd(&mut self, title: impl Into<String>, body: impl Into<String>, progress: Option<u8>, duration: Duration) {
+    pub fn show_osd(
+        &mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        progress: Option<u8>,
+        duration: Duration,
+    ) {
         self.osd = Some(OsdNotification {
             title: title.into(),
             body: body.into(),
@@ -453,8 +475,12 @@ pub struct ClientState {
     pub compositor_state: CompositorClientState,
 }
 impl ClientData for ClientState {
-    fn initialized(&self, _id: ClientId) { tracing::debug!("client connected"); }
-    fn disconnected(&self, _id: ClientId, _r: DisconnectReason) { tracing::debug!("client gone"); }
+    fn initialized(&self, _id: ClientId) {
+        tracing::debug!("client connected");
+    }
+    fn disconnected(&self, _id: ClientId, _r: DisconnectReason) {
+        tracing::debug!("client gone");
+    }
 }
 
 // ─── Handler impls ────────────────────────────────────────────────────────────
@@ -464,7 +490,9 @@ impl BufferHandler for State {
 }
 
 impl CompositorHandler for State {
-    fn compositor_state(&mut self) -> &mut CompositorState { &mut self.compositor_state }
+    fn compositor_state(&mut self) -> &mut CompositorState {
+        &mut self.compositor_state
+    }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
         // XWayland clients have their own client-data type. Try both.
@@ -482,13 +510,17 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         // Pull the newly-attached buffer (if any) and cache it as RGBA
         // keyed by surface id. We re-composite from all caches on tick.
-        enum Assign { New(wl_buffer::WlBuffer), Removed, None }
+        enum Assign {
+            New(wl_buffer::WlBuffer),
+            Removed,
+            None,
+        }
         let assign = with_states(surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
             match guard.current().buffer.take() {
                 Some(BufferAssignment::NewBuffer(b)) => Assign::New(b),
-                Some(BufferAssignment::Removed)      => Assign::Removed,
-                None                                 => Assign::None,
+                Some(BufferAssignment::Removed) => Assign::Removed,
+                None => Assign::None,
             }
         });
 
@@ -551,11 +583,21 @@ impl CompositorHandler for State {
                 // buffer every single commit. Falls back to an empty Vec
                 // (first commit, or previous buffer type was GPU-detiled and
                 // we don't reuse across that boundary — see note below).
-                let mut dest = self.surface_buffers.remove(&surface.id()).map(|b| b.rgba).unwrap_or_default();
+                let mut dest = self
+                    .surface_buffers
+                    .remove(&surface.id())
+                    .map(|b| b.rgba)
+                    .unwrap_or_default();
 
                 // Try shm first, then dmabuf.
                 let imported = with_buffer_contents(&buffer, |ptr, len, data| {
-                    tracing::info!("commit {} shm {}x{} fmt={:?}", surface.id(), data.width, data.height, data.format);
+                    tracing::info!(
+                        "commit {} shm {}x{} fmt={:?}",
+                        surface.id(),
+                        data.width,
+                        data.height,
+                        data.format
+                    );
                     let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
                     shm_to_rgba_into(raw, &data, &mut dest)
                 })
@@ -563,9 +605,14 @@ impl CompositorHandler for State {
                 .flatten()
                 .or_else(|| {
                     let dmabuf = get_dmabuf(&buffer).ok()?;
-                    tracing::info!("commit {} dma {}x{} fmt={:?} mod={:?}",
-                        surface.id(), dmabuf.width(), dmabuf.height(),
-                        dmabuf.format().code, dmabuf.format().modifier);
+                    tracing::info!(
+                        "commit {} dma {}x{} fmt={:?} mod={:?}",
+                        surface.id(),
+                        dmabuf.width(),
+                        dmabuf.height(),
+                        dmabuf.format().code,
+                        dmabuf.format().modifier
+                    );
                     // Linear → CPU mmap (fast, no GPU roundtrip). Anything else
                     // (tiled / implicit modifier) → GPU detile via EGLImage, if
                     // an importer is up; otherwise unsupported → blank.
@@ -577,7 +624,10 @@ impl CompositorHandler for State {
                         // without checking its internals first). Reusable
                         // `dest` is dropped here; not a regression, just not
                         // the win the other two paths get.
-                        gpu.import(dmabuf).map(|(rgba, w, h)| { dest = rgba; (w, h) })
+                        gpu.import(dmabuf).map(|(rgba, w, h)| {
+                            dest = rgba;
+                            (w, h)
+                        })
                     } else {
                         None
                     }
@@ -585,13 +635,17 @@ impl CompositorHandler for State {
 
                 if let Some((w, h)) = imported {
                     tracing::info!("commit {} → surface_buffers {}x{}", surface.id(), w, h);
-                    self.surface_buffers.insert(surface.id(), SurfaceBuf { rgba: dest, w, h });
+                    self.surface_buffers
+                        .insert(surface.id(), SurfaceBuf { rgba: dest, w, h });
                     match toplevel_rect_for(self, surface) {
                         Some((m, r)) => mark_dirty_rect(self, m, r),
-                        None         => mark_dirty_full(self), // subsurface/popup/cursor — no precise rect
+                        None => mark_dirty_full(self), // subsurface/popup/cursor — no precise rect
                     }
                 } else {
-                    tracing::warn!("commit {} — unsupported buffer type, skipping", surface.id());
+                    tracing::warn!(
+                        "commit {} — unsupported buffer type, skipping",
+                        surface.id()
+                    );
                 }
 
                 // Tell the client's GPU it can reuse/free the buffer now that
@@ -611,7 +665,7 @@ impl CompositorHandler for State {
                 self.surface_buffers.remove(&surface.id());
                 match toplevel_rect_for(self, surface) {
                     Some((m, r)) => mark_dirty_rect(self, m, r),
-                    None         => mark_dirty_full(self),
+                    None => mark_dirty_full(self),
                 }
             }
             Assign::None => {
@@ -631,18 +685,22 @@ impl CompositorHandler for State {
         if self.surface_buffers.remove(&surface.id()).is_some() {
             match toplevel_rect_for(self, surface) {
                 Some((m, r)) => mark_dirty_rect(self, m, r),
-                None         => mark_dirty_full(self),
+                None => mark_dirty_full(self),
             }
         }
     }
 }
 
 impl ShmHandler for State {
-    fn shm_state(&self) -> &ShmState { &self.shm_state }
+    fn shm_state(&self) -> &ShmState {
+        &self.shm_state
+    }
 }
 
 impl XdgShellHandler for State {
-    fn xdg_shell_state(&mut self) -> &mut XdgShellState { &mut self.xdg_shell_state }
+    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+        &mut self.xdg_shell_state
+    }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         // We DON'T force Fullscreen — weston-terminal, thunar and friends gate
@@ -658,9 +716,14 @@ impl XdgShellHandler for State {
         // workspace a new window is tagged with.
         let idx = active_monitor_idx(self);
         let ws = self.monitors[idx].active_workspace;
-        self.toplevels.push(Window::new(WindowSurface::Xdg(surface), idx, ws));
+        self.toplevels
+            .push(Window::new(WindowSurface::Xdg(surface), idx, ws));
         // New window takes focus; retile so every window gets its rect + size.
-        let n = self.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).count();
+        let n = self
+            .toplevels
+            .iter()
+            .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+            .count();
         self.monitors[idx].layout.focused = n.saturating_sub(1);
         relayout(self);
     }
@@ -677,11 +740,18 @@ impl XdgShellHandler for State {
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
     fn reposition_request(&mut self, _s: PopupSurface, _p: PositionerState, _t: u32) {}
 
-    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<wl_output::WlOutput>) {
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _output: Option<wl_output::WlOutput>,
+    ) {
         let wl = surface.wl_surface().clone();
         let idx = active_monitor_idx(self);
         let ws = self.monitors[idx].active_workspace;
-        if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+        if let Some(i) = self
+            .toplevels
+            .iter()
+            .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
             .position(|t| t.wl_surface().as_ref() == Some(&wl))
         {
             self.monitors[idx].layout.focused = i;
@@ -702,7 +772,11 @@ impl XdgShellHandler for State {
         // means relayout() accepting an explicit monitor instead of always
         // resolving its own — noted for Phase 2b/3, not fixed here.
         let wl = surface.wl_surface().clone();
-        if let Some(idx) = self.monitors.iter().position(|m| m.fullscreen.as_ref() == Some(&wl)) {
+        if let Some(idx) = self
+            .monitors
+            .iter()
+            .position(|m| m.fullscreen.as_ref() == Some(&wl))
+        {
             self.monitors[idx].fullscreen = None;
             relayout(self);
         }
@@ -711,10 +785,12 @@ impl XdgShellHandler for State {
 
 impl SeatHandler for State {
     type KeyboardFocus = WlSurface;
-    type PointerFocus  = WlSurface;
-    type TouchFocus    = WlSurface;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
 
-    fn seat_state(&mut self) -> &mut SeatState<Self> { &mut self.seat_state }
+    fn seat_state(&mut self) -> &mut SeatState<Self> {
+        &mut self.seat_state
+    }
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let client = focused.and_then(|s| s.client());
         set_data_device_focus::<State>(&self.display_handle, seat, client);
@@ -730,8 +806,15 @@ impl SeatHandler for State {
 impl SelectionHandler for State {
     type SelectionUserData = ();
 
-    fn new_selection(&mut self, ty: SelectionTarget, source: Option<SelectionSource>, _seat: Seat<Self>) {
-        if ty != SelectionTarget::Clipboard { return; }
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if ty != SelectionTarget::Clipboard {
+            return;
+        }
         self.client_has_selection = source.is_some();
         if source.is_some() {
             // Schedule a deferred read: Smithay updates seat_data AFTER this callback returns,
@@ -740,9 +823,20 @@ impl SelectionHandler for State {
         }
     }
 
-    fn send_selection(&mut self, ty: SelectionTarget, _mime_type: String, fd: OwnedFd, _seat: Seat<Self>, _user_data: &()) {
-        if ty != SelectionTarget::Clipboard { return; }
-        let Some(text) = self.host_clipboard.clone() else { return; };
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        _mime_type: String,
+        fd: OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        if ty != SelectionTarget::Clipboard {
+            return;
+        }
+        let Some(text) = self.host_clipboard.clone() else {
+            return;
+        };
         std::thread::spawn(move || {
             use std::io::Write;
             let mut f: std::fs::File = fd.into();
@@ -752,7 +846,9 @@ impl SelectionHandler for State {
 }
 
 impl DataDeviceHandler for State {
-    fn data_device_state(&self) -> &DataDeviceState { &self._data_device }
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self._data_device
+    }
 }
 impl ClientDndGrabHandler for State {}
 impl ServerDndGrabHandler for State {}
@@ -760,12 +856,20 @@ impl ServerDndGrabHandler for State {}
 impl OutputHandler for State {}
 
 impl PrimarySelectionHandler for State {
-    fn primary_selection_state(&self) -> &PrimarySelectionState { &self._primary_sel }
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self._primary_sel
+    }
 }
 
 impl PointerConstraintsHandler for State {
     fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
-    fn cursor_position_hint(&mut self, _: &WlSurface, _: &PointerHandle<Self>, _: Point<f64, Logical>) {}
+    fn cursor_position_hint(
+        &mut self,
+        _: &WlSurface,
+        _: &PointerHandle<Self>,
+        _: Point<f64, Logical>,
+    ) {
+    }
 }
 
 impl IdleInhibitHandler for State {
@@ -786,7 +890,9 @@ impl KeyboardShortcutsInhibitHandler for State {
 }
 
 impl DmabufHandler for State {
-    fn dmabuf_state(&mut self) -> &mut DmabufState { &mut self.dmabuf_state }
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
 
     fn dmabuf_imported(
         &mut self,
@@ -802,8 +908,12 @@ impl DmabufHandler for State {
             && fmt.modifier == Modifier::Linear
             && matches!(
                 fmt.code,
-                Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888
-                | Fourcc::Rgbx8888 | Fourcc::Bgrx8888
+                Fourcc::Argb8888
+                    | Fourcc::Xrgb8888
+                    | Fourcc::Abgr8888
+                    | Fourcc::Xbgr8888
+                    | Fourcc::Rgbx8888
+                    | Fourcc::Bgrx8888
             );
 
         if cpu_ok {
@@ -853,7 +963,11 @@ impl XdgDecorationHandler for State {
         });
         toplevel.send_configure();
     }
-    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: zxdg_toplevel_decoration_v1::Mode) {
+    fn request_mode(
+        &mut self,
+        toplevel: ToplevelSurface,
+        _mode: zxdg_toplevel_decoration_v1::Mode,
+    ) {
         toplevel.with_pending_state(|s| {
             s.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
         });
@@ -872,12 +986,14 @@ impl FractionalScaleHandler for State {
 }
 
 impl XdgActivationHandler for State {
-    fn activation_state(&mut self) -> &mut XdgActivationState { &mut self.xdg_activation }
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation
+    }
 
     fn request_activation(
         &mut self,
         _token: XdgActivationToken,
-        _data:  XdgActivationTokenData,
+        _data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
         // Simple policy: always grant — focus the requesting surface for keyboard.
@@ -925,8 +1041,8 @@ delegate_xwayland_shell!(State);
 /// and GL/Vulkan apps allocate their native *tiled* buffers, which we detile via
 /// EGLImage. Chromium (feedback-aware) still picks linear and takes the CPU path.
 fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> DmabufFeedback {
-    use std::os::unix::fs::MetadataExt;
     use smithay::backend::allocator::Format;
+    use std::os::unix::fs::MetadataExt;
 
     // Walk render nodes to find the first accessible one. dev_t tells clients
     // which GPU device to allocate on (must match the node it opens).
@@ -938,17 +1054,38 @@ fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> DmabufFeedback {
     if dev_t == 0 {
         eprintln!("[veil-host] dmabuf: no DRM render node found, feedback dev_t=0");
     } else {
-        eprintln!("[veil-host] dmabuf feedback: dev_t={dev_t:#x} (renderD{})", (dev_t & 0xFF));
+        eprintln!(
+            "[veil-host] dmabuf feedback: dev_t={dev_t:#x} (renderD{})",
+            (dev_t & 0xFF)
+        );
     }
 
     // Always-importable linear formats (CPU mmap path).
     let mut formats: Vec<Format> = vec![
-        Format { code: Fourcc::Argb8888, modifier: Modifier::Linear },
-        Format { code: Fourcc::Xrgb8888, modifier: Modifier::Linear },
-        Format { code: Fourcc::Abgr8888, modifier: Modifier::Linear },
-        Format { code: Fourcc::Xbgr8888, modifier: Modifier::Linear },
-        Format { code: Fourcc::Rgbx8888, modifier: Modifier::Linear },
-        Format { code: Fourcc::Bgrx8888, modifier: Modifier::Linear },
+        Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Linear,
+        },
+        Format {
+            code: Fourcc::Xrgb8888,
+            modifier: Modifier::Linear,
+        },
+        Format {
+            code: Fourcc::Abgr8888,
+            modifier: Modifier::Linear,
+        },
+        Format {
+            code: Fourcc::Xbgr8888,
+            modifier: Modifier::Linear,
+        },
+        Format {
+            code: Fourcc::Rgbx8888,
+            modifier: Modifier::Linear,
+        },
+        Format {
+            code: Fourcc::Bgrx8888,
+            modifier: Modifier::Linear,
+        },
     ];
 
     // Everything the render node can import (tiled modifiers included).
@@ -958,7 +1095,10 @@ fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> DmabufFeedback {
                 formats.push(f);
             }
         }
-        eprintln!("[veil-host] dmabuf feedback: {} formats (GPU detile enabled)", formats.len());
+        eprintln!(
+            "[veil-host] dmabuf feedback: {} formats (GPU detile enabled)",
+            formats.len()
+        );
     } else {
         eprintln!("[veil-host] dmabuf feedback: linear-only (no GPU importer)");
     }
@@ -972,37 +1112,45 @@ fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> DmabufFeedback {
 /// Only single-plane ARGB/XRGB/ABGR/XBGR 8888 with linear layout are supported.
 /// Writes into `out` in place instead of allocating — see shm_to_rgba_into.
 fn import_dmabuf_into(dmabuf: &Dmabuf, out: &mut Vec<u8>) -> Option<(u32, u32)> {
-    if dmabuf.num_planes() != 1 { return None; }
-    let fmt    = dmabuf.format();
+    if dmabuf.num_planes() != 1 {
+        return None;
+    }
+    let fmt = dmabuf.format();
     // Backstop: this is the CPU fast path — only ever mmap a LINEAR buffer.
     // Tiled / non-linear buffers go through the GPU detile path (commit routes
     // them to GpuImporter); a stray one reaching map_plane here would freeze the
     // compositor thread on an uncached/detiled CPU read, so bail.
-    if fmt.modifier != Modifier::Linear { return None; }
-    let w      = dmabuf.width()  as usize;
-    let h      = dmabuf.height() as usize;
+    if fmt.modifier != Modifier::Linear {
+        return None;
+    }
+    let w = dmabuf.width() as usize;
+    let h = dmabuf.height() as usize;
     let stride = dmabuf.strides().next()? as usize;
     let offset = dmabuf.offsets().next()? as usize;
 
-    if stride < w * 4 { return None; }
+    if stride < w * 4 {
+        return None;
+    }
 
     let mapping = dmabuf.map_plane(0, DmabufMappingMode::READ).ok()?;
     let raw = unsafe { std::slice::from_raw_parts(mapping.ptr() as *const u8, mapping.length()) };
 
     let pixel_data = raw.get(offset..)?;
-    if pixel_data.len() < stride * h { return None; }
+    if pixel_data.len() < stride * h {
+        return None;
+    }
 
     out.clear();
     out.reserve(w * h * 4);
     for y in 0..h {
-        let row = &pixel_data[y * stride .. y * stride + w * 4];
+        let row = &pixel_data[y * stride..y * stride + w * 4];
         for px in row.chunks_exact(4) {
             // DRM stores as little-endian u32: ARGB8888 = B,G,R,A in memory
             let (r, g, b) = match fmt.code {
                 Fourcc::Argb8888 | Fourcc::Xrgb8888 => (px[2], px[1], px[0]),
                 Fourcc::Abgr8888 | Fourcc::Xbgr8888 => (px[0], px[1], px[2]),
-                Fourcc::Rgbx8888                    => (px[3], px[2], px[1]),
-                Fourcc::Bgrx8888                    => (px[1], px[2], px[3]),
+                Fourcc::Rgbx8888 => (px[3], px[2], px[1]),
+                Fourcc::Bgrx8888 => (px[1], px[2], px[3]),
                 _ => return None,
             };
             out.extend_from_slice(&[r, g, b, 255]);
@@ -1014,17 +1162,23 @@ fn import_dmabuf_into(dmabuf: &Dmabuf, out: &mut Vec<u8>) -> Option<(u32, u32)> 
 /// Writes into `out` in place instead of allocating — `out.clear()` keeps
 /// its existing heap capacity, so a same-size redraw (the common case)
 /// reuses the same allocation instead of alloc+free every commit.
-fn shm_to_rgba_into(raw: &[u8], data: &smithay::wayland::shm::BufferData, out: &mut Vec<u8>) -> Option<(u32, u32)> {
-    let w = data.width  as usize;
+fn shm_to_rgba_into(
+    raw: &[u8],
+    data: &smithay::wayland::shm::BufferData,
+    out: &mut Vec<u8>,
+) -> Option<(u32, u32)> {
+    let w = data.width as usize;
     let h = data.height as usize;
     let stride = data.stride as usize;
-    if stride < w * 4 || raw.len() < stride * h { return None; }
+    if stride < w * 4 || raw.len() < stride * h {
+        return None;
+    }
 
     out.clear();
     out.reserve(w * h * 4);
     for y in 0..h {
         let row_start = data.offset as usize + y * stride;
-        let row = &raw[row_start .. row_start + w * 4];
+        let row = &raw[row_start..row_start + w * 4];
         for px in row.chunks_exact(4) {
             let (r, g, b) = match data.format {
                 wl_shm::Format::Xbgr8888 | wl_shm::Format::Abgr8888 => (px[0], px[1], px[2]),
@@ -1045,23 +1199,27 @@ fn blit(back: &mut [u8], back_w: u32, back_h: u32, src: &SurfaceBuf, x: i32, y: 
     let y0 = y.max(0);
     let x1 = (x + src.w as i32).min(bw);
     let y1 = (y + src.h as i32).min(bh);
-    if x0 >= x1 || y0 >= y1 { return; }
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
     for dy in y0..y1 {
         let sy = (dy - y) as u32;
         let drow = (dy as u32 * back_w * 4) as usize;
         let srow = (sy * src.w * 4) as usize;
         for dx in x0..x1 {
-            let sx  = (dx - x) as u32;
-            let di  = drow + (dx as u32 * 4) as usize;
-            let si  = srow + (sx * 4) as usize;
-            let a   = src.rgba[si + 3] as u32;
+            let sx = (dx - x) as u32;
+            let di = drow + (dx as u32 * 4) as usize;
+            let si = srow + (sx * 4) as usize;
+            let a = src.rgba[si + 3] as u32;
             if a == 255 {
                 back[di..di + 4].copy_from_slice(&src.rgba[si..si + 4]);
             } else if a > 0 {
                 let inv = 255 - a;
-                back[di]     = ((src.rgba[si]     as u32 * a + back[di]     as u32 * inv) / 255) as u8;
-                back[di + 1] = ((src.rgba[si + 1] as u32 * a + back[di + 1] as u32 * inv) / 255) as u8;
-                back[di + 2] = ((src.rgba[si + 2] as u32 * a + back[di + 2] as u32 * inv) / 255) as u8;
+                back[di] = ((src.rgba[si] as u32 * a + back[di] as u32 * inv) / 255) as u8;
+                back[di + 1] =
+                    ((src.rgba[si + 1] as u32 * a + back[di + 1] as u32 * inv) / 255) as u8;
+                back[di + 2] =
+                    ((src.rgba[si + 2] as u32 * a + back[di + 2] as u32 * inv) / 255) as u8;
                 back[di + 3] = 255;
             }
         }
@@ -1092,18 +1250,22 @@ const ARROW: &[&[u8; 12]; 16] = &[
 fn draw_fallback_cursor(back: &mut [u8], back_w: u32, back_h: u32, x: i32, y: i32) {
     for (dy, row) in ARROW.iter().enumerate() {
         let py = y + dy as i32;
-        if py < 0 || py as u32 >= back_h { continue; }
+        if py < 0 || py as u32 >= back_h {
+            continue;
+        }
         for (dx, &ch) in row.iter().enumerate() {
             let px = x + dx as i32;
-            if px < 0 || px as u32 >= back_w { continue; }
+            if px < 0 || px as u32 >= back_w {
+                continue;
+            }
             let rgb = match ch {
                 b'#' => Some([255u8, 255, 255]),
                 b'.' => Some([0u8, 0, 0]),
-                _    => None,
+                _ => None,
             };
             if let Some(c) = rgb {
                 let i = ((py as u32 * back_w + px as u32) * 4) as usize;
-                back[i]     = c[0];
+                back[i] = c[0];
                 back[i + 1] = c[1];
                 back[i + 2] = c[2];
                 back[i + 3] = 255;
@@ -1115,11 +1277,11 @@ fn draw_fallback_cursor(back: &mut [u8], back_w: u32, back_h: u32, x: i32, y: i3
 /// Walk `root`'s surface tree, blitting each surface's cached buffer
 /// into `back` at its accumulated subsurface offset (added to `origin`).
 fn blit_subtree(
-    back:   &mut [u8],
+    back: &mut [u8],
     back_w: u32,
     back_h: u32,
-    cache:  &HashMap<ObjectId, SurfaceBuf>,
-    root:   &WlSurface,
+    cache: &HashMap<ObjectId, SurfaceBuf>,
+    root: &WlSurface,
     origin: (i32, i32),
 ) {
     with_surface_tree_downward(
@@ -1178,7 +1340,9 @@ fn spawn_command(socket_name: &str, exec: &str) {
     match cmd.spawn() {
         Ok(mut child) => {
             tracing::info!("spawned {exec:?}");
-            std::thread::spawn(move || { let _ = child.wait(); });
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
         Err(e) => tracing::error!("spawn {exec:?} failed: {e}"),
     }
@@ -1275,10 +1439,7 @@ fn toggle_volume_mute() -> (String, Option<u8>) {
 
 fn adjust_brightness(up: bool) -> (String, Option<u8>) {
     let arg = if up { "+5%" } else { "5%-" };
-    if let Ok(out) = Command::new("brightnessctl")
-        .args(["set", arg])
-        .output()
-    {
+    if let Ok(out) = Command::new("brightnessctl").args(["set", arg]).output() {
         if out.status.success() {
             let s = String::from_utf8_lossy(&out.stdout);
             if let Some(start) = s.find('(') {
@@ -1328,24 +1489,47 @@ fn draw_osd_overlay(osd: &OsdNotification, back: &mut [u8], w: u32, h: u32) {
         lines.push(body_line);
     }
 
-    let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(18) as u32;
+    let text_cols = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(18) as u32;
     let box_w = (text_cols * advance + pad as u32 * 2).max(220);
-    let box_h = lines.len() as u32 * line_h + pad as u32 * 2 + if has_bar { bar_h as u32 } else { 0 };
+    let box_h =
+        lines.len() as u32 * line_h + pad as u32 * 2 + if has_bar { bar_h as u32 } else { 0 };
 
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = (h as i32 / 12).max(10);
 
     let is_error = osd.title.contains("ERROR");
-    let border_color = if is_error { [255, 85, 85, 255] } else { [128, 222, 234, 255] };
+    let border_color = if is_error {
+        [255, 85, 85, 255]
+    } else {
+        [128, 222, 234, 255]
+    };
 
     let border = 2i32;
-    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), border_color);
+    fill_rect(
+        back,
+        w,
+        h,
+        x0 - border,
+        y0 - border,
+        box_w + (border as u32 * 2),
+        box_h + (border as u32 * 2),
+        border_color,
+    );
     fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 10, 20, 240]);
 
     for (i, line) in lines.iter().enumerate() {
         let ty = y0 + pad + i as i32 * line_h as i32;
         let color = if i == 0 {
-            if is_error { [255, 100, 100, 255] } else { [255, 215, 0, 255] }
+            if is_error {
+                [255, 100, 100, 255]
+            } else {
+                [255, 215, 0, 255]
+            }
         } else {
             [220, 220, 240, 255]
         };
@@ -1380,23 +1564,42 @@ pub fn reload_config(state: &mut State) {
         None => veil_config::VeilConfig::default(),
     };
 
-    state.config_mtime = path.as_ref()
+    state.config_mtime = path
+        .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())
         .and_then(|m| m.modified().ok());
     state.config_path = path.clone();
 
     state.keybinds = new_cfg.keybinds;
-    state.background = [new_cfg.background[0], new_cfg.background[1], new_cfg.background[2], 255];
+    state.background = [
+        new_cfg.background[0],
+        new_cfg.background[1],
+        new_cfg.background[2],
+        255,
+    ];
     state.theme = new_cfg.theme;
     state.bar = new_cfg.bar;
     state.composite_interval = Duration::from_millis(1000 / new_cfg.fps.max(1) as u64);
 
     if let Some(p) = &path {
-        let name = p.file_name().and_then(|f| f.to_str()).unwrap_or("config.lua");
-        state.show_osd("CONFIG RELOADED", format!("Applied {name}"), None, Duration::from_secs(2));
+        let name = p
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("config.lua");
+        state.show_osd(
+            "CONFIG RELOADED",
+            format!("Applied {name}"),
+            None,
+            Duration::from_secs(2),
+        );
         eprintln!("[veil-host] reloaded config from {}", p.display());
     } else {
-        state.show_osd("CONFIG RELOADED", "Using default config", None, Duration::from_secs(2));
+        state.show_osd(
+            "CONFIG RELOADED",
+            "Using default config",
+            None,
+            Duration::from_secs(2),
+        );
         eprintln!("[veil-host] reloaded default config (no config.lua found)");
     }
     mark_dirty_full(state);
@@ -1417,7 +1620,9 @@ pub fn reload_config(state: &mut State) {
 /// if some future caller ever writes an out-of-range value).
 fn active_monitor_idx(state: &State) -> usize {
     let (gx, gy) = state.pointer_global;
-    state.monitors.iter()
+    state
+        .monitors
+        .iter()
         .position(|m| m.rect.contains(gx as i32, gy as i32))
         .unwrap_or(0)
 }
@@ -1432,7 +1637,11 @@ fn active_monitor_idx(state: &State) -> usize {
 fn cycle_focus(state: &mut State, forward: bool) {
     let idx = active_monitor_idx(state);
     let ws = state.monitors[idx].active_workspace;
-    let n = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).count();
+    let n = state
+        .toplevels
+        .iter()
+        .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+        .count();
     if n == 0 {
         return;
     }
@@ -1451,16 +1660,37 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
     let idx = active_monitor_idx(state);
     let ws = state.monitors[idx].active_workspace; // pulled out once; every filter below needs it
     match action {
-        FocusLeft  => { let r = state.monitors[idx].layout_rects.clone(); state.monitors[idx].layout.focus(&r, crate::layout::Dir::Left); }
-        FocusRight => { let r = state.monitors[idx].layout_rects.clone(); state.monitors[idx].layout.focus(&r, crate::layout::Dir::Right); }
-        FocusUp    => { let r = state.monitors[idx].layout_rects.clone(); state.monitors[idx].layout.focus(&r, crate::layout::Dir::Up); }
-        FocusDown  => { let r = state.monitors[idx].layout_rects.clone(); state.monitors[idx].layout.focus(&r, crate::layout::Dir::Down); }
+        FocusLeft => {
+            let r = state.monitors[idx].layout_rects.clone();
+            state.monitors[idx]
+                .layout
+                .focus(&r, crate::layout::Dir::Left);
+        }
+        FocusRight => {
+            let r = state.monitors[idx].layout_rects.clone();
+            state.monitors[idx]
+                .layout
+                .focus(&r, crate::layout::Dir::Right);
+        }
+        FocusUp => {
+            let r = state.monitors[idx].layout_rects.clone();
+            state.monitors[idx].layout.focus(&r, crate::layout::Dir::Up);
+        }
+        FocusDown => {
+            let r = state.monitors[idx].layout_rects.clone();
+            state.monitors[idx]
+                .layout
+                .focus(&r, crate::layout::Dir::Down);
+        }
         Swap => {
             // swap_next's indices are positions among LIVE toplevels ON THIS
             // MONITOR'S ACTIVE WORKSPACE; map them back to real Vec indices
             // in case a dead-but-unpruned or other-workspace/monitor entry
             // sits between live ones.
-            let live_idx: Vec<usize> = state.toplevels.iter().enumerate()
+            let live_idx: Vec<usize> = state
+                .toplevels
+                .iter()
+                .enumerate()
                 .filter(|(_, t)| t.alive() && t.monitor == idx && t.workspace == ws)
                 .map(|(i, _)| i)
                 .collect();
@@ -1471,16 +1701,24 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
         Rotate => state.monitors[idx].layout.rotate_split(),
         Close => {
             let focused = state.monitors[idx].layout.focused;
-            if let Some(tl) = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).nth(focused) {
+            if let Some(tl) = state
+                .toplevels
+                .iter()
+                .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+                .nth(focused)
+            {
                 tl.close_window();
             }
         }
-        ResizeGrow   => state.monitors[idx].layout.resize_grow(),
+        ResizeGrow => state.monitors[idx].layout.resize_grow(),
         ResizeShrink => state.monitors[idx].layout.resize_shrink(),
         ToggleLayout => state.monitors[idx].layout.toggle_mode(),
         ToggleFullscreen => {
             let focused = state.monitors[idx].layout.focused;
-            let focused_wl = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+            let focused_wl = state
+                .toplevels
+                .iter()
+                .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
                 .nth(focused)
                 .and_then(|t| t.wl_surface());
             match (&state.monitors[idx].fullscreen, &focused_wl) {
@@ -1507,7 +1745,12 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
                 state.monitors[idx].workspace_layouts[cur_ws as usize] = cur_layout;
                 state.monitors[idx].layout = state.monitors[idx].workspace_layouts[target as usize];
                 state.monitors[idx].active_workspace = target;
-                state.show_osd(format!("WORKSPACE {}", target + 1), "", None, Duration::from_millis(900));
+                state.show_osd(
+                    format!("WORKSPACE {}", target + 1),
+                    "",
+                    None,
+                    Duration::from_millis(900),
+                );
                 mark_dirty_full(state);
             }
         }
@@ -1518,7 +1761,10 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
             // position among LIVE ACTIVE-WORKSPACE windows on THIS monitor,
             // not a raw index.
             let focused = state.monitors[idx].layout.focused;
-            let real_idx = state.toplevels.iter().enumerate()
+            let real_idx = state
+                .toplevels
+                .iter()
+                .enumerate()
                 .filter(|(_, t)| t.alive() && t.monitor == idx && t.workspace == ws)
                 .nth(focused)
                 .map(|(i, _)| i);
@@ -1534,7 +1780,12 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
                 state.monitors[idx].workspace_layouts[cur_ws as usize] = cur_layout;
                 state.monitors[idx].layout = state.monitors[idx].workspace_layouts[target as usize];
                 state.monitors[idx].active_workspace = target;
-                state.show_osd(format!("MOVED TO WORKSPACE {}", target + 1), "", None, Duration::from_millis(900));
+                state.show_osd(
+                    format!("MOVED TO WORKSPACE {}", target + 1),
+                    "",
+                    None,
+                    Duration::from_millis(900),
+                );
                 mark_dirty_full(state);
             }
             // No window focused (empty workspace) — nothing to move, and
@@ -1561,7 +1812,7 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
             let (body, pct) = adjust_brightness(false);
             state.show_osd("BRIGHTNESS", body, pct, Duration::from_secs(2));
         }
-        Launch(cmd)  => spawn_command(&state.socket_name, &cmd),
+        Launch(cmd) => spawn_command(&state.socket_name, &cmd),
     }
     relayout(state);
     refocus_keyboard(state);
@@ -1578,8 +1829,8 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
     // <mod_key>+D closes the launcher too — same chord opens and closes it.
     let mod_held = match state.keybinds.mod_key {
         veil_config::ModKey::Super => mods.logo,
-        veil_config::ModKey::Ctrl  => mods.ctrl,
-        veil_config::ModKey::Alt   => mods.alt,
+        veil_config::ModKey::Ctrl => mods.ctrl,
+        veil_config::ModKey::Alt => mods.alt,
         veil_config::ModKey::Shift => mods.shift,
     };
     if mod_held && matches!(sym, keysyms::KEY_d | keysyms::KEY_D) {
@@ -1615,7 +1866,9 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
     if sym == keysyms::KEY_Down {
         if let Some(l) = state.launcher.as_mut() {
             let count = l.matches().len();
-            if count > 0 { l.selected = (l.selected + 1).min(count - 1); }
+            if count > 0 {
+                l.selected = (l.selected + 1).min(count - 1);
+            }
             mark_dirty_full(state);
         }
         return;
@@ -1623,7 +1876,9 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
     if sym == keysyms::KEY_Page_Down {
         if let Some(l) = state.launcher.as_mut() {
             let count = l.matches().len();
-            if count > 0 { l.selected = (l.selected + 10).min(count - 1); }
+            if count > 0 {
+                l.selected = (l.selected + 10).min(count - 1);
+            }
             mark_dirty_full(state);
         }
         return;
@@ -1645,7 +1900,9 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
     if sym == keysyms::KEY_End {
         if let Some(l) = state.launcher.as_mut() {
             let count = l.matches().len();
-            if count > 0 { l.selected = count - 1; }
+            if count > 0 {
+                l.selected = count - 1;
+            }
             mark_dirty_full(state);
         }
         return;
@@ -1669,12 +1926,16 @@ fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymH
 /// lifetime (that coupling, on the ORIGINAL `run` spawn, is what stranded
 /// abyss when the last window closed).
 fn launch_selected(state: &mut State) {
-    let Some(launcher) = state.launcher.take() else { return };
+    let Some(launcher) = state.launcher.take() else {
+        return;
+    };
     mark_dirty_full(state);
 
     let matches = launcher.matches();
     let exec = if !matches.is_empty() {
-        matches[launcher.selected.min(matches.len() - 1)].exec.clone()
+        matches[launcher.selected.min(matches.len() - 1)]
+            .exec
+            .clone()
     } else if !launcher.query.trim().is_empty() {
         launcher.query.clone()
     } else {
@@ -1693,8 +1954,8 @@ fn handle_power_menu_key(state: &mut State, mods: &ModifiersState, keysym: Keysy
     // <mod_key>+P closes the menu too — same chord opens and closes it.
     let mod_held = match state.keybinds.mod_key {
         veil_config::ModKey::Super => mods.logo,
-        veil_config::ModKey::Ctrl  => mods.ctrl,
-        veil_config::ModKey::Alt   => mods.alt,
+        veil_config::ModKey::Ctrl => mods.ctrl,
+        veil_config::ModKey::Alt => mods.alt,
         veil_config::ModKey::Shift => mods.shift,
     };
     if mod_held && matches!(sym, keysyms::KEY_p | keysyms::KEY_P) {
@@ -1733,13 +1994,15 @@ fn handle_power_menu_key(state: &mut State, mods: &ModifiersState, keysym: Keysy
 /// reuses the exact graceful-quit path Shift+Alt+E already uses — there's
 /// no session manager here, so "logout" just means "stop veil-host".
 fn execute_power_menu_selection(state: &mut State) {
-    let Some(menu) = state.power_menu.take() else { return };
+    let Some(menu) = state.power_menu.take() else {
+        return;
+    };
     mark_dirty_full(state);
 
     match menu.selected_action() {
         PowerAction::Poweroff => spawn_command(&state.socket_name, "systemctl poweroff"),
-        PowerAction::Reboot   => spawn_command(&state.socket_name, "systemctl reboot"),
-        PowerAction::Logout   => state.stop.store(true, Ordering::Relaxed),
+        PowerAction::Reboot => spawn_command(&state.socket_name, "systemctl reboot"),
+        PowerAction::Logout => state.stop.store(true, Ordering::Relaxed),
     }
 }
 
@@ -1756,7 +2019,11 @@ fn relayout(state: &mut State) {
     state.focus_cache = None;
     let idx = active_monitor_idx(state);
     let ws = state.monitors[idx].active_workspace;
-    let n = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).count();
+    let n = state
+        .toplevels
+        .iter()
+        .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+        .count();
     if state.monitors[idx].layout.focused >= n {
         state.monitors[idx].layout.focused = n.saturating_sub(1);
     }
@@ -1768,13 +2035,19 @@ fn relayout(state: &mut State) {
     // are simply absent here, so they never get a configure_size call and
     // never enter layout_rects/composite below — that's what actually hides
     // them, no separate visibility flag needed.
-    let alive: Vec<&Window> = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).collect();
+    let alive: Vec<&Window> = state
+        .toplevels
+        .iter()
+        .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+        .collect();
 
     // Which (alive-sequence) index, if any, is the fullscreen window right
     // now. Looked up by identity every call rather than cached, since
     // `fullscreen` only stores a WlSurface, not a position.
     let fs_idx = state.monitors[idx].fullscreen.as_ref().and_then(|fs| {
-        alive.iter().position(|t| t.wl_surface().as_ref() == Some(fs))
+        alive
+            .iter()
+            .position(|t| t.wl_surface().as_ref() == Some(fs))
     });
 
     let (output_w, output_h) = (state.monitors[idx].output_w, state.monitors[idx].output_h);
@@ -1786,7 +2059,11 @@ fn relayout(state: &mut State) {
     // fullscreen, so nothing's left peeking out from underneath it.
     let (tile_h, tile_y) = if state.bar.enabled {
         let h = output_h.saturating_sub(BAR_HEIGHT);
-        let y = if state.bar.position == veil_config::BarPosition::Top { BAR_HEIGHT as i32 } else { 0 };
+        let y = if state.bar.position == veil_config::BarPosition::Top {
+            BAR_HEIGHT as i32
+        } else {
+            0
+        };
         (h, y)
     } else {
         (output_h, 0)
@@ -1805,7 +2082,12 @@ fn relayout(state: &mut State) {
         r.y += tile_y;
     }
     if let Some(fs_i) = fs_idx {
-        rects[fs_i] = Rect { x: 0, y: 0, w: output_w, h: output_h };
+        rects[fs_i] = Rect {
+            x: 0,
+            y: 0,
+            w: output_w,
+            h: output_h,
+        };
     }
 
     for (i, tl) in alive.iter().enumerate() {
@@ -1830,7 +2112,12 @@ fn relayout(state: &mut State) {
             (Some(a), Some(b)) if a == b => a,
             (Some(a), Some(b)) => a.union(&b),
             (Some(a), None) | (None, Some(a)) => a,
-            (None, None) => Rect { x: 0, y: 0, w: state.monitors[idx].output_w, h: state.monitors[idx].output_h },
+            (None, None) => Rect {
+                x: 0,
+                y: 0,
+                w: state.monitors[idx].output_w,
+                h: state.monitors[idx].output_h,
+            },
         };
         mark_dirty_rect(state, idx, dirty_rect);
     } else {
@@ -1843,7 +2130,9 @@ fn relayout(state: &mut State) {
 fn refocus_keyboard(state: &mut State) {
     let idx = active_monitor_idx(state);
     let ws = state.monitors[idx].active_workspace;
-    let target = state.toplevels.iter()
+    let target = state
+        .toplevels
+        .iter()
         .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
         .nth(state.monitors[idx].layout.focused)
         .and_then(|t| t.wl_surface());
@@ -1861,7 +2150,10 @@ fn refocus_keyboard(state: &mut State) {
 /// redraw instead of a partial one — it can never cause a stale-pixel bug,
 /// since full-frame damage always covers whatever a precise rect would have.
 fn toplevel_rect_for(state: &State, surface: &WlSurface) -> Option<(usize, Rect)> {
-    let i = state.toplevels.iter().position(|t| t.wl_surface().as_ref() == Some(surface))?;
+    let i = state
+        .toplevels
+        .iter()
+        .position(|t| t.wl_surface().as_ref() == Some(surface))?;
     let monitor = state.toplevels[i].monitor;
     let rect = state.monitors.get(monitor)?.layout_rects.get(i).copied()?;
     Some((monitor, rect))
@@ -1880,7 +2172,12 @@ fn toplevel_rect_for(state: &State, surface: &WlSurface) -> Option<(usize, Rect)
 fn mark_dirty_full(state: &mut State) {
     state.dirty = true;
     for m in state.monitors.iter_mut() {
-        let full = Rect { x: 0, y: 0, w: m.output_w, h: m.output_h };
+        let full = Rect {
+            x: 0,
+            y: 0,
+            w: m.output_w,
+            h: m.output_h,
+        };
         m.damage = Some(match m.damage.take() {
             Some(d) => d.union(&full),
             None => full,
@@ -1910,7 +2207,14 @@ fn mark_dirty_rect(state: &mut State, monitor: usize, rect: Rect) {
 /// over every monitor. `active_idx`, `show_help`, `launcher_present`, and
 /// `power_menu_present` are resolved once per tick by the caller rather
 /// than once per monitor — none of them vary by monitor.
-fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_help: bool, launcher_present: bool, power_menu_present: bool) {
+fn composite_one_monitor(
+    state: &mut State,
+    idx: usize,
+    active_idx: usize,
+    show_help: bool,
+    launcher_present: bool,
+    power_menu_present: bool,
+) {
     let now = Instant::now();
     // One `&mut Monitor` borrow, reused for every monitor-scoped field
     // access below via `m.field` — NOT re-indexing `state.monitors[idx]`
@@ -1930,7 +2234,9 @@ fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_
     // single-threaded loop, but keeps the invariant obviously true rather
     // than relying on ordering elsewhere) accumulates for next tick instead
     // of being silently dropped.
-    let frame_damage = m.damage.take()
+    let frame_damage = m
+        .damage
+        .take()
         .unwrap_or(Rect { x: 0, y: 0, w, h })
         .clamp_to(w, h);
 
@@ -1951,9 +2257,13 @@ fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_
     debug_assert!(m.composite_buf.as_ptr().align_offset(4) == 0);
     {
         let (pre, u32s, post) = unsafe { m.composite_buf.align_to_mut::<u32>() };
-        for b in pre.chunks_exact_mut(4) { b.copy_from_slice(&bg); }
+        for b in pre.chunks_exact_mut(4) {
+            b.copy_from_slice(&bg);
+        }
         u32s.fill(bg_u32);
-        for b in post.chunks_exact_mut(4) { b.copy_from_slice(&bg); }
+        for b in post.chunks_exact_mut(4) {
+            b.copy_from_slice(&bg);
+        }
     }
 
     let ws = m.active_workspace;
@@ -1967,18 +2277,30 @@ fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_
     // Filtered to THIS monitor's active workspace — this MUST produce the
     // same alive-and-monitor-and-active-workspace sequence relayout() used
     // to build layout_rects, or index i here won't line up with rects[i].
-    let toplevels: Vec<Option<WlSurface>> = state.toplevels.iter()
+    let toplevels: Vec<Option<WlSurface>> = state
+        .toplevels
+        .iter()
         .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
         .map(|t| t.wl_surface())
         .collect();
     for (i, surf_opt) in toplevels.iter().enumerate() {
         let Some(surf) = surf_opt else { continue };
-        let r = m.layout_rects.get(i).copied()
+        let r = m
+            .layout_rects
+            .get(i)
+            .copied()
             .unwrap_or(Rect { x: 0, y: 0, w, h });
         blit_subtree(back, w, h, &state.surface_buffers, surf, (r.x, r.y));
         for (popup, off) in PopupManager::popups_for_surface(surf) {
             let ps = popup.wl_surface().clone();
-            blit_subtree(back, w, h, &state.surface_buffers, &ps, (r.x + off.x, r.y + off.y));
+            blit_subtree(
+                back,
+                w,
+                h,
+                &state.surface_buffers,
+                &ps,
+                (r.x + off.x, r.y + off.y),
+            );
         }
     }
 
@@ -1996,7 +2318,10 @@ fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_
     // this monitor) correctly stops matching here and this block becomes a
     // no-op until you switch back.
     if let Some(fs) = &m.fullscreen {
-        if let Some(surf) = state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+        if let Some(surf) = state
+            .toplevels
+            .iter()
+            .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
             .find(|t| t.wl_surface().as_ref() == Some(fs))
             .and_then(|t| t.wl_surface())
         {
@@ -2021,7 +2346,14 @@ fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_
     for f in state.floating.iter().filter(|f| f.alive()) {
         let Some(surf) = f.wl_surface() else { continue };
         let g = f.geometry();
-        blit_subtree(back, w, h, &state.surface_buffers, &surf, (g.loc.x, g.loc.y));
+        blit_subtree(
+            back,
+            w,
+            h,
+            &state.surface_buffers,
+            &surf,
+            (g.loc.x, g.loc.y),
+        );
     }
 
     // Cursor on top — only on the monitor the pointer is actually over.
@@ -2030,7 +2362,8 @@ fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_
         match &state.cursor_status {
             CursorImageStatus::Surface(cs) => {
                 let hotspot = with_states(cs, |s| {
-                    s.data_map.get::<std::sync::Mutex<CursorImageAttributes>>()
+                    s.data_map
+                        .get::<std::sync::Mutex<CursorImageAttributes>>()
                         .map(|m| m.lock().unwrap().hotspot)
                         .unwrap_or_default()
                 });
@@ -2042,11 +2375,7 @@ fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_
                 // Client wants a themed cursor (default arrow etc) — we don't
                 // load themes. Draw a tiny built-in arrow so the user can see
                 // where their pointer is.
-                draw_fallback_cursor(
-                    back, w, h,
-                    m.pointer_pos.0 as i32,
-                    m.pointer_pos.1 as i32,
-                );
+                draw_fallback_cursor(back, w, h, m.pointer_pos.0 as i32, m.pointer_pos.1 as i32);
             }
             CursorImageStatus::Hidden => {}
         }
@@ -2062,14 +2391,27 @@ fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_
         // its own workspace 3. Matches the dumb-separation model: each
         // monitor's bar is exactly as if it were the only monitor.
         let mut occupancy = [0u8; veil_config::WORKSPACE_COUNT as usize];
-        for t in state.toplevels.iter().filter(|t| t.alive() && t.monitor == idx) {
+        for t in state
+            .toplevels
+            .iter()
+            .filter(|t| t.alive() && t.monitor == idx)
+        {
             let occ_idx = t.workspace as usize;
             if occ_idx < occupancy.len() {
                 occupancy[occ_idx] += 1;
             }
         }
         let active_ws = m.active_workspace;
-        let hitboxes = draw_bar(&theme, &state.bar, &state.keybinds, active_ws, &occupancy, back, w, h);
+        let hitboxes = draw_bar(
+            &theme,
+            &state.bar,
+            &state.keybinds,
+            active_ws,
+            &occupancy,
+            back,
+            w,
+            h,
+        );
         m.bar_hitboxes = hitboxes;
     } else {
         // Fullscreen hides the bar entirely (conventional — see relayout()'s
@@ -2145,7 +2487,11 @@ fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_
     };
     m.prev_frame = Some(outgoing.clone());
     let _ = state.frame_tx.send(crate::sink::Frame {
-        rgba: outgoing, width: w, height: h, output_id: idx, serial: state.frame_serial,
+        rgba: outgoing,
+        width: w,
+        height: h,
+        output_id: idx,
+        serial: state.frame_serial,
         damage: frame_damage,
     });
 }
@@ -2156,13 +2502,20 @@ fn composite_one_monitor(state: &mut State, idx: usize, active_idx: usize, show_
 /// not per-monitor; the actual drawing work is delegated to
 /// `composite_one_monitor`, called once per entry in `state.monitors`.
 fn composite_and_send(state: &mut State) {
-    if !state.dirty { return; }
+    if !state.dirty {
+        return;
+    }
     let now = Instant::now();
     if let Some(t) = state.monitors[0].last_composite {
-        if now.duration_since(t) < state.composite_interval { return; }
+        if now.duration_since(t) < state.composite_interval {
+            return;
+        }
     }
     state.dirty = false;
-    tracing::info!("compositing frame (buffers={})", state.surface_buffers.len());
+    tracing::info!(
+        "compositing frame (buffers={})",
+        state.surface_buffers.len()
+    );
 
     let show_help = state.show_help;
     let launcher_present = state.launcher.is_some();
@@ -2170,7 +2523,14 @@ fn composite_and_send(state: &mut State) {
     let active_idx = active_monitor_idx(state);
 
     for idx in 0..state.monitors.len() {
-        composite_one_monitor(state, idx, active_idx, show_help, launcher_present, power_menu_present);
+        composite_one_monitor(
+            state,
+            idx,
+            active_idx,
+            show_help,
+            launcher_present,
+            power_menu_present,
+        );
     }
 
     // Fire frame callbacks now that we've consumed and displayed every
@@ -2181,10 +2541,18 @@ fn composite_and_send(state: &mut State) {
     // client's surface belongs to exactly one monitor, but there's no
     // reason to fire its callback more than once per tick regardless.
     let time = state.start_time.elapsed().as_millis() as u32;
-    let surfaces: Vec<WlSurface> = state.toplevels.iter()
+    let surfaces: Vec<WlSurface> = state
+        .toplevels
+        .iter()
         .filter(|t| t.alive())
         .filter_map(|t| t.wl_surface())
-        .chain(state.floating.iter().filter(|f| f.alive()).filter_map(|f| f.wl_surface()))
+        .chain(
+            state
+                .floating
+                .iter()
+                .filter(|f| f.alive())
+                .filter_map(|f| f.wl_surface()),
+        )
         .collect();
     for s in &surfaces {
         send_frame_callbacks(s, time);
@@ -2227,11 +2595,15 @@ fn draw_bar(
     use veil_config::BarPosition;
 
     const SCALE: u32 = 1; // full help/launcher overlays use 2 — bar stays
-                           // compact: 7px glyph + 5px padding = BAR_HEIGHT.
+                          // compact: 7px glyph + 5px padding = BAR_HEIGHT.
     const ADVANCE: u32 = 6; // (GLYPH_W + 1) * SCALE, matches font5x7's own spacing formula
-    const PAD_Y: i32 = 3;   // vertically centers a 7px glyph in a 12px bar
+    const PAD_Y: i32 = 3; // vertically centers a 7px glyph in a 12px bar
 
-    let y0 = if bar.position == BarPosition::Top { 0 } else { h.saturating_sub(BAR_HEIGHT) as i32 };
+    let y0 = if bar.position == BarPosition::Top {
+        0
+    } else {
+        h.saturating_sub(BAR_HEIGHT) as i32
+    };
     fill_rect(back, w, h, 0, y0, w, BAR_HEIGHT, theme.panel_bg);
 
     // --- Column 1: workspace widget, fixed 16 chars / 96px ---
@@ -2241,7 +2613,9 @@ fn draw_bar(
     // "N:" (empty) or "N:" + up to 3 `*` (one per window, capped). Active
     // workspace's token gets the accent color so it stands out at a glance.
     let col1_w = 16 * ADVANCE;
-    let highest = occupancy.iter().rposition(|&c| c > 0)
+    let highest = occupancy
+        .iter()
+        .rposition(|&c| c > 0)
         .map(|i| i as u8 + 1)
         .unwrap_or(0)
         .max(active_ws + 1)
@@ -2251,8 +2625,14 @@ fn draw_bar(
         let count = occupancy[(n - 1) as usize];
         let token = format!("{n}:{}", "*".repeat(count.min(3) as usize));
         let token_w = token.chars().count() as u32 * ADVANCE;
-        if cx as u32 + token_w > col1_w { break; }
-        let color = if n == active_ws + 1 { theme.accent } else { theme.text_dim };
+        if cx as u32 + token_w > col1_w {
+            break;
+        }
+        let color = if n == active_ws + 1 {
+            theme.accent
+        } else {
+            theme.text_dim
+        };
         draw_text(back, w, h, cx, y0 + PAD_Y, SCALE, &token, color);
         cx += token_w as i32 + ADVANCE as i32; // one blank char of gap
     }
@@ -2263,7 +2643,16 @@ fn draw_bar(
     // displayed minute obviously only visibly changes once a minute.
     let col2_x = col1_w as i32;
     let clock = chrono::Local::now().format("%H:%M").to_string();
-    draw_text(back, w, h, col2_x + 2, y0 + PAD_Y, SCALE, &clock, theme.text);
+    draw_text(
+        back,
+        w,
+        h,
+        col2_x + 2,
+        y0 + PAD_Y,
+        SCALE,
+        &clock,
+        theme.text,
+    );
 
     // --- Column 3: app shortcuts, whatever width is left ---
     // Every Action::Launch bind becomes a tile — no separate `bar.apps`
@@ -2275,21 +2664,39 @@ fn draw_bar(
     let mut hitboxes = Vec::new();
     let mut tx = col3_x + 2;
     for (_, action) in &keybinds.binds {
-        let veil_config::Action::Launch(cmd) = action else { continue };
+        let veil_config::Action::Launch(cmd) = action else {
+            continue;
+        };
         let prog = cmd.split_whitespace().next().unwrap_or(cmd);
         let name = prog.rsplit('/').next().unwrap_or(prog);
         let label = format!("[{name}]");
         let label_w = label.chars().count() as u32 * ADVANCE;
-        if tx as u32 + label_w > w { break; } // out of bar width — rest just don't fit
+        if tx as u32 + label_w > w {
+            break;
+        } // out of bar width — rest just don't fit
         draw_text(back, w, h, tx, y0 + PAD_Y, SCALE, &label, theme.text);
-        hitboxes.push((Rect { x: tx, y: y0, w: label_w, h: BAR_HEIGHT }, cmd.clone()));
+        hitboxes.push((
+            Rect {
+                x: tx,
+                y: y0,
+                w: label_w,
+                h: BAR_HEIGHT,
+            },
+            cmd.clone(),
+        ));
         tx += label_w as i32 + ADVANCE as i32;
     }
 
     hitboxes
 }
 
-fn draw_help_overlay(keybinds: &veil_config::Keybinds, theme: &veil_config::Theme, back: &mut [u8], w: u32, h: u32) {
+fn draw_help_overlay(
+    keybinds: &veil_config::Keybinds,
+    theme: &veil_config::Theme,
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+) {
     use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
 
     let scale = 2u32;
@@ -2300,7 +2707,11 @@ fn draw_help_overlay(keybinds: &veil_config::Keybinds, theme: &veil_config::Them
     let mod_label = keybinds.mod_key.label().to_ascii_uppercase();
     let mut lines: Vec<String> = vec!["KEYBINDS".to_string(), String::new()];
     for (key, action) in &keybinds.binds {
-        lines.push(format!("{mod_label}+{}  {}", key.to_ascii_uppercase(), action.label().to_ascii_uppercase()));
+        lines.push(format!(
+            "{mod_label}+{}  {}",
+            key.to_ascii_uppercase(),
+            action.label().to_ascii_uppercase()
+        ));
     }
     lines.push(String::new());
     lines.push(format!("{mod_label}+/  TOGGLE THIS MENU"));
@@ -2316,7 +2727,16 @@ fn draw_help_overlay(keybinds: &veil_config::Keybinds, theme: &veil_config::Them
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
 
     let border = 2i32;
-    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), theme.border);
+    fill_rect(
+        back,
+        w,
+        h,
+        x0 - border,
+        y0 - border,
+        box_w + (border as u32 * 2),
+        box_h + (border as u32 * 2),
+        theme.border,
+    );
     fill_rect(back, w, h, x0, y0, box_w, box_h, theme.panel_bg);
     for (i, line) in lines.iter().enumerate() {
         let ty = y0 + pad + i as i32 * line_h as i32;
@@ -2327,7 +2747,14 @@ fn draw_help_overlay(keybinds: &veil_config::Keybinds, theme: &veil_config::Them
 
 /// `<mod_key>+D` launcher modal: query box + top matches, same font/box
 /// style as the help overlay. Selected row gets a highlight bar.
-fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, theme: &veil_config::Theme, back: &mut [u8], w: u32, h: u32) {
+fn draw_launcher_overlay(
+    launcher: &Launcher,
+    mod_key: veil_config::ModKey,
+    theme: &veil_config::Theme,
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+) {
     use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
 
     const PAGE_SIZE: usize = 10;
@@ -2371,14 +2798,28 @@ fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, them
         }
     }
 
-    let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(40) as u32;
+    let text_cols = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(40) as u32;
     let box_w = text_cols * advance + pad as u32 * 2;
     let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
 
     let border = 2i32;
-    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), theme.border);
+    fill_rect(
+        back,
+        w,
+        h,
+        x0 - border,
+        y0 - border,
+        box_w + (border as u32 * 2),
+        box_h + (border as u32 * 2),
+        theme.border,
+    );
     fill_rect(back, w, h, x0, y0, box_w, box_h, theme.panel_bg);
 
     // Highlight bar behind the selected match row
@@ -2407,7 +2848,14 @@ fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, them
 
 /// `<mod_key>+P` power menu modal: fixed 3-row list, same box/font style as
 /// the launcher overlay. Selected row gets a highlight bar.
-fn draw_power_menu_overlay(menu: &PowerMenu, mod_key: veil_config::ModKey, theme: &veil_config::Theme, back: &mut [u8], w: u32, h: u32) {
+fn draw_power_menu_overlay(
+    menu: &PowerMenu,
+    mod_key: veil_config::ModKey,
+    theme: &veil_config::Theme,
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+) {
     use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
 
     let scale = 2u32;
@@ -2427,14 +2875,28 @@ fn draw_power_menu_overlay(menu: &PowerMenu, mod_key: veil_config::ModKey, theme
         lines.push(a.label().to_string());
     }
 
-    let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(40) as u32;
+    let text_cols = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(40) as u32;
     let box_w = text_cols * advance + pad as u32 * 2;
     let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
 
     let border = 2i32;
-    fill_rect(back, w, h, x0 - border, y0 - border, box_w + (border as u32 * 2), box_h + (border as u32 * 2), theme.border);
+    fill_rect(
+        back,
+        w,
+        h,
+        x0 - border,
+        y0 - border,
+        box_w + (border as u32 * 2),
+        box_h + (border as u32 * 2),
+        theme.border,
+    );
     fill_rect(back, w, h, x0, y0, box_w, box_h, theme.panel_bg);
 
     // Highlight bar behind the selected entry row
@@ -2471,15 +2933,24 @@ fn send_frame_callbacks(surface: &WlSurface, time: u32) {
 fn toplevel_at(state: &State, monitor: usize, x: f64, y: f64) -> Option<usize> {
     let xi = x as i32;
     let yi = y as i32;
-    state.monitors[monitor].layout_rects.iter().position(|r| {
-        xi >= r.x && yi >= r.y && xi < r.x + r.w as i32 && yi < r.y + r.h as i32
-    })
+    state.monitors[monitor]
+        .layout_rects
+        .iter()
+        .position(|r| xi >= r.x && yi >= r.y && xi < r.x + r.w as i32 && yi < r.y + r.h as i32)
 }
 
 /// Walk all toplevels' popups (newest first) then the toplevel root.
 /// Return the first surface whose cached buffer rect contains (x, y),
 /// along with the cursor's surface-local coordinates.
-fn pick_focus(state: &State, monitor: usize, x: f64, y: f64) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
+fn pick_focus(
+    state: &State,
+    monitor: usize,
+    x: f64,
+    y: f64,
+) -> Option<(
+    WlSurface,
+    smithay::utils::Point<f64, smithay::utils::Logical>,
+)> {
     let xi = x as i32;
     let yi = y as i32;
 
@@ -2490,9 +2961,7 @@ fn pick_focus(state: &State, monitor: usize, x: f64, y: f64) -> Option<(WlSurfac
     for f in state.floating.iter().rev().filter(|f| f.alive()) {
         let Some(surf) = f.wl_surface() else { continue };
         let g = f.geometry();
-        if xi >= g.loc.x && yi >= g.loc.y
-            && xi < g.loc.x + g.size.w && yi < g.loc.y + g.size.h
-        {
+        if xi >= g.loc.x && yi >= g.loc.y && xi < g.loc.x + g.size.w && yi < g.loc.y + g.size.h {
             return Some((surf, (g.loc.x as f64, g.loc.y as f64).into()));
         }
     }
@@ -2503,7 +2972,10 @@ fn pick_focus(state: &State, monitor: usize, x: f64, y: f64) -> Option<(WlSurfac
     // clicks fall through to a window you can't actually see.
     let ws = state.monitors[monitor].active_workspace;
     if let Some(fs) = &state.monitors[monitor].fullscreen {
-        return state.toplevels.iter().filter(|t| t.alive() && t.monitor == monitor && t.workspace == ws)
+        return state
+            .toplevels
+            .iter()
+            .filter(|t| t.alive() && t.monitor == monitor && t.workspace == ws)
             .find(|t| t.wl_surface().as_ref() == Some(fs))
             .and_then(|t| t.wl_surface())
             .map(|surf| (surf, (0.0, 0.0).into()));
@@ -2514,15 +2986,28 @@ fn pick_focus(state: &State, monitor: usize, x: f64, y: f64) -> Option<(WlSurfac
     // Monitor- and workspace-filtered for the same reason composite()'s
     // copy is — must match the exact sequence relayout() used to build
     // layout_rects.
-    let live: Vec<Option<WlSurface>> = state.toplevels.iter()
+    let live: Vec<Option<WlSurface>> = state
+        .toplevels
+        .iter()
         .filter(|t| t.alive() && t.monitor == monitor && t.workspace == ws)
         .map(|t| t.wl_surface())
         .collect();
     for (i, root_opt) in live.iter().enumerate().rev() {
         let Some(root) = root_opt else { continue };
-        let (out_w, out_h) = (state.monitors[monitor].output_w, state.monitors[monitor].output_h);
-        let r = state.monitors[monitor].layout_rects.get(i).copied()
-            .unwrap_or(Rect { x: 0, y: 0, w: out_w, h: out_h });
+        let (out_w, out_h) = (
+            state.monitors[monitor].output_w,
+            state.monitors[monitor].output_h,
+        );
+        let r = state.monitors[monitor]
+            .layout_rects
+            .get(i)
+            .copied()
+            .unwrap_or(Rect {
+                x: 0,
+                y: 0,
+                w: out_w,
+                h: out_h,
+            });
 
         // Popups (per-toplevel) — last-added wins on overlap. Positioned at
         // the toplevel rect origin + the popup's toplevel-relative offset.
@@ -2532,9 +3017,7 @@ fn pick_focus(state: &State, monitor: usize, x: f64, y: f64) -> Option<(WlSurfac
             if let Some(buf) = state.surface_buffers.get(&ps.id()) {
                 let bx = r.x + off.x;
                 let by = r.y + off.y;
-                if xi >= bx && yi >= by
-                    && xi < bx + buf.w as i32 && yi < by + buf.h as i32
-                {
+                if xi >= bx && yi >= by && xi < bx + buf.w as i32 && yi < by + buf.h as i32 {
                     // loc = surface origin in compositor space; Smithay
                     // computes surface-local as event.location - loc.
                     return Some((ps.clone(), (bx as f64, by as f64).into()));
@@ -2544,9 +3027,7 @@ fn pick_focus(state: &State, monitor: usize, x: f64, y: f64) -> Option<(WlSurfac
 
         // Toplevel root sits at its rect origin.
         if let Some(buf) = state.surface_buffers.get(&root.id()) {
-            if xi >= r.x && yi >= r.y
-                && xi < r.x + buf.w as i32 && yi < r.y + buf.h as i32
-            {
+            if xi >= r.x && yi >= r.y && xi < r.x + buf.w as i32 && yi < r.y + buf.h as i32 {
                 return Some((root.clone(), (r.x as f64, r.y as f64).into()));
             }
         }
@@ -2557,15 +3038,25 @@ fn pick_focus(state: &State, monitor: usize, x: f64, y: f64) -> Option<(WlSurfac
 fn apply_input(state: &mut State, cmd: InputCmd) {
     use smithay::backend::input::{ButtonState as BState, KeyState};
     let serial = state.next_serial();
-    let time   = state.start_time.elapsed().as_millis() as u32;
+    let time = state.start_time.elapsed().as_millis() as u32;
 
     match cmd {
-        InputCmd::Key { keycode, pressed, .. } => {
-            let ks = if pressed { KeyState::Pressed } else { KeyState::Released };
+        InputCmd::Key {
+            keycode, pressed, ..
+        } => {
+            let ks = if pressed {
+                KeyState::Pressed
+            } else {
+                KeyState::Released
+            };
             // xkbcommon Keycode is an X11 keycode = evdev + 8.
             let kb = state.keyboard.clone();
             kb.input::<(), _>(
-                state, (keycode + 8).into(), ks, serial, time,
+                state,
+                (keycode + 8).into(),
+                ks,
+                serial,
+                time,
                 |st, mods: &ModifiersState, keysym: KeysymHandle<'_>| {
                     // Launcher modal: swallow ALL key input while it's open
                     // (typed query text, arrow-key selection, Enter/Escape),
@@ -2646,8 +3137,8 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
 
                     let mod_held = match st.keybinds.mod_key {
                         veil_config::ModKey::Super => mods.logo,
-                        veil_config::ModKey::Ctrl  => mods.ctrl,
-                        veil_config::ModKey::Alt   => mods.alt,
+                        veil_config::ModKey::Ctrl => mods.ctrl,
+                        veil_config::ModKey::Alt => mods.alt,
                         veil_config::ModKey::Shift => mods.shift,
                     };
                     if mod_held {
@@ -2684,7 +3175,12 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             );
         }
 
-        InputCmd::PointerMotionAbs { x, y, width, height } => {
+        InputCmd::PointerMotionAbs {
+            x,
+            y,
+            width,
+            height,
+        } => {
             // Caller (evdev's virtual cursor, or crossterm's terminal-cell
             // mapping) works in its own (width × height) pixel space —
             // rescale into OUR shared virtual arrangement (the combined
@@ -2702,8 +3198,16 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
 
             let total_w: u32 = state.monitors.iter().map(|m| m.output_w).sum();
             let total_h: u32 = state.monitors.iter().map(|m| m.output_h).max().unwrap_or(0);
-            let gx = if width  > 0 { x as f64 * total_w as f64 / width  as f64 } else { x as f64 };
-            let gy = if height > 0 { y as f64 * total_h as f64 / height as f64 } else { y as f64 };
+            let gx = if width > 0 {
+                x as f64 * total_w as f64 / width as f64
+            } else {
+                x as f64
+            };
+            let gy = if height > 0 {
+                y as f64 * total_h as f64 / height as f64
+            } else {
+                y as f64
+            };
             let gx = gx.clamp(0.0, total_w.saturating_sub(1) as f64);
             let gy = gy.clamp(0.0, total_h.saturating_sub(1) as f64);
             state.pointer_global = (gx, gy);
@@ -2730,10 +3234,19 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // exceed it and leave a stale edge pixel behind — a cosmetic
             // edge case, not a correctness or crash issue.
             fn cursor_bbox(pos: (f64, f64)) -> Rect {
-                Rect { x: pos.0 as i32 - 16, y: pos.1 as i32 - 16, w: 64, h: 64 }
+                Rect {
+                    x: pos.0 as i32 - 16,
+                    y: pos.1 as i32 - 16,
+                    w: 64,
+                    h: 64,
+                }
             }
             if old_idx == idx {
-                mark_dirty_rect(state, idx, cursor_bbox(old_pos).union(&cursor_bbox((nx, ny))));
+                mark_dirty_rect(
+                    state,
+                    idx,
+                    cursor_bbox(old_pos).union(&cursor_bbox((nx, ny))),
+                );
             } else {
                 // Cursor crossed onto a different monitor this event (rare —
                 // only right at a monitor's edge): erase it from where it
@@ -2746,19 +3259,34 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // else the toplevel. Surface-local coords are (global - origin).
             let focus = pick_focus(state, idx, nx, ny);
             if focus.is_none() {
-                tracing::debug!("motion ({:.0},{:.0}) on monitor {idx} → no focus (toplevels={}, buffers={})",
-                    nx, ny, state.toplevels.len(), state.surface_buffers.len());
+                tracing::debug!(
+                    "motion ({:.0},{:.0}) on monitor {idx} → no focus (toplevels={}, buffers={})",
+                    nx,
+                    ny,
+                    state.toplevels.len(),
+                    state.surface_buffers.len()
+                );
             }
             let ptr = state.pointer.clone();
-            ptr.motion(state, focus, &MotionEvent {
-                location: (nx, ny).into(), serial, time,
-            });
+            ptr.motion(
+                state,
+                focus,
+                &MotionEvent {
+                    location: (nx, ny).into(),
+                    serial,
+                    time,
+                },
+            );
             ptr.frame(state);
         }
 
         InputCmd::PointerButton { button, pressed } => {
             let idx = active_monitor_idx(state);
-            let bs = if pressed { BState::Pressed } else { BState::Released };
+            let bs = if pressed {
+                BState::Pressed
+            } else {
+                BState::Released
+            };
             const BTN_LEFT: u32 = 0x110;
 
             // Bar app tile — launch and stop here. A bar click has no
@@ -2766,9 +3294,16 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // so it takes a completely separate path from the click-to-
             // focus/forwarding below rather than falling through into it.
             let bar_hit = if pressed && button == BTN_LEFT {
-                let (px, py) = (state.monitors[idx].pointer_pos.0 as i32, state.monitors[idx].pointer_pos.1 as i32);
-                state.monitors[idx].bar_hitboxes.iter()
-                    .find(|(r, _)| px >= r.x && py >= r.y && px < r.x + r.w as i32 && py < r.y + r.h as i32)
+                let (px, py) = (
+                    state.monitors[idx].pointer_pos.0 as i32,
+                    state.monitors[idx].pointer_pos.1 as i32,
+                );
+                state.monitors[idx]
+                    .bar_hitboxes
+                    .iter()
+                    .find(|(r, _)| {
+                        px >= r.x && py >= r.y && px < r.x + r.w as i32 && py < r.y + r.h as i32
+                    })
                     .map(|(_, exec)| exec.clone())
             } else {
                 None
@@ -2800,11 +3335,22 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             let focus = state.pointer.current_focus();
             tracing::info!(
                 "button 0x{:x} pressed={} pos=({:.0},{:.0}) focus={:?}",
-                button, pressed, state.monitors[idx].pointer_pos.0, state.monitors[idx].pointer_pos.1,
+                button,
+                pressed,
+                state.monitors[idx].pointer_pos.0,
+                state.monitors[idx].pointer_pos.1,
                 focus.as_ref().map(|s| s.id()),
             );
             let ptr = state.pointer.clone();
-            ptr.button(state, &ButtonEvent { button, state: bs, serial, time });
+            ptr.button(
+                state,
+                &ButtonEvent {
+                    button,
+                    state: bs,
+                    serial,
+                    time,
+                },
+            );
             ptr.frame(state);
         }
 
@@ -2817,7 +3363,7 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // Rescale existing pointer position into the new pixel space so the
             // cursor doesn't jump on resize.
             if m.output_w > 0 && m.output_h > 0 {
-                m.pointer_pos.0 = m.pointer_pos.0 * width  as f64 / m.output_w as f64;
+                m.pointer_pos.0 = m.pointer_pos.0 * width as f64 / m.output_w as f64;
                 m.pointer_pos.1 = m.pointer_pos.1 * height as f64 / m.output_h as f64;
             }
             m.output_w = width;
@@ -2828,7 +3374,9 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                 size: (width as i32, height as i32).into(),
                 refresh: 60_000,
             };
-            state.output.change_current_state(Some(mode), None, None, None);
+            state
+                .output
+                .change_current_state(Some(mode), None, None, None);
             // Retile everyone into the new output extent.
             relayout(state);
         }
@@ -2848,7 +3396,12 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                     // brief window before this arrived) survives instead of
                     // being silently discarded.
                     Some(m) => {
-                        m.rect = Rect { x: origin_x, y: 0, w, h };
+                        m.rect = Rect {
+                            x: origin_x,
+                            y: 0,
+                            w,
+                            h,
+                        };
                         m.output_w = w;
                         m.output_h = h;
                         m.pointer_pos.0 = m.pointer_pos.0.clamp(0.0, w.saturating_sub(1) as f64);
@@ -2876,7 +3429,9 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                 size: (m0.output_w as i32, m0.output_h as i32).into(),
                 refresh: 60_000,
             };
-            state.output.change_current_state(Some(mode), None, None, None);
+            state
+                .output
+                .change_current_state(Some(mode), None, None, None);
 
             // Newly added monitors have nothing tiled yet, so there's
             // nothing for relayout() to do on them — but they DO need their
@@ -2914,8 +3469,7 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // v120 = 120 per notch (Windows convention). Convert to a 15px-per-notch
             // continuous value as well; clients pick whichever they understand.
             let notches = v120 as f64 / 120.0;
-            let mut f = AxisFrame::new(time)
-                .source(smithay::backend::input::AxisSource::Wheel);
+            let mut f = AxisFrame::new(time).source(smithay::backend::input::AxisSource::Wheel);
             f.axis = (0.0, notches * 15.0);
             f.v120 = Some((0, v120));
             let ptr = state.pointer.clone();
@@ -2923,7 +3477,11 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             ptr.frame(state);
         }
 
-        InputCmd::Osd { title, body, progress } => {
+        InputCmd::Osd {
+            title,
+            body,
+            progress,
+        } => {
             state.show_osd(title, body, progress, Duration::from_secs(2));
         }
     }
@@ -2933,7 +3491,7 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
 
 /// Bundle of state passed through calloop callbacks.
 pub struct LoopData {
-    pub state:   State,
+    pub state: State,
     pub display: Display<State>,
 }
 
@@ -2944,13 +3502,19 @@ pub struct LoopData {
 /// the time an unmap/destroy notification arrives.
 fn remove_x11_window(state: &mut State, window: &X11Surface) {
     if let Some(wl) = window.wl_surface() {
-        if let Some(idx) = state.monitors.iter().position(|m| m.fullscreen.as_ref() == Some(&wl)) {
+        if let Some(idx) = state
+            .monitors
+            .iter()
+            .position(|m| m.fullscreen.as_ref() == Some(&wl))
+        {
             state.monitors[idx].fullscreen = None;
         }
     }
 
     let before = state.toplevels.len();
-    state.toplevels.retain(|w| !matches!(&w.surface, WindowSurface::X11(x) if x == window));
+    state
+        .toplevels
+        .retain(|w| !matches!(&w.surface, WindowSurface::X11(x) if x == window));
     if state.toplevels.len() != before {
         relayout(state);
         refocus_keyboard(state);
@@ -2977,7 +3541,9 @@ fn remove_x11_window(state: &mut State, window: &X11Surface) {
 // LoopData's impl below is a thin forward into these.
 impl XwmHandler for State {
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
-        self.xwm.as_mut().expect("XwmHandler called before X11Wm started")
+        self.xwm
+            .as_mut()
+            .expect("XwmHandler called before X11Wm started")
     }
 
     fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
@@ -2991,8 +3557,13 @@ impl XwmHandler for State {
         let wl = window.wl_surface();
         let idx = active_monitor_idx(self);
         let ws = self.monitors[idx].active_workspace;
-        self.toplevels.push(Window::new(WindowSurface::X11(window), idx, ws));
-        let n = self.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws).count();
+        self.toplevels
+            .push(Window::new(WindowSurface::X11(window), idx, ws));
+        let n = self
+            .toplevels
+            .iter()
+            .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+            .count();
         self.monitors[idx].layout.focused = n.saturating_sub(1);
         // Only if already paired with a wl_surface (usually is, by this
         // point) — if not yet, it'll pick up focus on the next natural
@@ -3044,16 +3615,24 @@ impl XwmHandler for State {
         if or {
             // Floating windows own their geometry entirely — this is how a
             // dropdown/menu ends up positioned where the client wants it.
-            if let Some(x) = x { geo.loc.x = x; }
-            if let Some(y) = y { geo.loc.y = y; }
+            if let Some(x) = x {
+                geo.loc.x = x;
+            }
+            if let Some(y) = y {
+                geo.loc.y = y;
+            }
         }
         // Tiling WM: a *managed* window's position is always ours, never
         // the client's to set — x/y ignored for those (fall through, no
         // loc change above). Size honored either way, immediately, rather
         // than making the client wait for the next relayout tick (matches
         // smithay's own anvil reference).
-        if let Some(w) = w { geo.size.w = w as i32; }
-        if let Some(h) = h { geo.size.h = h as i32; }
+        if let Some(w) = w {
+            geo.size.w = w as i32;
+        }
+        if let Some(h) = h {
+            geo.size.h = h as i32;
+        }
 
         // Heuristic for games/apps that go fullscreen by directly requesting
         // output-sized geometry instead of the proper EWMH
@@ -3067,7 +3646,10 @@ impl XwmHandler for State {
         if !or && w == Some(out_w) && h == Some(out_h) {
             if let Some(wl) = window.wl_surface() {
                 let ws = self.monitors[idx].active_workspace;
-                if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+                if let Some(i) = self
+                    .toplevels
+                    .iter()
+                    .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
                     .position(|t| t.wl_surface().as_ref() == Some(&wl))
                 {
                     self.monitors[idx].layout.focused = i;
@@ -3102,14 +3684,26 @@ impl XwmHandler for State {
 
     // Tiling WM: geometry is always ours, never interactive. Declining these
     // is the philosophically correct answer here, same as i3/sway would.
-    fn resize_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32, _edges: ResizeEdge) {}
+    fn resize_request(
+        &mut self,
+        _xwm: XwmId,
+        _window: X11Surface,
+        _button: u32,
+        _edges: ResizeEdge,
+    ) {
+    }
     fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {}
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        let Some(wl) = window.wl_surface() else { return };
+        let Some(wl) = window.wl_surface() else {
+            return;
+        };
         let idx = active_monitor_idx(self);
         let ws = self.monitors[idx].active_workspace;
-        if let Some(i) = self.toplevels.iter().filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+        if let Some(i) = self
+            .toplevels
+            .iter()
+            .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
             .position(|t| t.wl_surface().as_ref() == Some(&wl))
         {
             self.monitors[idx].layout.focused = i;
@@ -3123,7 +3717,11 @@ impl XwmHandler for State {
         // Client-initiated — search rather than assume active monitor, same
         // reasoning as the xdg-shell unfullscreen_request above.
         if let Some(wl) = window.wl_surface() {
-            if let Some(idx) = self.monitors.iter().position(|m| m.fullscreen.as_ref() == Some(&wl)) {
+            if let Some(idx) = self
+                .monitors
+                .iter()
+                .position(|m| m.fullscreen.as_ref() == Some(&wl))
+            {
                 self.monitors[idx].fullscreen = None;
                 relayout(self);
             }
@@ -3142,8 +3740,12 @@ impl XWaylandShellHandler for LoopData {
 }
 
 impl XwmHandler for LoopData {
-    fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm { self.state.xwm_state(xwm) }
-    fn new_window(&mut self, xwm: XwmId, window: X11Surface) { self.state.new_window(xwm, window) }
+    fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {
+        self.state.xwm_state(xwm)
+    }
+    fn new_window(&mut self, xwm: XwmId, window: X11Surface) {
+        self.state.new_window(xwm, window)
+    }
     fn new_override_redirect_window(&mut self, xwm: XwmId, window: X11Surface) {
         self.state.new_override_redirect_window(xwm, window)
     }
@@ -3153,16 +3755,31 @@ impl XwmHandler for LoopData {
     fn mapped_override_redirect_window(&mut self, xwm: XwmId, window: X11Surface) {
         self.state.mapped_override_redirect_window(xwm, window)
     }
-    fn unmapped_window(&mut self, xwm: XwmId, window: X11Surface) { self.state.unmapped_window(xwm, window) }
-    fn destroyed_window(&mut self, xwm: XwmId, window: X11Surface) { self.state.destroyed_window(xwm, window) }
+    fn unmapped_window(&mut self, xwm: XwmId, window: X11Surface) {
+        self.state.unmapped_window(xwm, window)
+    }
+    fn destroyed_window(&mut self, xwm: XwmId, window: X11Surface) {
+        self.state.destroyed_window(xwm, window)
+    }
     fn configure_request(
-        &mut self, xwm: XwmId, window: X11Surface,
-        x: Option<i32>, y: Option<i32>, w: Option<u32>, h: Option<u32>, reorder: Option<Reorder>,
+        &mut self,
+        xwm: XwmId,
+        window: X11Surface,
+        x: Option<i32>,
+        y: Option<i32>,
+        w: Option<u32>,
+        h: Option<u32>,
+        reorder: Option<Reorder>,
     ) {
-        self.state.configure_request(xwm, window, x, y, w, h, reorder)
+        self.state
+            .configure_request(xwm, window, x, y, w, h, reorder)
     }
     fn configure_notify(
-        &mut self, xwm: XwmId, window: X11Surface, geometry: Rectangle<i32, Logical>, above: Option<X11Window>,
+        &mut self,
+        xwm: XwmId,
+        window: X11Surface,
+        geometry: Rectangle<i32, Logical>,
+        above: Option<X11Window>,
     ) {
         self.state.configure_notify(xwm, window, geometry, above)
     }
@@ -3177,10 +3794,10 @@ impl XwmHandler for LoopData {
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     socket_name: &str,
-    width:  u32,
+    width: u32,
     height: u32,
-    fps:    u32,
-    spawn:  Option<Vec<String>>,
+    fps: u32,
+    spawn: Option<Vec<String>>,
     wayland_debug: bool,
     frame_tx: mpsc::Sender<Frame>,
     input_rx: mpsc::Receiver<InputCmd>,
@@ -3191,15 +3808,15 @@ pub fn run(
     bar: veil_config::BarConfig,
 ) -> io::Result<()> {
     let composite_interval = Duration::from_millis(1000 / fps.max(1) as u64);
-    let display: Display<State> = Display::new()
-        .map_err(|e| io::Error::other(format!("display: {e}")))?;
+    let display: Display<State> =
+        Display::new().map_err(|e| io::Error::other(format!("display: {e}")))?;
     let dh = display.handle();
 
     let compositor_state = CompositorState::new::<State>(&dh);
-    let shm_state        = ShmState::new::<State>(&dh, vec![]);
-    let xdg_shell_state  = XdgShellState::new::<State>(&dh);
-    let xdg_activation   = XdgActivationState::new::<State>(&dh);
-    let output_manager   = OutputManagerState::new_with_xdg_output::<State>(&dh);
+    let shm_state = ShmState::new::<State>(&dh, vec![]);
+    let xdg_shell_state = XdgShellState::new::<State>(&dh);
+    let xdg_activation = XdgActivationState::new::<State>(&dh);
+    let output_manager = OutputManagerState::new_with_xdg_output::<State>(&dh);
     // Bring up the GPU dmabuf importer (EGL/GLES on the render node). None if
     // there's no GPU / EGL — veil then stays CPU-only + linear-only. Created
     // before the dmabuf global so feedback can advertise its formats.
@@ -3235,46 +3852,55 @@ pub fn run(
     // v4 dmabuf with default feedback: advertise the render device + the formats
     // we can import (linear always; tiled too when the GPU importer is up).
     // Feedback-aware clients allocate accordingly; we detile tiled buffers.
-    let mut dmabuf_state  = DmabufState::new();
-    let dmabuf_feedback   = build_dmabuf_feedback(&gpu_probe);
+    let mut dmabuf_state = DmabufState::new();
+    let dmabuf_feedback = build_dmabuf_feedback(&gpu_probe);
     drop(gpu_probe); // real context recreated lazily by gpu_lazy() when actually needed
-    let _dmabuf_global    = dmabuf_state.create_global_with_default_feedback::<State>(&dh, &dmabuf_feedback);
+    let _dmabuf_global =
+        dmabuf_state.create_global_with_default_feedback::<State>(&dh, &dmabuf_feedback);
     // XWayland pairing: lets an X11 window's wl_surface get associated with
     // its X11Surface (see XWaylandShellHandler::surface_associated). Only
     // XWayland clients can bind this global.
     let xwayland_shell_state = XWaylandShellState::new::<State>(&dh);
-    let _data_device          = DataDeviceState::new::<State>(&dh);
-    let _xdg_decoration       = XdgDecorationState::new::<State>(&dh);
-    let _viewporter           = ViewporterState::new::<State>(&dh);
-    let _fractional           = FractionalScaleManagerState::new::<State>(&dh);
+    let _data_device = DataDeviceState::new::<State>(&dh);
+    let _xdg_decoration = XdgDecorationState::new::<State>(&dh);
+    let _viewporter = ViewporterState::new::<State>(&dh);
+    let _fractional = FractionalScaleManagerState::new::<State>(&dh);
     // clk_id 1 = CLOCK_MONOTONIC.
-    let _presentation         = PresentationState::new::<State>(&dh, 1);
-    let _text_input           = TextInputManagerState::new::<State>(&dh);
-    let _primary_sel          = PrimarySelectionState::new::<State>(&dh);
-    let _cursor_shape         = CursorShapeManagerState::new::<State>(&dh);
-    let _pointer_constraints  = PointerConstraintsState::new::<State>(&dh);
-    let _relative_pointer     = RelativePointerManagerState::new::<State>(&dh);
-    let _idle_inhibit         = IdleInhibitManagerState::new::<State>(&dh);
-    let _kb_inhibit           = KeyboardShortcutsInhibitState::new::<State>(&dh);
-    let _tablet               = TabletManagerState::new::<State>(&dh);
-    let mut seat_state   = SeatState::<State>::new();
-    let mut seat         = seat_state.new_wl_seat(&dh, "veil-seat");
+    let _presentation = PresentationState::new::<State>(&dh, 1);
+    let _text_input = TextInputManagerState::new::<State>(&dh);
+    let _primary_sel = PrimarySelectionState::new::<State>(&dh);
+    let _cursor_shape = CursorShapeManagerState::new::<State>(&dh);
+    let _pointer_constraints = PointerConstraintsState::new::<State>(&dh);
+    let _relative_pointer = RelativePointerManagerState::new::<State>(&dh);
+    let _idle_inhibit = IdleInhibitManagerState::new::<State>(&dh);
+    let _kb_inhibit = KeyboardShortcutsInhibitState::new::<State>(&dh);
+    let _tablet = TabletManagerState::new::<State>(&dh);
+    let mut seat_state = SeatState::<State>::new();
+    let mut seat = seat_state.new_wl_seat(&dh, "veil-seat");
     let keyboard = seat
         .add_keyboard(XkbConfig::default(), 200, 16)
         .map_err(|e| io::Error::other(format!("keyboard: {e}")))?;
     let pointer = seat.add_pointer();
 
-    let output = Output::new("veil-host-0".into(), PhysicalProperties {
-        size: (0, 0).into(),
-        subpixel: Subpixel::Unknown,
-        make:  "veil".into(),
-        model: "host".into(),
-    });
+    let output = Output::new(
+        "veil-host-0".into(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "veil".into(),
+            model: "host".into(),
+        },
+    );
     let mode = OutputMode {
-        size:    (width as i32, height as i32).into(),
+        size: (width as i32, height as i32).into(),
         refresh: 60_000,
     };
-    output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
+    );
     output.set_preferred(mode);
     let _output_global = output.create_global::<State>(&dh);
 
@@ -3287,33 +3913,56 @@ pub fn run(
         let mut last = String::new();
         loop {
             std::thread::sleep(Duration::from_millis(1000));
-            if let Ok((mut reader, _)) = get_contents(ClipboardType::Regular, PasteSeat::Unspecified, MimeType::Text) {
+            if let Ok((mut reader, _)) = get_contents(
+                ClipboardType::Regular,
+                PasteSeat::Unspecified,
+                MimeType::Text,
+            ) {
                 let mut text = String::new();
                 if reader.read_to_string(&mut text).is_ok() && !text.is_empty() && text != last {
                     last = text.clone();
-                    if clipboard_tx.send(text).is_err() { break; }
+                    if clipboard_tx.send(text).is_err() {
+                        break;
+                    }
                 }
             }
         }
     });
 
     let config_path = veil_config::config_path();
-    let config_mtime = config_path.as_ref()
+    let config_mtime = config_path
+        .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())
         .and_then(|m| m.modified().ok());
 
     let state = State {
-        compositor_state, xdg_shell_state, shm_state, seat_state,
-        xdg_activation, output_manager,
-        dmabuf_state, _dmabuf_global,
-        gpu:                  None, // stood up lazily by gpu_lazy() on first non-linear commit
+        compositor_state,
+        xdg_shell_state,
+        shm_state,
+        seat_state,
+        xdg_activation,
+        output_manager,
+        dmabuf_state,
+        _dmabuf_global,
+        gpu: None, // stood up lazily by gpu_lazy() on first non-linear commit
         gpu_available,
         syncobj_state,
         _data_device,
-        _xdg_decoration, _viewporter, _fractional, _presentation,
-        _text_input, _primary_sel, _cursor_shape,
-        _pointer_constraints, _relative_pointer, _idle_inhibit, _kb_inhibit, _tablet,
-        seat, keyboard, pointer,
+        _xdg_decoration,
+        _viewporter,
+        _fractional,
+        _presentation,
+        _text_input,
+        _primary_sel,
+        _cursor_shape,
+        _pointer_constraints,
+        _relative_pointer,
+        _idle_inhibit,
+        _kb_inhibit,
+        _tablet,
+        seat,
+        keyboard,
+        pointer,
         output,
         // Startup guess — one monitor, sized to the terminal cell estimate
         // or CLI -w/-h. Rebuilt to match reality shortly after by
@@ -3333,25 +3982,29 @@ pub fn run(
         bar,
         // No anchor client to spawn into (`veil-host start`) → open straight
         // to the launcher instead of an empty screen with no hint of what to press.
-        launcher: if spawn.is_none() { Some(Launcher::new()) } else { None },
+        launcher: if spawn.is_none() {
+            Some(Launcher::new())
+        } else {
+            None
+        },
         power_menu: None,
         socket_name: socket_name.to_string(),
-        popups:           PopupManager::default(),
-        surface_buffers:  HashMap::new(),
+        popups: PopupManager::default(),
+        surface_buffers: HashMap::new(),
         sync_wait_broken: std::collections::HashSet::new(),
-        cursor_status:    CursorImageStatus::default_named(),
-        focus_cache:      None,
-        dirty:            false,
+        cursor_status: CursorImageStatus::default_named(),
+        focus_cache: None,
+        dirty: false,
         frame_tx,
         serial_counter: 0,
-        frame_serial:   0,
-        running:        true,
-        stop:           stop.clone(),
-        start_time:     Instant::now(),
-        display_handle:       dh.clone(),
-        host_clipboard:       None,
+        frame_serial: 0,
+        running: true,
+        stop: stop.clone(),
+        start_time: Instant::now(),
+        display_handle: dh.clone(),
+        host_clipboard: None,
         clipboard_rx,
-        pending_copy_out:     false,
+        pending_copy_out: false,
         client_has_selection: false,
         config_path,
         config_mtime,
@@ -3363,8 +4016,8 @@ pub fn run(
     let mut data = LoopData { state, display };
 
     // ── Calloop event loop ────────────────────────────────────────────────────
-    let mut event_loop: EventLoop<'static, LoopData> = EventLoop::try_new()
-        .map_err(|e| io::Error::other(format!("event_loop: {e}")))?;
+    let mut event_loop: EventLoop<'static, LoopData> =
+        EventLoop::try_new().map_err(|e| io::Error::other(format!("event_loop: {e}")))?;
     let handle = event_loop.handle();
     // Grabbed so the stop checks below can actually end `event_loop.run()` —
     // `calloop::EventLoop::run` only returns once this is told to stop; the
@@ -3376,27 +4029,40 @@ pub fn run(
     let listener_source = ListeningSocketSource::with_name(socket_name)
         .map_err(|e| io::Error::other(format!("bind {socket_name}: {e}")))?;
     let bound_name = listener_source.socket_name().to_os_string();
-    handle.insert_source(listener_source, |stream, _, data| {
-        let _ = data.display.handle()
-            .insert_client(stream, Arc::new(ClientState::default()));
-    }).map_err(|e| io::Error::other(format!("insert listener: {e}")))?;
+    handle
+        .insert_source(listener_source, |stream, _, data| {
+            let _ = data
+                .display
+                .handle()
+                .insert_client(stream, Arc::new(ClientState::default()));
+        })
+        .map_err(|e| io::Error::other(format!("insert listener: {e}")))?;
     tracing::info!("listening on WAYLAND_DISPLAY={:?}", bound_name);
 
     // 2. Wayland display fd → dispatch protocol messages.
     let wl_fd = data.display.backend().poll_fd().as_raw_fd();
     let wl_src = Generic::new(
-        unsafe { FdWrapper::new(wl_fd) }, Interest::READ, CMode::Level,
+        unsafe { FdWrapper::new(wl_fd) },
+        Interest::READ,
+        CMode::Level,
     );
-    handle.insert_source(wl_src, |_, _, data| {
-        data.display.dispatch_clients(&mut data.state)
-            .map_err(|e| { tracing::error!("dispatch: {e}"); e })?;
-        Ok(PostAction::Continue)
-    }).map_err(|e| io::Error::other(format!("insert display: {e}")))?;
+    handle
+        .insert_source(wl_src, |_, _, data| {
+            data.display
+                .dispatch_clients(&mut data.state)
+                .map_err(|e| {
+                    tracing::error!("dispatch: {e}");
+                    e
+                })?;
+            Ok(PostAction::Continue)
+        })
+        .map_err(|e| io::Error::other(format!("insert display: {e}")))?;
 
     // 3. XWayland — spawn it and listen for the Ready event so we can set
     //    DISPLAY for any X11 children we later spawn. Failure is non-fatal:
     //    if Xwayland isn't installed, we just lose X11 compat.
-    let xwayland_display: Arc<std::sync::Mutex<Option<u32>>> = Arc::new(std::sync::Mutex::new(None));
+    let xwayland_display: Arc<std::sync::Mutex<Option<u32>>> =
+        Arc::new(std::sync::Mutex::new(None));
     match XWayland::spawn(
         &data.display.handle(),
         None,
@@ -3413,28 +4079,37 @@ pub fn run(
             // works regardless, and degrades safely if Ready somehow fired
             // more than once (it shouldn't).
             let mut x_client = Some(x_client);
-            handle.insert_source(xwayland, move |event, _, data| {
-                match event {
-                    XWaylandEvent::Ready { x11_socket, display_number } => {
+            handle
+                .insert_source(xwayland, move |event, _, data| match event {
+                    XWaylandEvent::Ready {
+                        x11_socket,
+                        display_number,
+                    } => {
                         tracing::info!("XWayland ready on DISPLAY=:{display_number}");
                         *xd.lock().unwrap() = Some(display_number);
                         std::env::set_var("DISPLAY", format!(":{display_number}"));
                         match x_client.take() {
-                            Some(client) => match X11Wm::start_wm(wm_handle.clone(), x11_socket, client) {
-                                Ok(wm) => {
-                                    tracing::info!("X11 window manager started");
-                                    data.state.xwm = Some(wm);
+                            Some(client) => {
+                                match X11Wm::start_wm(wm_handle.clone(), x11_socket, client) {
+                                    Ok(wm) => {
+                                        tracing::info!("X11 window manager started");
+                                        data.state.xwm = Some(wm);
+                                    }
+                                    Err(e) => tracing::error!(
+                                        "X11Wm::start_wm failed: {e} — X11 apps will not work"
+                                    ),
                                 }
-                                Err(e) => tracing::error!("X11Wm::start_wm failed: {e} — X11 apps will not work"),
-                            },
-                            None => tracing::warn!("XWaylandEvent::Ready fired more than once — ignoring"),
+                            }
+                            None => tracing::warn!(
+                                "XWaylandEvent::Ready fired more than once — ignoring"
+                            ),
                         }
                     }
                     XWaylandEvent::Error => {
                         tracing::error!("XWayland startup failed");
                     }
-                }
-            }).map_err(|e| io::Error::other(format!("insert xwayland: {e}")))?;
+                })
+                .map_err(|e| io::Error::other(format!("insert xwayland: {e}")))?;
         }
         Err(e) => tracing::warn!("XWayland unavailable: {e} — X11 apps will not work"),
     }
@@ -3446,147 +4121,177 @@ pub fn run(
     let loop_signal_t = loop_signal.clone();
     let tick = Timer::immediate();
     let tick_trace = std::env::var("VEIL_TICK_TRACE").is_ok();
-    if tick_trace { eprintln!("[veil-tick] VEIL_TICK_TRACE on — phase timing every 120th tick (~1s)"); }
+    if tick_trace {
+        eprintln!("[veil-tick] VEIL_TICK_TRACE on — phase timing every 120th tick (~1s)");
+    }
     let mut tick_n: u32 = 0;
-    handle.insert_source(tick, move |_, _, data| {
-        let t_start = tick_trace.then(std::time::Instant::now);
-        // Prune toplevels that the client has destroyed. If any closed, retile
-        // the survivors and move keyboard focus onto one of them.
-        let before = data.state.toplevels.len();
-        data.state.toplevels.retain(|t| t.alive());
-        if data.state.toplevels.len() != before {
-            relayout(&mut data.state);
-            refocus_keyboard(&mut data.state);
-        }
-        // If the fullscreen window was among those just pruned, don't leave
-        // `fullscreen` pointing at a dead surface — relayout() already
-        // treats a not-found fullscreen surface as "nothing fullscreen", so
-        // this is tidiness (no stale handle retained), not a correctness
-        // fix. Every monitor has its own slot to check now.
-        for m in data.state.monitors.iter_mut() {
-            if let Some(wl) = &m.fullscreen {
-                if !data.state.toplevels.iter().any(|t| t.wl_surface().as_ref() == Some(wl)) {
-                    m.fullscreen = None;
+    handle
+        .insert_source(tick, move |_, _, data| {
+            let t_start = tick_trace.then(std::time::Instant::now);
+            // Prune toplevels that the client has destroyed. If any closed, retile
+            // the survivors and move keyboard focus onto one of them.
+            let before = data.state.toplevels.len();
+            data.state.toplevels.retain(|t| t.alive());
+            if data.state.toplevels.len() != before {
+                relayout(&mut data.state);
+                refocus_keyboard(&mut data.state);
+            }
+            // If the fullscreen window was among those just pruned, don't leave
+            // `fullscreen` pointing at a dead surface — relayout() already
+            // treats a not-found fullscreen surface as "nothing fullscreen", so
+            // this is tidiness (no stale handle retained), not a correctness
+            // fix. Every monitor has its own slot to check now.
+            for m in data.state.monitors.iter_mut() {
+                if let Some(wl) = &m.fullscreen {
+                    if !data
+                        .state
+                        .toplevels
+                        .iter()
+                        .any(|t| t.wl_surface().as_ref() == Some(wl))
+                    {
+                        m.fullscreen = None;
+                    }
                 }
             }
-        }
 
-        // Same backstop for floating (override-redirect) windows — normally
-        // removed explicitly via unmapped_window/destroyed_window, this just
-        // catches anything that slipped through without one firing.
-        let before = data.state.floating.len();
-        data.state.floating.retain(|f| f.alive());
-        if data.state.floating.len() != before {
-            mark_dirty_full(&mut data.state);
-        }
+            // Same backstop for floating (override-redirect) windows — normally
+            // removed explicitly via unmapped_window/destroyed_window, this just
+            // catches anything that slipped through without one firing.
+            let before = data.state.floating.len();
+            data.state.floating.retain(|f| f.alive());
+            if data.state.floating.len() != before {
+                mark_dirty_full(&mut data.state);
+            }
 
-        // Drain input cmds.
-        let t_pre_input = tick_trace.then(std::time::Instant::now);
-        while let Ok(cmd) = input_rx.try_recv() {
-            apply_input(&mut data.state, cmd);
-        }
-        let t_post_input = tick_trace.then(std::time::Instant::now);
+            // Drain input cmds.
+            let t_pre_input = tick_trace.then(std::time::Instant::now);
+            while let Ok(cmd) = input_rx.try_recv() {
+                apply_input(&mut data.state, cmd);
+            }
+            let t_post_input = tick_trace.then(std::time::Instant::now);
 
-        // Copy-out: hosted client set clipboard → push to host compositor.
-        // Deferred one tick because Smithay updates seat_data after new_selection returns.
-        if data.state.pending_copy_out {
-            data.state.pending_copy_out = false;
-            let seat = data.state.seat.clone();
-            for &mime in &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"] {
-                let mut fds = [-1i32; 2];
-                let ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) == 0 };
-                if !ok { break; }
-                let read_fd  = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-                let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-                if request_data_device_client_selection::<State>(&seat, mime.to_string(), write_fd).is_ok() {
-                    std::thread::spawn(move || {
-                        use std::io::Read;
-                        let mut f: std::fs::File = read_fd.into();
-                        let mut buf = Vec::new();
-                        if f.read_to_end(&mut buf).is_err() || buf.is_empty() { return; }
-                        let _ = wl_clipboard_rs::copy::Options::new().copy(
-                            wl_clipboard_rs::copy::Source::Bytes(buf.into_boxed_slice()),
-                            wl_clipboard_rs::copy::MimeType::Text,
+            // Copy-out: hosted client set clipboard → push to host compositor.
+            // Deferred one tick because Smithay updates seat_data after new_selection returns.
+            if data.state.pending_copy_out {
+                data.state.pending_copy_out = false;
+                let seat = data.state.seat.clone();
+                for &mime in &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"] {
+                    let mut fds = [-1i32; 2];
+                    let ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) == 0 };
+                    if !ok {
+                        break;
+                    }
+                    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+                    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+                    if request_data_device_client_selection::<State>(
+                        &seat,
+                        mime.to_string(),
+                        write_fd,
+                    )
+                    .is_ok()
+                    {
+                        std::thread::spawn(move || {
+                            use std::io::Read;
+                            let mut f: std::fs::File = read_fd.into();
+                            let mut buf = Vec::new();
+                            if f.read_to_end(&mut buf).is_err() || buf.is_empty() {
+                                return;
+                            }
+                            let _ = wl_clipboard_rs::copy::Options::new().copy(
+                                wl_clipboard_rs::copy::Source::Bytes(buf.into_boxed_slice()),
+                                wl_clipboard_rs::copy::MimeType::Text,
+                            );
+                        });
+                        break;
+                    }
+                    // read_fd closes here if request failed; write_fd was consumed by the call
+                }
+            }
+
+            // Paste-in: host clipboard changed → offer it to the hosted client.
+            // Only when the client has no active selection of its own.
+            if !data.state.client_has_selection {
+                let mut latest: Option<String> = None;
+                while let Ok(text) = data.state.clipboard_rx.try_recv() {
+                    latest = Some(text);
+                }
+                if let Some(text) = latest {
+                    if data.state.host_clipboard.as_deref() != Some(&text) {
+                        data.state.host_clipboard = Some(text);
+                        let dh = data.display.handle();
+                        let seat = data.state.seat.clone();
+                        set_data_device_selection::<State>(
+                            &dh,
+                            &seat,
+                            vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
+                            (),
                         );
-                    });
-                    break;
-                }
-                // read_fd closes here if request failed; write_fd was consumed by the call
-            }
-        }
-
-        // Paste-in: host clipboard changed → offer it to the hosted client.
-        // Only when the client has no active selection of its own.
-        if !data.state.client_has_selection {
-            let mut latest: Option<String> = None;
-            while let Ok(text) = data.state.clipboard_rx.try_recv() { latest = Some(text); }
-            if let Some(text) = latest {
-                if data.state.host_clipboard.as_deref() != Some(&text) {
-                    data.state.host_clipboard = Some(text);
-                    let dh = data.display.handle();
-                    let seat = data.state.seat.clone();
-                    set_data_device_selection::<State>(
-                        &dh, &seat,
-                        vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
-                        (),
-                    );
+                    }
                 }
             }
-        }
 
-        // Auto-reload config if config.lua was created or modified on disk (checked every 1s).
-        let now = Instant::now();
-        if now.duration_since(data.state.last_config_check) >= Duration::from_secs(1) {
-            data.state.last_config_check = now;
-            let current_path = veil_config::config_path();
-            let current_mtime = current_path.as_ref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .and_then(|m| m.modified().ok());
+            // Auto-reload config if config.lua was created or modified on disk (checked every 1s).
+            let now = Instant::now();
+            if now.duration_since(data.state.last_config_check) >= Duration::from_secs(1) {
+                data.state.last_config_check = now;
+                let current_path = veil_config::config_path();
+                let current_mtime = current_path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .and_then(|m| m.modified().ok());
 
-            if current_path != data.state.config_path || current_mtime != data.state.config_mtime {
-                reload_config(&mut data.state);
-            }
-        }
-
-        // Composite all dirty surfaces into one RGBA frame and ship it.
-        // Frame callbacks are fired inside composite_and_send after the frame is sent.
-        let t_pre_composite = tick_trace.then(std::time::Instant::now);
-        let was_dirty = data.state.dirty;
-        composite_and_send(&mut data.state);
-        let t_post_composite = tick_trace.then(std::time::Instant::now);
-
-        // Flush outgoing wayland messages.
-        let _ = data.display.flush_clients();
-        let t_end = tick_trace.then(std::time::Instant::now);
-
-        if tick_trace {
-            tick_n = tick_n.wrapping_add(1);
-            if tick_n.is_multiple_of(120) {
-                if let (Some(s), Some(pi), Some(pai), Some(pc), Some(poc), Some(e))
-                    = (t_start, t_pre_input, t_post_input, t_pre_composite, t_post_composite, t_end)
+                if current_path != data.state.config_path
+                    || current_mtime != data.state.config_mtime
                 {
-                    eprintln!(
-                        "[veil-tick] total={:.2}ms  prelude={:.2}ms input={:.2}ms \
-                         pre_composite_misc={:.2}ms composite={:.2}ms(dirty={}) flush={:.2}ms",
-                        (e - s).as_secs_f64() * 1000.0,
-                        (pi - s).as_secs_f64() * 1000.0,
-                        (pai - pi).as_secs_f64() * 1000.0,
-                        (pc - pai).as_secs_f64() * 1000.0,
-                        (poc - pc).as_secs_f64() * 1000.0,
-                        was_dirty,
-                        (e - poc).as_secs_f64() * 1000.0,
-                    );
+                    reload_config(&mut data.state);
                 }
             }
-        }
 
-        if stop_t.load(Ordering::Relaxed) || !data.state.running {
-            loop_signal_t.stop();
-            TimeoutAction::Drop
-        } else {
-            TimeoutAction::ToDuration(Duration::from_millis(8))
-        }
-    }).map_err(|e| io::Error::other(format!("insert tick: {e}")))?;
+            // Composite all dirty surfaces into one RGBA frame and ship it.
+            // Frame callbacks are fired inside composite_and_send after the frame is sent.
+            let t_pre_composite = tick_trace.then(std::time::Instant::now);
+            let was_dirty = data.state.dirty;
+            composite_and_send(&mut data.state);
+            let t_post_composite = tick_trace.then(std::time::Instant::now);
+
+            // Flush outgoing wayland messages.
+            let _ = data.display.flush_clients();
+            let t_end = tick_trace.then(std::time::Instant::now);
+
+            if tick_trace {
+                tick_n = tick_n.wrapping_add(1);
+                if tick_n.is_multiple_of(120) {
+                    if let (Some(s), Some(pi), Some(pai), Some(pc), Some(poc), Some(e)) = (
+                        t_start,
+                        t_pre_input,
+                        t_post_input,
+                        t_pre_composite,
+                        t_post_composite,
+                        t_end,
+                    ) {
+                        eprintln!(
+                            "[veil-tick] total={:.2}ms  prelude={:.2}ms input={:.2}ms \
+                         pre_composite_misc={:.2}ms composite={:.2}ms(dirty={}) flush={:.2}ms",
+                            (e - s).as_secs_f64() * 1000.0,
+                            (pi - s).as_secs_f64() * 1000.0,
+                            (pai - pi).as_secs_f64() * 1000.0,
+                            (pc - pai).as_secs_f64() * 1000.0,
+                            (poc - pc).as_secs_f64() * 1000.0,
+                            was_dirty,
+                            (e - poc).as_secs_f64() * 1000.0,
+                        );
+                    }
+                }
+            }
+
+            if stop_t.load(Ordering::Relaxed) || !data.state.running {
+                loop_signal_t.stop();
+                TimeoutAction::Drop
+            } else {
+                TimeoutAction::ToDuration(Duration::from_millis(8))
+            }
+        })
+        .map_err(|e| io::Error::other(format!("insert tick: {e}")))?;
 
     // 5. Spawn the hosted client after the socket is live.
     if let Some(argv) = spawn {
@@ -3609,11 +4314,9 @@ pub fn run(
                     // firefox`-and-wait model; doesn't anymore now that Alt+D
                     // makes this a persistent session. Only HOME/Ctrl-C
                     // should ever stop veil now.
-                    std::thread::spawn(move || {
-                        match child.wait() {
-                            Ok(s)  => tracing::info!("anchor client exited: {s} (veil keeps running)"),
-                            Err(e) => tracing::error!("anchor client wait: {e}"),
-                        }
+                    std::thread::spawn(move || match child.wait() {
+                        Ok(s) => tracing::info!("anchor client exited: {s} (veil keeps running)"),
+                        Err(e) => tracing::error!("anchor client wait: {e}"),
                     });
                 }
                 Err(e) => tracing::error!("spawn {:?} failed: {e}", argv),
@@ -3622,14 +4325,16 @@ pub fn run(
     }
 
     // ── Drive the loop ────────────────────────────────────────────────────────
-    event_loop.run(Some(Duration::from_millis(16)), &mut data, |data| {
-        // Post-dispatch hook: flush again to push anything generated during dispatch.
-        let _ = data.display.flush_clients();
-        if stop.load(Ordering::Relaxed) || !data.state.running {
-            data.state.running = false;
-            loop_signal.stop();
-        }
-    }).map_err(|e| io::Error::other(format!("run: {e}")))?;
+    event_loop
+        .run(Some(Duration::from_millis(16)), &mut data, |data| {
+            // Post-dispatch hook: flush again to push anything generated during dispatch.
+            let _ = data.display.flush_clients();
+            if stop.load(Ordering::Relaxed) || !data.state.running {
+                data.state.running = false;
+                loop_signal.stop();
+            }
+        })
+        .map_err(|e| io::Error::other(format!("run: {e}")))?;
 
     // Belt-and-suspenders: every intentional shutdown path (HOME, Ctrl-C)
     // already calls this directly, and crashes go through the panic

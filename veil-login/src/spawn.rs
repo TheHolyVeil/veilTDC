@@ -121,7 +121,11 @@ pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
     let gid = user.primary_group_id();
     let home = user.home_dir().to_path_buf();
     let shell = user.shell().to_path_buf();
-    let shell = if shell.as_os_str().is_empty() { "/bin/sh".into() } else { shell };
+    let shell = if shell.as_os_str().is_empty() {
+        "/bin/sh".into()
+    } else {
+        shell
+    };
 
     // Debug breadcrumb trail — opened up front so it brackets the *entire*
     // post-auth path, not just the fork/exec handoff. Temporary: goes away
@@ -211,15 +215,17 @@ pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
     // user@.service) and then our gkr-pam auto_start line (forks + unlocks the
     // keyring daemon). The eprintln breadcrumbs bracket it in the *journal*
     // (persistent) rather than the /tmp trace file, which a reboot wipes.
-    eprintln!("[velogin] opening PAM session (seat0/vt{} + keyring)…", vtnr.unwrap_or(0));
+    eprintln!(
+        "[velogin] opening PAM session (seat0/vt{} + keyring)…",
+        vtnr.unwrap_or(0)
+    );
     let session = ctx.open_session(Flag::NONE)?;
     eprintln!("[velogin] PAM session opened, proceeding to fork/exec");
     dbg(dbg_fd, "open_session done\n");
 
     // ── prepare EVERYTHING the child needs before forking ──────────────────
     // (no allocation between fork and exec)
-    let mut env: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
-        std::collections::BTreeMap::new();
+    let mut env: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = std::collections::BTreeMap::new();
     for (k, v) in session.envlist().iter_tuples() {
         env.insert(k.as_bytes().to_vec(), v.as_bytes().to_vec());
     }
@@ -301,11 +307,9 @@ pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
             CString::new(format!("exec {}", entry.exec))?,
         ]
     };
-    let mut argv_ptrs: Vec<*const libc::c_char> =
-        argv.iter().map(|a| a.as_ptr()).collect();
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
-    let mut envp_ptrs: Vec<*const libc::c_char> =
-        envp.iter().map(|e| e.as_ptr()).collect();
+    let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
     envp_ptrs.push(std::ptr::null());
 
     let user_c = CString::new(username)?;
@@ -332,21 +336,19 @@ pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
     let mut groups: Vec<libc::gid_t> = vec![0; 32];
     let mut ngroups: libc::c_int = groups.len() as libc::c_int;
     loop {
-        let rc = unsafe {
-            libc::getgrouplist(
-                user_c.as_ptr(),
-                gid,
-                groups.as_mut_ptr(),
-                &mut ngroups,
-            )
-        };
+        let rc =
+            unsafe { libc::getgrouplist(user_c.as_ptr(), gid, groups.as_mut_ptr(), &mut ngroups) };
         if rc >= 0 {
             groups.truncate(ngroups as usize);
             break;
         }
         // buffer too small — ngroups now holds the required size (always > 0
         // per POSIX, but guard against a bogus non-positive value defensively).
-        let required = if ngroups > 0 { ngroups as usize } else { groups.len() };
+        let required = if ngroups > 0 {
+            ngroups as usize
+        } else {
+            groups.len()
+        };
         groups.resize(required.max(groups.len() * 2), 0);
     }
     dbg(dbg_fd, "getgrouplist: done\n");
@@ -387,7 +389,14 @@ pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
                 }
                 dbg(dbg_fd, "[child] priv drop done\n");
                 let cd = libc::chdir(home_c.as_ptr());
-                dbg(dbg_fd, if cd == 0 { "[child] chdir done\n" } else { "[child] chdir FAILED\n" });
+                dbg(
+                    dbg_fd,
+                    if cd == 0 {
+                        "[child] chdir done\n"
+                    } else {
+                        "[child] chdir FAILED\n"
+                    },
+                );
                 dbg(dbg_fd, "[child] about to execve\n");
                 libc::execve(shell_c.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
                 dbg(dbg_fd, "[child] execve RETURNED (failed)\n");

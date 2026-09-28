@@ -23,11 +23,11 @@ use std::time::Duration;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use veil_config::detect_quality;
 use veil_host::input_backend::{self, InputCtx, InputGeometry};
 use veil_host::{Host, HostConfig};
-use veil_config::detect_quality;
 
-const VERSION: &str  = env!("CARGO_PKG_VERSION");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Persistent debug-log path (NOT /tmp — that's tmpfs and is wiped by the
 /// reboot after a hard lock, taking the crash evidence with it).
@@ -82,7 +82,9 @@ fn print_help() {
     println!("  veil-host run -a dolphin          # add to a running instance (any VT)");
     println!("  veil-host run -d -m halfblock firefox");
     println!("  veil-host run --stats nautilus");
-    println!("  veil-host run -O -s wayland-veil-2 weston-terminal   # second, unregistered instance");
+    println!(
+        "  veil-host run -O -s wayland-veil-2 weston-terminal   # second, unregistered instance"
+    );
     println!("  veil-host start                    # empty desktop, launcher open, pick an app");
     println!("  veil-host stop                     # stop the running default instance");
     println!("  veil-host probe");
@@ -99,47 +101,90 @@ fn main() -> std::io::Result<()> {
     let subcmd = raw_args.next().unwrap_or_default();
 
     match subcmd.as_str() {
-        ""                  => { print_help(); return Ok(()); }
-        "-v" | "--version"  => { println!("veil-host {VERSION}"); return Ok(()); }
-        "--help"            => { print_help(); return Ok(()); }
-        "probe"             => return cmd_probe(),
-        "list-modes"        => { cmd_list_modes(); return Ok(()); }
-        "stop"              => return cmd_stop(),
-        "run" | "start"     => {}
-        _                   => { eprintln!("unknown subcommand: {subcmd:?}"); eprintln!("run 'veil-host --help' for usage"); std::process::exit(2); }
+        "" => {
+            print_help();
+            return Ok(());
+        }
+        "-v" | "--version" => {
+            println!("veil-host {VERSION}");
+            return Ok(());
+        }
+        "--help" => {
+            print_help();
+            return Ok(());
+        }
+        "probe" => return cmd_probe(),
+        "list-modes" => {
+            cmd_list_modes();
+            return Ok(());
+        }
+        "stop" => return cmd_stop(),
+        "run" | "start" => {}
+        _ => {
+            eprintln!("unknown subcommand: {subcmd:?}");
+            eprintln!("run 'veil-host --help' for usage");
+            std::process::exit(2);
+        }
     }
     let is_start = subcmd == "start";
 
     // ── `run` / `start` subcommand ───────────────────────────────────────────
-    let mut cfg        = HostConfig::default();
-    let mut debug      = false;
+    let mut cfg = HostConfig::default();
+    let mut debug = false;
     let mut spawn: Vec<String> = Vec::new();
     let mut explicit_size = false;
     let mut explicit_socket = false;
-    let mut append     = false;
+    let mut append = false;
     let mut override_lock = false;
 
     while let Some(a) = raw_args.next() {
-        if !spawn.is_empty() { spawn.push(a); continue; }
+        if !spawn.is_empty() {
+            spawn.push(a);
+            continue;
+        }
         match a.as_str() {
-            "--help"          => { print_help(); return Ok(()); }
-            "-a" | "--append" => { append = true; }
-            "-d" | "--debug"  => { debug = true; cfg.wayland_debug = true; }
-            "-O" | "--override" => { override_lock = true; }
-            "-w" | "--width"  => {
-                cfg.width = raw_args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.width);
+            "--help" => {
+                print_help();
+                return Ok(());
+            }
+            "-a" | "--append" => {
+                append = true;
+            }
+            "-d" | "--debug" => {
+                debug = true;
+                cfg.wayland_debug = true;
+            }
+            "-O" | "--override" => {
+                override_lock = true;
+            }
+            "-w" | "--width" => {
+                cfg.width = raw_args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(cfg.width);
                 explicit_size = true;
             }
             "-h" | "--height" => {
-                cfg.height = raw_args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.height);
+                cfg.height = raw_args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(cfg.height);
                 explicit_size = true;
             }
             "-s" | "--socket" => {
-                cfg.socket_name = raw_args.next().unwrap_or_else(|| { eprintln!("--socket requires a value"); std::process::exit(2); });
+                cfg.socket_name = raw_args.next().unwrap_or_else(|| {
+                    eprintln!("--socket requires a value");
+                    std::process::exit(2);
+                });
                 explicit_socket = true;
             }
-            other if other.starts_with('-') => { eprintln!("unknown flag: {other}\nrun 'veil-host --help' for usage"); std::process::exit(2); }
-            cmd => { spawn.push(cmd.to_string()); }
+            other if other.starts_with('-') => {
+                eprintln!("unknown flag: {other}\nrun 'veil-host --help' for usage");
+                std::process::exit(2);
+            }
+            cmd => {
+                spawn.push(cmd.to_string());
+            }
         }
     }
     if is_start {
@@ -214,12 +259,16 @@ fn main() -> std::io::Result<()> {
     // (e.g. after the signal handler already ran) is harmless.
     struct ShutdownGuard;
     impl Drop for ShutdownGuard {
-        fn drop(&mut self) { veil_host::vt::emergency_restore(); }
+        fn drop(&mut self) {
+            veil_host::vt::emergency_restore();
+        }
     }
     let _shutdown_guard = ShutdownGuard;
 
     // ── Debug mode: redirect stderr into the persistent log so it doesn't corrupt output.
-    if debug { init_debug_log()?; }
+    if debug {
+        init_debug_log()?;
+    }
     init_tracing(debug);
 
     // Size compositor to match actual terminal pixel area unless user gave explicit dims.
@@ -227,10 +276,10 @@ fn main() -> std::io::Result<()> {
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     if !explicit_size {
         if let Some((pw, ph)) = term_pixel_size() {
-            cfg.width  = pw;
+            cfg.width = pw;
             cfg.height = ph;
         } else {
-            cfg.width  = term_cols as u32 * 8;
+            cfg.width = term_cols as u32 * 8;
             cfg.height = term_rows as u32 * 16;
         }
     }
@@ -245,7 +294,7 @@ fn main() -> std::io::Result<()> {
     // Shared geometry for pointer mapping — updated on resize events.
     let (init_cols, init_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let geom = InputGeometry::new(init_cols, init_rows, comp_w, comp_h);
-    let host   = Host::spawn(cfg)?;
+    let host = Host::spawn(cfg)?;
 
     // ── SIGINT handler: if ctrl-c slips past raw mode (eg. via `kill -INT`
     //    from another shell), still tear down cleanly.
@@ -267,10 +316,10 @@ fn main() -> std::io::Result<()> {
     {
         let backend = input_backend::detect();
         let ctx = InputCtx {
-            tx:        host.input_sender(),
-            running:   running.clone(),
+            tx: host.input_sender(),
+            running: running.clone(),
             host_stop: host.stop_flag(),
-            geom:      geom.clone(),
+            geom: geom.clone(),
         };
         std::thread::spawn(move || backend.run(ctx));
     }
@@ -279,7 +328,10 @@ fn main() -> std::io::Result<()> {
     let mut output = veil_host::output::detect(vcfg.output, vcfg.gpu_render)?;
     let n_monitors = output.monitor_count();
     let sizes: Vec<(u32, u32)> = (0..n_monitors).map(|i| output.get_size(i)).collect();
-    eprintln!("[veil-host] output backend initialized: {} display(s) detected: {:?}", n_monitors, sizes);
+    eprintln!(
+        "[veil-host] output backend initialized: {} display(s) detected: {:?}",
+        n_monitors, sizes
+    );
 
     // Compositor started against a startup guess (terminal cell size, or
     // nothing DRM-specific yet — see `comp_w`/`comp_h` above); now that
@@ -295,14 +347,14 @@ fn main() -> std::io::Result<()> {
     let total_h: u32 = sizes.iter().map(|(_, h)| *h).max().unwrap_or(0);
     geom.comp_w.store(total_w, Ordering::Relaxed);
     geom.comp_h.store(total_h, Ordering::Relaxed);
-    let _ = host.input_sender().send(
-        veil_host::InputCmd::SetMonitors { sizes },
-    );
+    let _ = host
+        .input_sender()
+        .send(veil_host::InputCmd::SetMonitors { sizes });
     eprintln!("[veil-host] retargeting compositor: {n_monitors} monitor(s), virtual space {total_w}x{total_h}");
 
     // ── frame loop ────────────────────────────────────────────────────────────
     let mut fps_frame_count = 0u32;
-    let mut fps_last        = std::time::Instant::now();
+    let mut fps_last = std::time::Instant::now();
 
     // Track last-known terminal size so we can notify the output backend on change.
     let mut last_term_cols = init_cols;
@@ -403,7 +455,10 @@ fn main() -> std::io::Result<()> {
             if let Some(frame) = slot.take() {
                 output.render_frame(id, &frame.rgba, frame.width, frame.height, frame.damage)?;
                 rendered_any = true;
-                if id == 0 { logged_w = frame.width; logged_h = frame.height; }
+                if id == 0 {
+                    logged_w = frame.width;
+                    logged_h = frame.height;
+                }
             }
         }
 
@@ -414,7 +469,10 @@ fn main() -> std::io::Result<()> {
         let elapsed = fps_last.elapsed();
         if elapsed.as_secs_f32() >= 1.0 {
             let fps = fps_frame_count as f32 / elapsed.as_secs_f32();
-            eprintln!("[veil-host] fps: {:.0}  compositor: {}x{}px", fps, logged_w, logged_h);
+            eprintln!(
+                "[veil-host] fps: {:.0}  compositor: {}x{}px",
+                fps, logged_w, logged_h
+            );
             fps_frame_count = 0;
             fps_last = std::time::Instant::now();
         }
@@ -463,10 +521,13 @@ fn attach(socket: &str, argv: &[String]) -> std::io::Result<()> {
         });
     }
 
-    let child = cmd.spawn().map_err(|e| {
-        std::io::Error::new(e.kind(), format!("spawn {:?}: {e}", argv[0]))
-    })?;
-    println!("[veil-host] attached {argv:?} (pid {}) → {socket}", child.id());
+    let child = cmd
+        .spawn()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("spawn {:?}: {e}", argv[0])))?;
+    println!(
+        "[veil-host] attached {argv:?} (pid {}) → {socket}",
+        child.id()
+    );
     Ok(())
 }
 
@@ -497,10 +558,26 @@ fn cmd_list_modes() {
     println!();
 
     let modes = [
-        ("kitty",      "Kitty Graphics Protocol — native pixel images, best quality",        "$TERM=xterm-kitty or WezTerm"),
-        ("halfblock",  "Unicode ▀ half-blocks with 24-bit truecolor, 2× vertical res",      "$COLORTERM=truecolor or 24bit"),
-        ("ascii",      "Luma-mapped ASCII characters, works in any terminal",               "any"),
-        ("ascii-edge", "Luma with hysteresis edge-detection, sharper than ascii",           "any"),
+        (
+            "kitty",
+            "Kitty Graphics Protocol — native pixel images, best quality",
+            "$TERM=xterm-kitty or WezTerm",
+        ),
+        (
+            "halfblock",
+            "Unicode ▀ half-blocks with 24-bit truecolor, 2× vertical res",
+            "$COLORTERM=truecolor or 24bit",
+        ),
+        (
+            "ascii",
+            "Luma-mapped ASCII characters, works in any terminal",
+            "any",
+        ),
+        (
+            "ascii-edge",
+            "Luma with hysteresis edge-detection, sharper than ascii",
+            "any",
+        ),
     ];
 
     for (name, desc, req) in &modes {
@@ -523,19 +600,24 @@ fn cmd_probe() -> std::io::Result<()> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let pixel_dims = term_pixel_size();
     let (comp_w, comp_h) = pixel_dims.unwrap_or((cols as u32 * 8, rows as u32 * 16));
-    let pixel_source = if pixel_dims.is_some() { "TIOCGWINSZ" } else { "cols×8, rows×16 (estimate)" };
+    let pixel_source = if pixel_dims.is_some() {
+        "TIOCGWINSZ"
+    } else {
+        "cols×8, rows×16 (estimate)"
+    };
 
-    let term      = std::env::var("TERM").unwrap_or_else(|_| "unknown".into());
+    let term = std::env::var("TERM").unwrap_or_else(|_| "unknown".into());
     let colorterm = std::env::var("COLORTERM").unwrap_or_else(|_| "unset".into());
-    let wayland   = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "unset".into());
-    let display   = std::env::var("DISPLAY").unwrap_or_else(|_| "unset".into());
+    let wayland = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "unset".into());
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| "unset".into());
 
     let cfg_path = config_path();
-    let vcfg = cfg_path.as_ref()
+    let vcfg = cfg_path
+        .as_ref()
         .map(|p| veil_config::load(p))
         .unwrap_or_default();
 
-    let detected   = detect_quality();
+    let detected = detect_quality();
     let ssh_mode = std::env::var("SSH_CLIENT").is_ok() || std::env::var("SSH_TTY").is_ok();
     let compositor_mode = wayland != "unset" || display != "unset";
 
@@ -545,12 +627,12 @@ fn cmd_probe() -> std::io::Result<()> {
     // you the truth about what `run` will actually pick.
     let veil_output_env = std::env::var("VEIL_OUTPUT").ok();
     let predicted_backend: &str = match veil_output_env.as_deref() {
-        Some("drm") | Some("kms")       => "DRM/KMS (VEIL_OUTPUT forces it)",
+        Some("drm") | Some("kms") => "DRM/KMS (VEIL_OUTPUT forces it)",
         Some("terminal") | Some("term") => "terminal (VEIL_OUTPUT forces it)",
-        _ if compositor_mode             => "terminal (nested compositor detected)",
+        _ if compositor_mode => "terminal (nested compositor detected)",
         _ => match vcfg.output {
             veil_config::OutputPref::Terminal => "terminal (config.lua output=terminal)",
-            veil_config::OutputPref::Drm      => "DRM/KMS (config.lua output=drm, forced)",
+            veil_config::OutputPref::Drm => "DRM/KMS (config.lua output=drm, forced)",
             veil_config::OutputPref::Auto if ssh_mode => "terminal (SSH session)",
             veil_config::OutputPref::Auto => "DRM/KMS (if available), else terminal",
         },
@@ -563,15 +645,38 @@ fn cmd_probe() -> std::io::Result<()> {
     println!("detected quality: {detected:?}");
     println!("config quality  : {:?}", vcfg.quality);
     println!("fps             : {}", vcfg.fps);
-    println!("gpu_render      : {}", if vcfg.gpu_render { "on (default)" } else { "off" });
+    println!(
+        "gpu_render      : {}",
+        if vcfg.gpu_render {
+            "on (default)"
+        } else {
+            "off"
+        }
+    );
     println!("config output   : {:?}", vcfg.output);
     println!("config mod_key  : {}", vcfg.keybinds.mod_key.label());
-    println!("config bg color : #{:02x}{:02x}{:02x}", vcfg.background[0], vcfg.background[1], vcfg.background[2]);
+    println!(
+        "config bg color : #{:02x}{:02x}{:02x}",
+        vcfg.background[0], vcfg.background[1], vcfg.background[2]
+    );
     println!("config theme    : {}", vcfg.theme_name.label());
-    println!("config file     : {}", cfg_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (using defaults)".into()));
+    println!(
+        "config file     : {}",
+        cfg_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "none (using defaults)".into())
+    );
     println!("WAYLAND_DISPLAY : {wayland}");
     println!("DISPLAY         : {display}");
-    println!("SSH_CLIENT      : {}", if ssh_mode { "yes (using terminal output)" } else { "no" });
+    println!(
+        "SSH_CLIENT      : {}",
+        if ssh_mode {
+            "yes (using terminal output)"
+        } else {
+            "no"
+        }
+    );
     println!("output backend  : {predicted_backend}");
     println!("socket (default): wayland-veil-0");
     Ok(())
@@ -586,7 +691,10 @@ fn cmd_stop() -> std::io::Result<()> {
         std::process::exit(1);
     };
 
-    eprintln!("[veil-host] stopping pid {} (socket {:?})...", info.pid, info.socket_name);
+    eprintln!(
+        "[veil-host] stopping pid {} (socket {:?})...",
+        info.pid, info.socket_name
+    );
     if unsafe { libc::kill(info.pid, libc::SIGTERM) } != 0 {
         let e = std::io::Error::last_os_error();
         eprintln!("[veil-host] failed to signal pid {}: {e}", info.pid);
@@ -617,7 +725,9 @@ fn ctrlc_set<F: FnMut() + Send + 'static>(f: F) -> std::io::Result<()> {
 
     extern "C" fn handler(_sig: libc::c_int) {
         if let Ok(mut g) = HOOK.lock() {
-            if let Some(cb) = g.as_mut() { cb(); }
+            if let Some(cb) = g.as_mut() {
+                cb();
+            }
         }
     }
 
@@ -626,8 +736,9 @@ fn ctrlc_set<F: FnMut() + Send + 'static>(f: F) -> std::io::Result<()> {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = handler as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
-        if libc::sigaction(libc::SIGINT,  &sa, std::ptr::null_mut()) < 0
-        || libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) < 0 {
+        if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) < 0
+            || libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) < 0
+        {
             return Err(std::io::Error::last_os_error());
         }
     }
@@ -659,9 +770,10 @@ fn init_tracing(debug: bool) {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let filter = std::env::var("VEIL_LOG")
-            .ok()
-            .or_else(|| if debug { Some("debug".into()) } else { None });
+        let filter =
+            std::env::var("VEIL_LOG")
+                .ok()
+                .or_else(|| if debug { Some("debug".into()) } else { None });
         if let Some(f) = filter {
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -673,4 +785,3 @@ fn init_tracing(debug: bool) {
         }
     });
 }
-

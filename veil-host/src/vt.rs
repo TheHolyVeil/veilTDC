@@ -67,9 +67,7 @@ impl VtGuard {
     /// (e.g. SSH) where `KDSETMODE` returns ENOTTY — caller should treat that
     /// as "not a real VT" and avoid DRM.
     pub fn acquire() -> io::Result<Self> {
-        let raw = unsafe {
-            libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
-        };
+        let raw = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -116,10 +114,14 @@ pub fn emergency_restore() {
         }
     }
     if let Some(path) = SOCKET_PATH.get() {
-        unsafe { libc::unlink(path.as_ptr()); }
+        unsafe {
+            libc::unlink(path.as_ptr());
+        }
     }
     if let Some(path) = LOCK_PATH.get() {
-        unsafe { libc::unlink(path.as_ptr()); }
+        unsafe {
+            libc::unlink(path.as_ptr());
+        }
     }
 }
 
@@ -140,7 +142,13 @@ pub fn install_handlers() {
 
         // Hard crashes that bypass Drop: restore, reset to default disposition,
         // re-raise so we still get the real fault/coredump.
-        for sig in [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+        for sig in [
+            libc::SIGSEGV,
+            libc::SIGABRT,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGFPE,
+        ] {
             unsafe {
                 let mut sa: libc::sigaction = std::mem::zeroed();
                 sa.sa_sigaction = fatal_handler as *const () as usize;

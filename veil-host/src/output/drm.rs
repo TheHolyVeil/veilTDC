@@ -54,21 +54,21 @@ struct Monitor {
     /// Index into `DrmOutput::cards` — which physical GPU node this
     /// monitor's CRTC lives on.
     card_idx: usize,
-    crtc:     crtc::Handle,
-    conn:     connector::Handle,
-    mode:     Mode,
-    width:    u32,
-    height:   u32,
-    bufs:     [DumbBuffer; 2],
-    fbs:      [framebuffer::Handle; 2],
+    crtc: crtc::Handle,
+    conn: connector::Handle,
+    mode: Mode,
+    width: u32,
+    height: u32,
+    bufs: [DumbBuffer; 2],
+    fbs: [framebuffer::Handle; 2],
     /// Raw CPU-mapped pointers for `bufs[0]`/`bufs[1]`, established ONCE at
     /// setup via [`map_persistent`] and kept mapped for the monitor's whole
     /// lifetime — see that function for why. `map_len` is the mapped byte
     /// length, identical for both slots since they're the same dimensions.
     map_ptrs: [*mut u8; 2],
-    map_len:  usize,
+    map_len: usize,
     /// Index of the buffer we'll render into next (not currently scanned out).
-    back:     usize,
+    back: usize,
     /// Damage not yet applied to buffer `[i]`, accumulated since that
     /// buffer's last write. See the equivalent field in the original
     /// single-monitor design — same buffer-age reasoning, just now one copy
@@ -102,8 +102,8 @@ pub(crate) fn list_cards() -> Vec<String> {
 }
 
 pub struct DrmOutput {
-    seat:     Seat,
-    cards:    Vec<Card>,
+    seat: Seat,
+    cards: Vec<Card>,
     monitors: Vec<Monitor>,
     /// VT held in graphics mode. Declared LAST so it drops last: our `Drop`
     /// destroys buffers, then `cards` drop (releasing DRM-master), then this
@@ -114,11 +114,11 @@ pub struct DrmOutput {
     /// blit / page_flip) and flip outcome counts (ok / EBUSY / error /
     /// "skipped, still pending") every 60 `render_frame` calls, plus every
     /// real page_flip error immediately. Zero cost when unset.
-    trace:   bool,
+    trace: bool,
     trace_n: u32,
-    flip_ok:      u32,
-    flip_ebusy:   u32,
-    flip_err:     u32,
+    flip_ok: u32,
+    flip_ebusy: u32,
+    flip_err: u32,
     flip_skipped: u32, // render_frame ran but flip_pending was still true
 }
 
@@ -183,7 +183,9 @@ impl DrmOutput {
                     for m in &card_monitors {
                         eprintln!(
                             "[veil-host] DRM:   {}x{}@{}Hz",
-                            m.width, m.height, m.mode.vrefresh()
+                            m.width,
+                            m.height,
+                            m.mode.vrefresh()
                         );
                     }
                     for m in &mut card_monitors {
@@ -201,17 +203,28 @@ impl DrmOutput {
 
         if monitors.is_empty() {
             // No card worked: `vt` drops here, restoring text mode.
-            return Err(last_err.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "no usable DRM card")
-            }));
+            return Err(last_err
+                .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no usable DRM card")));
         }
 
         let trace = std::env::var("VEIL_DRM_TRACE").is_ok();
-        if trace { eprintln!("[veil-drm] VEIL_DRM_TRACE on — timing + flip stats every 60th render_frame call"); }
+        if trace {
+            eprintln!(
+                "[veil-drm] VEIL_DRM_TRACE on — timing + flip stats every 60th render_frame call"
+            );
+        }
 
         Ok(Self {
-            seat, cards, monitors, _vt: vt,
-            trace, trace_n: 0, flip_ok: 0, flip_ebusy: 0, flip_err: 0, flip_skipped: 0,
+            seat,
+            cards,
+            monitors,
+            _vt: vt,
+            trace,
+            trace_n: 0,
+            flip_ok: 0,
+            flip_ebusy: 0,
+            flip_err: 0,
+            flip_skipped: 0,
         })
     }
 
@@ -236,7 +249,10 @@ impl DrmOutput {
             .collect();
 
         if connected.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "no connected display"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no connected display",
+            ));
         }
 
         // Track CRTCs already claimed by an earlier connector on this same
@@ -294,10 +310,18 @@ impl DrmOutput {
                 // the real cause of the slowdown.
                 let (p0, len0) = map_persistent(&card, &mut b0)?;
                 let (p1, len1) = map_persistent(&card, &mut b1)?;
-                debug_assert_eq!(len0, len1, "same-format double buffers must map to the same length");
+                debug_assert_eq!(
+                    len0, len1,
+                    "same-format double buffers must map to the same length"
+                );
                 // Initial mode-set scans out buffer 0; we render into buffer 1 first.
                 card.set_crtc(crtc, Some(f0), (0, 0), &[con.handle()], Some(mode))?;
-                let full = Rect { x: 0, y: 0, w: width, h: height };
+                let full = Rect {
+                    x: 0,
+                    y: 0,
+                    w: width,
+                    h: height,
+                };
                 Ok(Monitor {
                     card_idx: 0, // fixed up by the caller
                     crtc,
@@ -393,9 +417,19 @@ impl OutputBackend for DrmOutput {
         self.monitors.len()
     }
 
-    fn render_frame(&mut self, monitor: usize, rgba: &[u8], fw: u32, fh: u32, damage: Rect) -> io::Result<()> {
+    fn render_frame(
+        &mut self,
+        monitor: usize,
+        rgba: &[u8],
+        fw: u32,
+        fh: u32,
+        damage: Rect,
+    ) -> io::Result<()> {
         if monitor >= self.monitors.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "no such monitor"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no such monitor",
+            ));
         }
 
         // Accumulate into both buffer-age slots before anything else in this
@@ -435,7 +469,9 @@ impl OutputBackend for DrmOutput {
             self.monitors[monitor].needs_flip = false;
             match self.reassert_crtc(monitor) {
                 Ok(()) => self.monitors[monitor].was_active = true,
-                Err(e) => eprintln!("[veil-host] VT resume: re-modeset failed on monitor {monitor}, retrying: {e}"),
+                Err(e) => eprintln!(
+                    "[veil-host] VT resume: re-modeset failed on monitor {monitor}, retrying: {e}"
+                ),
             }
         } else {
             self.monitors[monitor].was_active = active_now;
@@ -466,14 +502,22 @@ impl OutputBackend for DrmOutput {
             // creation; nothing here touches the kernel at all.
             let ptr = self.monitors[monitor].map_ptrs[back];
             let len = self.monitors[monitor].map_len;
-            debug_assert!(!ptr.is_null(), "map_persistent should have failed setup, not left this null");
+            debug_assert!(
+                !ptr.is_null(),
+                "map_persistent should have failed setup, not left this null"
+            );
             let map: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
             blit_rgba_to_xrgb(map, pitch, width, height, rgba, fw, fh, y0, y1);
         }
         let t_blit1 = self.trace.then(std::time::Instant::now);
         // This slot now matches the source for everything in [y0, y1) — the
         // only rows it was behind on.
-        self.monitors[monitor].pending_damage[back] = Rect { x: 0, y: 0, w: 0, h: 0 };
+        self.monitors[monitor].pending_damage[back] = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
 
         if !self.monitors[monitor].flip_pending {
             let card = &self.cards[card_idx];
@@ -510,7 +554,9 @@ impl OutputBackend for DrmOutput {
         if self.trace {
             self.trace_n = self.trace_n.wrapping_add(1);
             if self.trace_n.is_multiple_of(60) {
-                if let (Some(d0), Some(d1), Some(b1), Some(f1)) = (t_drain0, t_drain1, t_blit1, t_flip1) {
+                if let (Some(d0), Some(d1), Some(b1), Some(f1)) =
+                    (t_drain0, t_drain1, t_blit1, t_flip1)
+                {
                     eprintln!(
                         "[veil-drm] drain={:.2}ms blit={:.2}ms flip_call={:.2}ms damage_rows={}  \
                          flip: ok={} ebusy={} err={} skipped_pending={}",
@@ -518,7 +564,10 @@ impl OutputBackend for DrmOutput {
                         (b1 - d1).as_secs_f64() * 1000.0,
                         (f1 - b1).as_secs_f64() * 1000.0,
                         y1.saturating_sub(y0),
-                        self.flip_ok, self.flip_ebusy, self.flip_err, self.flip_skipped,
+                        self.flip_ok,
+                        self.flip_ebusy,
+                        self.flip_err,
+                        self.flip_skipped,
                     );
                 }
             }
@@ -527,7 +576,9 @@ impl OutputBackend for DrmOutput {
     }
 
     fn get_size(&self, monitor: usize) -> (u32, u32) {
-        self.monitors.get(monitor).map_or((0, 0), |m| (m.width, m.height))
+        self.monitors
+            .get(monitor)
+            .map_or((0, 0), |m| (m.width, m.height))
     }
 
     fn on_vt_switch(&mut self, switch_in: bool) -> io::Result<()> {
@@ -553,7 +604,8 @@ impl OutputBackend for DrmOutput {
             return Ok(false);
         }
 
-        let mut pollfds: Vec<libc::pollfd> = self.cards
+        let mut pollfds: Vec<libc::pollfd> = self
+            .cards
             .iter()
             .map(|c| libc::pollfd {
                 fd: c.as_fd().as_raw_fd(),
@@ -563,7 +615,13 @@ impl OutputBackend for DrmOutput {
             .collect();
 
         let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms) };
+        let ret = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
 
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -674,10 +732,10 @@ fn blit_rgba_to_xrgb(
         for x in 0..copy_w {
             let s = x * 4;
             let d = x * 4;
-            drow[d]     = srow[s + 2]; // B
+            drow[d] = srow[s + 2]; // B
             drow[d + 1] = srow[s + 1]; // G
-            drow[d + 2] = srow[s];     // R
-            drow[d + 3] = 0;           // X
+            drow[d + 2] = srow[s]; // R
+            drow[d + 3] = 0; // X
         }
         // Letterbox to the right of the copied region.
         if copy_w < dw as usize {

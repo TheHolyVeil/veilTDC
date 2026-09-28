@@ -5,14 +5,14 @@
 //! - DrmOutput: Direct framebuffer via DRM/KMS on bare TTY — one independent
 //!   pipeline per connected display, see `monitor_count()`
 
-pub mod terminal;
 pub mod drm;
+pub mod terminal;
 
-use std::io;
 use crate::layout::Rect;
+use std::io;
 
-pub use terminal::TerminalOutput;
 pub use drm::DrmOutput;
+pub use terminal::TerminalOutput;
 
 /// Trait for output backends.
 ///
@@ -38,7 +38,14 @@ pub trait OutputBackend {
     /// use it; backends that can't (terminal cell encoding, today) are free
     /// to ignore it and redraw everything, same as before this parameter
     /// existed.
-    fn render_frame(&mut self, monitor: usize, rgba: &[u8], width: u32, height: u32, damage: Rect) -> io::Result<()>;
+    fn render_frame(
+        &mut self,
+        monitor: usize,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        damage: Rect,
+    ) -> io::Result<()>;
 
     /// Get one monitor's current output dimensions in pixels.
     fn get_size(&self, monitor: usize) -> (u32, u32);
@@ -93,7 +100,10 @@ fn is_bare_tty() -> bool {
         if name.is_null() {
             None
         } else {
-            std::ffi::CStr::from_ptr(name).to_str().ok().map(|s| s.to_string())
+            std::ffi::CStr::from_ptr(name)
+                .to_str()
+                .ok()
+                .map(|s| s.to_string())
         }
     };
     if let Some(name) = tty_name {
@@ -109,9 +119,12 @@ fn is_bare_tty() -> bool {
 /// `gpu_render` is config.lua's `gpu_render` flag, forwarded straight to
 /// `TerminalOutput::new` — it has no effect on `DrmOutput`, which doesn't
 /// use `veil-gpu` at all.
-pub fn detect(pref: veil_config::OutputPref, gpu_render: bool) -> io::Result<Box<dyn OutputBackend>> {
+pub fn detect(
+    pref: veil_config::OutputPref,
+    gpu_render: bool,
+) -> io::Result<Box<dyn OutputBackend>> {
     let force = match std::env::var("VEIL_OUTPUT").ok().as_deref() {
-        Some("drm") | Some("kms")  => Some(Force::Drm),
+        Some("drm") | Some("kms") => Some(Force::Drm),
         Some("terminal") | Some("term") => Some(Force::Terminal),
         _ => None,
     };

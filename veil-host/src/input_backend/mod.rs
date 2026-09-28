@@ -26,8 +26,8 @@ pub use evdev_input::EvdevInput;
 /// Terminal mode tracks both cell grid and pixel size (cells → pixels);
 /// evdev mode only cares about the pixel extent for cursor clamping.
 pub struct InputGeometry {
-    pub cols:   AtomicU16,
-    pub rows:   AtomicU16,
+    pub cols: AtomicU16,
+    pub rows: AtomicU16,
     pub comp_w: AtomicU32,
     pub comp_h: AtomicU32,
 }
@@ -35,8 +35,8 @@ pub struct InputGeometry {
 impl InputGeometry {
     pub fn new(cols: u16, rows: u16, comp_w: u32, comp_h: u32) -> Arc<Self> {
         Arc::new(Self {
-            cols:   AtomicU16::new(cols),
-            rows:   AtomicU16::new(rows),
+            cols: AtomicU16::new(cols),
+            rows: AtomicU16::new(rows),
             comp_w: AtomicU32::new(comp_w),
             comp_h: AtomicU32::new(comp_h),
         })
@@ -46,13 +46,13 @@ impl InputGeometry {
 /// Everything a backend needs to run its loop.
 pub struct InputCtx {
     /// Push translated events into the host compositor.
-    pub tx:        Sender<InputCmd>,
+    pub tx: Sender<InputCmd>,
     /// Cleared to request CLI shutdown (ctrl-c, device gone).
-    pub running:   Arc<AtomicBool>,
+    pub running: Arc<AtomicBool>,
     /// Mirror of `running` that also stops the compositor thread.
     pub host_stop: Arc<AtomicBool>,
     /// Live geometry for pointer mapping.
-    pub geom:      Arc<InputGeometry>,
+    pub geom: Arc<InputGeometry>,
 }
 
 /// A pluggable source of [`InputCmd`]s.
@@ -71,10 +71,10 @@ pub trait InputBackend: Send {
 /// readable) → evdev. Anything else → crossterm. evdev construction can
 /// fail (permissions, no devices); we fall back to crossterm in that case.
 pub fn detect() -> Box<dyn InputBackend> {
-    let ssh        = std::env::var("SSH_CLIENT").is_ok() || std::env::var("SSH_TTY").is_ok();
-    let wayland    = std::env::var("WAYLAND_DISPLAY").is_ok();
-    let x11        = std::env::var("DISPLAY").is_ok();
-    let bare_tty   = !ssh && !wayland && !x11;
+    let ssh = std::env::var("SSH_CLIENT").is_ok() || std::env::var("SSH_TTY").is_ok();
+    let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+    let x11 = std::env::var("DISPLAY").is_ok();
+    let bare_tty = !ssh && !wayland && !x11;
 
     if bare_tty {
         match EvdevInput::open() {

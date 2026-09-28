@@ -34,12 +34,20 @@ pub fn default_veil_exec() -> String {
 
 pub fn detect() -> Vec<SessionEntry> {
     let mut sessions = vec![
-        SessionEntry { name: "Veil".into(), exec: default_veil_exec() },
-        SessionEntry { name: "Shell".into(), exec: String::new() },
+        SessionEntry {
+            name: "Veil".into(),
+            exec: default_veil_exec(),
+        },
+        SessionEntry {
+            name: "Shell".into(),
+            exec: String::new(),
+        },
     ];
 
     for dir in ["/usr/share/wayland-sessions", "/usr/share/xsessions"] {
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "desktop") {
@@ -60,9 +68,14 @@ fn from_desktop_file(path: &Path) -> Option<SessionEntry> {
     let content = std::fs::read_to_string(path).ok()?;
     let raw_exec = ini_get(&content, "Desktop Entry", "Exec")?;
     let exec = clean_exec(&raw_exec);
-    if exec.is_empty() { return None; }
+    if exec.is_empty() {
+        return None;
+    }
     let name = ini_get(&content, "Desktop Entry", "Name").unwrap_or_else(|| {
-        path.file_stem().unwrap_or_default().to_string_lossy().into_owned()
+        path.file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
     });
     Some(SessionEntry { name, exec })
 }

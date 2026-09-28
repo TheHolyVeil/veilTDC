@@ -19,7 +19,6 @@ tracing            = { workspace = true }
 chrono             = { workspace = true }
 veil-render        = { path = "../veil-render" }
 veil-config        = { path = "../veil-config" }
-veil-gpu           = { path = "../veil-gpu" }
 crossterm          = { workspace = true }
 evdev              = { workspace = true }
 drm                = { workspace = true }
