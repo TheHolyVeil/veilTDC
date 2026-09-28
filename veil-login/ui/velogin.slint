@@ -106,16 +106,29 @@ component ThemedInput inherits Rectangle {
     }
 
     // masked view — little orbs standing in for each typed character
-    // (character-count is bound through a plain property first — using the
-    // builtin call directly as a repeater's model expression trips a rustc
-    // parenthesization bug in Slint 1.17's generated code.)
+    // (Deliberately NOT `for i in <int>` — Slint's codegen for repeaters
+    // whose model is an int wraps it as `<expr> as i32 .max(0) as usize`,
+    // and if <expr> already ends in a cast (character-count lowers to
+    // `graphemes(...).count() as i32`), that's "cast followed by a method
+    // call", which rustc rejects. Routing through an intermediate `property
+    // <int>` does NOT help — the compiler inlines a trivial single-use int
+    // property straight back into the repeater site, regenerating the same
+    // broken chain. Reproduced on both Slint 1.17 and 1.18.1, so this is a
+    // real upstream codegen bug in that path, not a version-drift fluke.
+    // Fix: repeat over a fixed literal array instead (a different, safe
+    // codegen path) and hide slots past the live length. 40 dots is far
+    // more than any real password needs, and the parent's clip:true already
+    // truncates anything longer, so nothing is lost.
     property <int> mask-len: root.text.character-count;
+    property <[int]> mask-slots: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,
+        20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39];
     if root.password && !root.reveal : Rectangle {
         x: root.icon != "" ? 38px : 16px;
         width: parent.width - (root.icon != "" ? 50px : 32px) - 42px - (root.caps-lock-on ? 65px : 0px);
         height: parent.height;
         clip: true;
-        for i in root.mask-len : Rectangle {
+        for slot[i] in root.mask-slots : Rectangle {
+            visible: i < root.mask-len;
             x: i * 14px;
             y: (parent.height - self.height) / 2;
             width: 8px;
