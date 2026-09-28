@@ -10,14 +10,57 @@
 //! the session through the user's shell as a login shell. The parent waits,
 //! closes the PAM session, and exits — systemd (Restart=always) respawns us.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use pam_client2::{conv_mock::Conversation, Context, Flag};
+use pam_client2::{conv_null, Context, ConversationHandler, ErrorCode, Flag};
 use uzers::os::unix::UserExt;
 
 use crate::session::SessionEntry;
+
+/// Conversation handler for the *visible* greeter stage (see [`verify`]).
+///
+/// Non-interactively supplies the given username/password like conv_mock
+/// did, but — unlike conv_mock, which is a scripted/headless handler that
+/// silently logs `text_info`/`error_msg` into a `log` field nobody reads —
+/// forwards those messages to a caller-supplied callback. This is what
+/// carries pam_u2f's `cue` prompt ("touch your security key") to the UI
+/// instead of it being swallowed, which was the root cause of auth just
+/// sitting there with no feedback.
+struct UiConversation<F: FnMut(String) + Send> {
+    username: CString,
+    password: CString,
+    on_message: F,
+}
+
+impl<F: FnMut(String) + Send> UiConversation<F> {
+    fn new(username: &str, password: &str, on_message: F) -> Self {
+        Self {
+            username: CString::new(username).unwrap_or_default(),
+            password: CString::new(password).unwrap_or_default(),
+            on_message,
+        }
+    }
+}
+
+impl<F: FnMut(String) + Send> ConversationHandler for UiConversation<F> {
+    fn prompt_echo_on(&mut self, _prompt: &CStr) -> Result<CString, ErrorCode> {
+        Ok(self.username.clone())
+    }
+
+    fn prompt_echo_off(&mut self, _prompt: &CStr) -> Result<CString, ErrorCode> {
+        Ok(self.password.clone())
+    }
+
+    fn text_info(&mut self, msg: &CStr) {
+        (self.on_message)(msg.to_string_lossy().into_owned());
+    }
+
+    fn error_msg(&mut self, msg: &CStr) {
+        (self.on_message)(msg.to_string_lossy().into_owned());
+    }
+}
 
 /// Session-group pid the parent is currently waiting on, so a SIGTERM (from
 /// `systemctl stop/restart`) can be forwarded instead of just killing us.
@@ -53,19 +96,25 @@ pub enum LaunchError {
 }
 
 /// Authenticate only — used by the UI thread to validate credentials before
-/// tearing down the greeter. Full session setup happens later in [`launch`].
-pub fn verify(username: &str, password: &str) -> Result<(), pam_client2::Error> {
-    let mut ctx = Context::new(
-        "velogin",
-        Some(username),
-        Conversation::with_credentials(username, password),
-    )?;
+/// tearing down the greeter. Full session setup happens later in [`launch`],
+/// which does *not* re-authenticate (see there for why).
+///
+/// `on_message` fires on this thread for every `text_info`/`error_msg` PAM
+/// emits mid-authenticate (e.g. pam_u2f's `cue`: "touch your security key")
+/// — the caller is expected to marshal it onto the UI thread.
+pub fn verify(
+    username: &str,
+    password: &str,
+    on_message: impl FnMut(String) + Send + 'static,
+) -> Result<(), pam_client2::Error> {
+    let conv = UiConversation::new(username, password, on_message);
+    let mut ctx = Context::new("velogin", Some(username), conv)?;
     ctx.authenticate(Flag::NONE)?;
     ctx.acct_mgmt(Flag::NONE)?;
     Ok(())
 }
 
-pub fn launch(username: &str, password: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
+pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
     let user = uzers::get_user_by_name(username)
         .ok_or_else(|| LaunchError::UnknownUser(username.to_string()))?;
     let uid = user.uid();
@@ -91,14 +140,19 @@ pub fn launch(username: &str, password: &str, entry: &SessionEntry) -> Result<()
         }
     }
 
-    let mut ctx = Context::new(
-        "velogin",
-        Some(username),
-        Conversation::with_credentials(username, password),
-    )?;
-    ctx.authenticate(Flag::NONE)?;
+    // Credentials were already verified once in `verify()`, on the UI
+    // thread, in the still-visible greeter. Calling `ctx.authenticate()`
+    // again here would re-run the whole PAM auth stack from scratch in this
+    // headless process — no window, no conversation UI — which for a
+    // pam_u2f stack means silently demanding a *second* physical touch of
+    // the security key with nothing on screen to say so. That's the
+    // "sits there" bug. This is pam-client2's own sanctioned pattern for
+    // "already authenticated by other means": conv_null + a preset
+    // username, skip authenticate(), go straight to acct_mgmt() +
+    // open_session().
+    let mut ctx = Context::new("velogin", Some(username), conv_null::Conversation::new())?;
     ctx.acct_mgmt(Flag::NONE)?;
-    dbg(dbg_fd, "authenticate+acct_mgmt done\n");
+    dbg(dbg_fd, "acct_mgmt done (no re-auth — see comment)\n");
 
     // Controlling TTY (systemd TTYPath=/dev/tty1) and its VT number. Computed
     // *before* open_session because pam_systemd needs the VT to register an
@@ -290,8 +344,10 @@ pub fn launch(username: &str, password: &str, entry: &SessionEntry) -> Result<()
             groups.truncate(ngroups as usize);
             break;
         }
-        // buffer too small — ngroups now holds the required size
-        groups.resize(ngroups.max(groups.len() as i32 * 2) as usize, 0);
+        // buffer too small — ngroups now holds the required size (always > 0
+        // per POSIX, but guard against a bogus non-positive value defensively).
+        let required = if ngroups > 0 { ngroups as usize } else { groups.len() };
+        groups.resize(required.max(groups.len() * 2), 0);
     }
     dbg(dbg_fd, "getgrouplist: done\n");
 

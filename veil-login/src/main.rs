@@ -148,6 +148,16 @@ fn main() {
     ui.on_reboot(|| power_action("reboot"));
     ui.on_switch_tty(move |tty_num| switch_vt(tty_num));
 
+    // Oh-shit key (Ctrl+Shift+\, bound in velogin.slint's killswitch
+    // FocusScope): bail exactly like closing the dev window — quit the event
+    // loop with no PENDING login set, so the post-run() teardown below (drop
+    // ui → release DRM/libseat, sleep, close_lingering_fds) runs and we exit
+    // without spawning a session.
+    ui.on_emergency_exit(|| {
+        eprintln!("[velogin] emergency exit (Ctrl+Shift+\\) — bailing out");
+        let _ = slint::quit_event_loop();
+    });
+
     {
         let weak = ui.as_weak();
         ui.on_vk_key(move |field, ch| {
@@ -194,6 +204,7 @@ fn main() {
             let Some(ui) = weak.upgrade() else { return };
             ui.set_busy(true);
             ui.set_error_msg("".into());
+            ui.set_status_msg("".into());
 
             let username = username.to_string();
             let password = password.to_string();
@@ -203,10 +214,19 @@ fn main() {
             let fail_count = fail_count.clone();
 
             std::thread::spawn(move || {
+                let status_weak = weak.clone();
                 let result = if dry_run {
                     Ok(())
                 } else {
-                    spawn::verify(&username, &password).map_err(|e| e.to_string())
+                    spawn::verify(&username, &password, move |msg| {
+                        let status_weak = status_weak.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = status_weak.upgrade() {
+                                ui.set_status_msg(msg.into());
+                            }
+                        });
+                    })
+                    .map_err(|e| e.to_string())
                 };
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = weak.upgrade() else { return };
@@ -311,10 +331,10 @@ fn reexec_into_session(username: &str, password: &str, entry: &session::SessionE
     while off < pw.len() {
         let n = unsafe { libc::write(wr, pw[off..].as_ptr() as *const _, pw.len() - off) };
         if n < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            let e = std::io::Error::last_os_error();
             unsafe { libc::close(wr); libc::close(rd); }
             return e;
         }
@@ -367,10 +387,10 @@ fn run_session_helper(argv: &[String]) {
     let exec = argv.get(4).cloned().unwrap_or_default();
     let rd: i32 = argv.get(5).and_then(|s| s.parse().ok()).unwrap_or(-1);
 
-    let password = read_pipe_password(rd);
+    read_pipe_password(rd); // drains and closes the pipe fd; password not re-used (no double-auth)
     let entry = session::SessionEntry { name, exec };
     eprintln!("[velogin:session] clean helper up, launching {username} into {:?}", entry.name);
-    match spawn::launch(&username, &password, &entry) {
+    match spawn::launch(&username, &entry) {
         Ok(()) => eprintln!("[velogin:session] session ended, exiting (systemd respawns greeter)"),
         Err(e) => {
             eprintln!("[velogin:session] launch failed: {e}");
@@ -492,17 +512,30 @@ fn switch_vt(n: i32) {
 /// forces an immediate socket EOF instead of trusting an async teardown that
 /// may never run before it matters.
 fn close_lingering_fds() {
-    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else { return };
-    // Collect first: closing fds while the directory itself is open under one
-    // of those fds would yank the listing out from under the iterator.
-    let fds: Vec<i32> = entries
-        .flatten()
-        .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
-        .collect();
-    for fd in fds {
-        if fd > 2 {
-            unsafe { libc::close(fd) };
+    // Use opendir/readdir/dirfd directly so we can exclude the directory's
+    // own fd from the close list.  The previous read_dir approach collected
+    // all fds and then closed them, but ReadDir closes its internal dirfd
+    // on drop (which happens after collect()) — so we'd double-close that
+    // fd number in the loop, potentially hitting a reused descriptor.
+    let dir = unsafe { libc::opendir(c"/proc/self/fd".as_ptr()) };
+    if dir.is_null() { return; }
+    let dir_fd = unsafe { libc::dirfd(dir) };
+    let mut fds = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() { break; }
+        let name = unsafe { (*entry).d_name.as_ptr() };
+        if let Ok(s) = unsafe { std::ffi::CStr::from_ptr(name) }.to_str() {
+            if let Ok(fd) = s.parse::<i32>() {
+                if fd > 2 && fd != dir_fd {
+                    fds.push(fd);
+                }
+            }
         }
+    }
+    unsafe { libc::closedir(dir) };
+    for fd in fds {
+        unsafe { libc::close(fd) };
     }
 }
 

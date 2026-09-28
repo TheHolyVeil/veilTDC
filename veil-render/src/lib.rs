@@ -86,31 +86,78 @@ pub fn render_chars(frame: &TermFrame) -> Vec<char> {
 
 // ── GUI path ──────────────────────────────────────────────────────────────────
 
-/// Compute per-cell luma via nearest-neighbour sampling + Rec.601 weights.
+/// Compute per-cell luma via box/area-average + Rec.601 weights, with
+/// text-cell detection.
 ///
-/// Previously this went through the `image` crate: `rgba.to_vec()` (a full
-/// source-frame clone, every frame), then `RgbaImage`, then a `DynamicImage`
-/// wrap, then a Triangle-filter `resize_exact` (a convolution over a support
-/// window — real work per output pixel), then `.to_luma8()` (yet another
-/// full-size intermediate buffer) before finally collecting into the `Vec<u8>`
-/// we actually wanted. None of that was necessary: we only need one sample
-/// per cell, exactly like `rgba_to_halfblocks` above already does for the
-/// halfblock path. This also now matches `luma.wgsl`'s GPU sampling exactly
-/// (nearest-neighbour, same 77/150/29 Rec.601 fixed-point weights), so output
-/// no longer depends on which path (GPU vs CPU) happened to render it.
+/// Samples every source texel in each cell's coverage rectangle — not a
+/// single nearest-neighbour point. Point sampling aliases badly on
+/// anti-aliased glyph edges: a single sample can land anywhere in a
+/// sub-pixel, producing random luma values for cells that ought to look
+/// similar. Box-averaging matches `luma.wgsl`'s GPU path exactly.
+///
+/// **Text-cell detection**: when the intra-cell pixel contrast (max−min
+/// luma) exceeds [`TEXT_CONTRAST_T`], the cell likely contains an ink
+/// glyph on a background. The ink-side luma is returned instead of the
+/// box average. The average smears anti-aliased glyphs to mid-gray
+/// (~128), which maps to mid-density `LUMA_MAP` characters regardless
+/// of the glyph's shape; the ink minimum (dark-on-light) or maximum
+/// (light-on-dark) pushes glyph cells to clearly dark or clearly bright
+/// values, letting `luma_to_chars` produce density chars that reflect
+/// actual ink presence. Adjacent glyph cells also become similarly
+/// extreme, collapsing intra-region cell-to-cell contrast and reducing
+/// false `|`/`-` edge detection inside text areas.
 pub fn compute_luma(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -> Vec<u8> {
+    /// Intra-cell contrast threshold for text-cell detection. 60/255 ≈ 23.5%
+    /// — tuned so anti-aliased glyphs (typically 40–80% contrast) trigger it
+    /// while smooth gradients and solid-colour regions don't.
+    const TEXT_CONTRAST_T: u8 = 60;
+
     let cols_u = (cols as u32).max(1);
     let rows_u = (rows as u32).max(1);
     let mut out = Vec::with_capacity(cols as usize * rows as usize);
+
     for row in 0..rows_u {
-        let px_y = row * src_h / rows_u;
+        let y0 = row * src_h / rows_u;
+        // Clamp to at least one row so upsampling (rows > src_h) degrades
+        // to a point sample rather than an empty loop.
+        let y1 = ((row + 1) * src_h / rows_u).max(y0 + 1).min(src_h);
         for col in 0..cols_u {
-            let px_x = col * src_w / cols_u;
-            let rgb = sample_rgb(rgba, src_w, px_x, px_y);
-            // Rec.601 luma, fixed-point weights summing to 256 — identical
-            // formula to luma.wgsl's `0.299/0.587/0.114` (just scaled).
-            let luma = (rgb[0] as u32 * 77 + rgb[1] as u32 * 150 + rgb[2] as u32 * 29) >> 8;
-            out.push(luma as u8);
+            let x0 = col * src_w / cols_u;
+            let x1 = ((col + 1) * src_w / cols_u).max(x0 + 1).min(src_w);
+
+            let mut sum:   u32 = 0;
+            let mut min_l: u8  = 255;
+            let mut max_l: u8  = 0;
+            let mut count: u32 = 0;
+
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    let rgb = sample_rgb(rgba, src_w, px, py);
+                    // Rec.601 weights (77+150+29 = 256); right-shift is a
+                    // fast divide-by-256, identical to luma.wgsl's floats.
+                    let l = ((rgb[0] as u32 * 77
+                            + rgb[1] as u32 * 150
+                            + rgb[2] as u32 * 29) >> 8) as u8;
+                    sum   += l as u32;
+                    if l < min_l { min_l = l; }
+                    if l > max_l { max_l = l; }
+                    count += 1;
+                }
+            }
+
+            let avg      = (sum / count) as u8;
+            let contrast = max_l.saturating_sub(min_l);
+
+            // Text-cell: return the ink-side luma.
+            //   Light background (avg > 128) → ink is the dark minimum.
+            //   Dark  background (avg ≤ 128) → ink is the bright maximum.
+            let luma = if contrast >= TEXT_CONTRAST_T {
+                if avg > 128 { min_l } else { max_l }
+            } else {
+                avg
+            };
+
+            out.push(luma);
         }
     }
     out

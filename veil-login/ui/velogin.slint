@@ -1,5 +1,3 @@
-// Abyss login manager — Slint UI.
-//
 // Palette (deep sage): bg #0b100c, accent #9db08a, secondary #b7c9a3.
 // Flow: clock screen → (click) → username → (enter) → password → login.
 // A remembered user skips straight from the clock to the password field.
@@ -204,6 +202,7 @@ export component LoginWindow inherits Window {
     in property <[string]> sessions: ["Veil"];
     in-out property <int> session-index: 0;
     in property <string> error-msg;
+    in property <string> status-msg: "";
     in property <bool> busy: false;
     in property <image> avatar;
     in property <bool> has-avatar: false;
@@ -225,6 +224,7 @@ export component LoginWindow inherits Window {
     callback login(string, string, int);       // username, password, session idx
     callback poweroff();
     callback reboot();
+    callback emergency-exit();                 // oh-shit key: Ctrl+Shift+\ — graceful bail
     callback switch-tty(int);                  // switch to a specific text VT (1..6)
     callback username-edited(string);          // live — reloads avatar
     callback vk-key(int, string);              // field (0=user,1=pass), char
@@ -275,6 +275,26 @@ export component LoginWindow inherits Window {
             pass-input.focus-input();
         }
     }
+
+    // ── oh-shit key ──────────────────────────────────────────────────────────
+    // Ctrl+Shift+\ from anywhere (username/password fields included) bails out
+    // of the greeter — quits the event loop exactly like closing the dev window
+    // or an unsuccessful session, which main.rs already tears down gracefully
+    // (drops the UI/DRM master, lets libseat disconnect, then exits with no
+    // PENDING login so no session is spawned). Wrapping all content in this
+    // FocusScope is what lets an unhandled combo bubble up here even while a
+    // TextInput has focus — see Slint's key event delivery/bubbling model.
+    killswitch := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.modifiers.control && event.modifiers.shift && event.text == "\\") {
+                root.emergency-exit();
+                accept
+            } else {
+                reject
+            }
+        }
 
     // ── background ──────────────────────────────────────────────────────────
     if root.has-wallpaper : Image {
@@ -651,7 +671,7 @@ export component LoginWindow inherits Window {
                     horizontal-alignment: center;
                     vertical-alignment: center;
                     text: root.cooldown-secs > 0 ? "try again in \{root.cooldown-secs}s"
-                        : root.busy ? "authenticating..." : "login";
+                        : root.busy ? (root.status-msg == "" ? "authenticating..." : root.status-msg) : "login";
                     color: #0b100c;
                     font-size: 16px;
                     font-family: "Syne";
@@ -1062,4 +1082,5 @@ export component LoginWindow inherits Window {
             }
         }
     }
+    } // killswitch FocusScope
 }

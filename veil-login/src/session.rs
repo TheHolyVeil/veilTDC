@@ -67,12 +67,25 @@ fn from_desktop_file(path: &Path) -> Option<SessionEntry> {
     Some(SessionEntry { name, exec })
 }
 
-/// Strip desktop-entry field codes (`%f`, `%F`, `%u`, `%U`, `%i`, `%c`, `%k`, `%%`).
+/// Strip desktop-entry field codes (`%f`, `%F`, `%u`, `%U`, `%i`, `%c`, `%k`, etc.)
+/// and decode `%%` → literal `%`.  Operates character-by-character so that
+/// mid-token codes (`--file=%f`) are caught and `%%` is not mistakenly dropped.
 fn clean_exec(exec: &str) -> String {
-    exec.split_whitespace()
-        .filter(|tok| !(tok.len() == 2 && tok.starts_with('%')))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = String::with_capacity(exec.len());
+    let mut chars = exec.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next() {
+                Some('%') => out.push('%'), // %% → literal %
+                Some(_) => {}               // any other %x field code → strip
+                None => {}                  // trailing lone % → strip
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    // Re-join tokens: stripping mid-token codes can leave multiple spaces.
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn ini_get(content: &str, section: &str, key: &str) -> Option<String> {
