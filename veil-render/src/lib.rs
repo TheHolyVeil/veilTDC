@@ -58,6 +58,181 @@ pub fn rgba_to_halfblocks(
     cells
 }
 
+/* ── Braille / quadrant sub-cell renderers ───────────────────────────────── */
+
+/// One terminal cell in braille/quadrant mode: `ch` drawn in `fg` over `bg`.
+#[derive(Clone, PartialEq)]
+pub struct BrailleCell {
+    pub ch: char,
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+}
+
+/// Quadrant-block codepoints indexed by a 4-bit mask, row-major:
+/// bit0 = upper-left, bit1 = upper-right, bit2 = lower-left, bit3 = lower-right.
+/// Geometric fills by definition — any covering font draws solid shapes.
+pub const QUAD_CP: [char; 16] = [
+    ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+];
+
+/// Braille dot bit for each row-major sub-pixel of a 2×4 cell.
+const BRAILLE_BIT: [u32; 8] = [0x01, 0x08, 0x02, 0x10, 0x04, 0x20, 0x40, 0x80];
+
+fn braille_glyph(mask: u32) -> char {
+    if mask == 0 {
+        return ' ';
+    }
+    let bits = (0..8)
+        .filter(|i| mask >> i & 1 == 1)
+        .fold(0u32, |acc, i| acc | BRAILLE_BIT[i as usize]);
+    char::from_u32(0x2800 + bits).unwrap_or(' ')
+}
+
+fn box_avg_rgb(rgba: &[u8], w: u32, h: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> [u8; 3] {
+    let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+    for y in y0..y1.min(h) {
+        for x in x0..x1.min(w) {
+            let p = sample_rgb(rgba, w, x, y);
+            r += p[0] as u32;
+            g += p[1] as u32;
+            b += p[2] as u32;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        [0, 0, 0]
+    } else {
+        [(r / n) as u8, (g / n) as u8, (b / n) as u8]
+    }
+}
+
+/// Rec.601 luma, same weights as `compute_luma` / `luma.wgsl`.
+fn rgb_luma(p: [u8; 3]) -> u32 {
+    (p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8
+}
+
+/// How a cell's sub-pixels are split into fg/bg.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum Threshold {
+    /// Cut at the cell's mean luma. Thin strokes on a mostly-flat background
+    /// can fall under the mean and vanish.
+    #[default]
+    Mean,
+    /// High-contrast cells (max−min ≥ 60, same bar as `compute_luma`'s
+    /// text-cell detection) cut at (min+max)/2 so strokes survive; flat
+    /// cells fall back to `Mean`.
+    MidRange,
+}
+
+/// Shared core: split each cell into `sub_w × sub_h` box-averaged sub-pixels,
+/// threshold them per `threshold` (brighter → fg, rest → bg),
+/// and let `glyph` turn the row-major bitmask into a character.
+fn rgba_to_subpixel_cells(
+    rgba: &[u8],
+    src_w: u32,
+    src_h: u32,
+    cols: u16,
+    rows: u16,
+    sub_w: u32,
+    sub_h: u32,
+    glyph: fn(u32) -> char,
+    threshold: Threshold,
+) -> Vec<BrailleCell> {
+    if cols == 0 || rows == 0 || src_w == 0 || src_h == 0 {
+        return Vec::new();
+    }
+    let (cols_u, rows_u) = (cols as u32, rows as u32);
+    let (eff_w, eff_h) = (cols_u * sub_w, rows_u * sub_h);
+    let n = (sub_w * sub_h) as usize;
+    let mut cells = Vec::with_capacity(cols as usize * rows as usize);
+    let mut subs = [[0u8; 3]; 8];
+
+    for row in 0..rows_u {
+        for col in 0..cols_u {
+            let mut luma_sum = 0u32;
+            let (mut min_l, mut max_l) = (u32::MAX, 0u32);
+            for sy in 0..sub_h {
+                for sx in 0..sub_w {
+                    let (gx, gy) = (col * sub_w + sx, row * sub_h + sy);
+                    let x0 = gx * src_w / eff_w;
+                    let y0 = gy * src_h / eff_h;
+                    let x1 = ((gx + 1) * src_w / eff_w).max(x0 + 1);
+                    let y1 = ((gy + 1) * src_h / eff_h).max(y0 + 1);
+                    let p = box_avg_rgb(rgba, src_w, src_h, x0, y0, x1, y1);
+                    subs[(sy * sub_w + sx) as usize] = p;
+                    let l = rgb_luma(p);
+                    luma_sum += l;
+                    min_l = min_l.min(l);
+                    max_l = max_l.max(l);
+                }
+            }
+            let mean = luma_sum / n as u32;
+            let cut = match threshold {
+                Threshold::MidRange if max_l - min_l >= 60 => (min_l + max_l) / 2,
+                _ => mean,
+            };
+
+            let (mut mask, mut fg_n, mut bg_n) = (0u32, 0u32, 0u32);
+            let (mut fg_s, mut bg_s) = ([0u32; 3], [0u32; 3]);
+            for (i, p) in subs[..n].iter().enumerate() {
+                let (sum, cnt) = if rgb_luma(*p) > cut {
+                    mask |= 1 << i;
+                    (&mut fg_s, &mut fg_n)
+                } else {
+                    (&mut bg_s, &mut bg_n)
+                };
+                for c in 0..3 {
+                    sum[c] += p[c] as u32;
+                }
+                *cnt += 1;
+            }
+            let avg = |s: [u32; 3], c: u32| [(s[0] / c) as u8, (s[1] / c) as u8, (s[2] / c) as u8];
+            // A uniform cell has one side empty — mirror the other so fg == bg.
+            let (fg, bg) = match (fg_n, bg_n) {
+                (0, _) => (avg(bg_s, bg_n), avg(bg_s, bg_n)),
+                (_, 0) => (avg(fg_s, fg_n), avg(fg_s, fg_n)),
+                _ => (avg(fg_s, fg_n), avg(bg_s, bg_n)),
+            };
+            cells.push(BrailleCell { ch: glyph(mask), fg, bg });
+        }
+    }
+    cells
+}
+
+/// 2×4 sub-pixels per cell via Unicode braille (U+2800 block).
+/// Kept for the preview example; renders as literal dots in Nerd Fonts, so
+/// not suitable as a shipping tier — see `rgba_to_quadrant`.
+pub fn rgba_to_braille(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -> Vec<BrailleCell> {
+    rgba_to_braille_with(rgba, src_w, src_h, cols, rows, Threshold::Mean)
+}
+
+pub fn rgba_to_braille_with(
+    rgba: &[u8],
+    src_w: u32,
+    src_h: u32,
+    cols: u16,
+    rows: u16,
+    threshold: Threshold,
+) -> Vec<BrailleCell> {
+    rgba_to_subpixel_cells(rgba, src_w, src_h, cols, rows, 2, 4, braille_glyph, threshold)
+}
+
+/// 2×2 sub-pixels per cell via quadrant blocks (U+2596 range).
+pub fn rgba_to_quadrant(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -> Vec<BrailleCell> {
+    rgba_to_quadrant_with(rgba, src_w, src_h, cols, rows, Threshold::Mean)
+}
+
+pub fn rgba_to_quadrant_with(
+    rgba: &[u8],
+    src_w: u32,
+    src_h: u32,
+    cols: u16,
+    rows: u16,
+    threshold: Threshold,
+) -> Vec<BrailleCell> {
+    rgba_to_subpixel_cells(rgba, src_w, src_h, cols, rows, 2, 2, |m| QUAD_CP[(m & 15) as usize], threshold)
+}
+
 const LUMA_MAP: &[char] = &[
     ' ', '.', '\'', '`', '^', '"', ',', ':', ';', 'I', 'l', '!', 'i', '>', '<', '~', '+', '_', '-',
     '?', ']', '[', '}', '{', '1', ')', '(', '|', '\\', '/', 't', 'f', 'j', 'r', 'x', 'n', 'u', 'v',
