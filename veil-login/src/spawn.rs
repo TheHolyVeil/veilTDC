@@ -128,16 +128,10 @@ pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
     };
 
     // Debug breadcrumb trail — opened up front so it brackets the *entire*
-    // post-auth path, not just the fork/exec handoff. Temporary: goes away
-    // once the hang between "PAM session opened" and the fork is actually
-    // root-caused instead of guessed at.
-    let dbg_fd = unsafe {
-        libc::open(
-            c"/tmp/velogin-fork-trace.log".as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
-            0o644,
-        )
-    };
+    // post-auth path, not just the fork/exec handoff. Kept deliberately for
+    // debugging hangs between "PAM session opened" and the fork. Lives in a
+    // root-only dir under /run (tmpfs: survives session restarts, not reboots).
+    let dbg_fd = open_trace();
     fn dbg(fd: i32, msg: &str) {
         if fd >= 0 {
             unsafe { libc::write(fd, msg.as_ptr() as *const _, msg.len()) };
@@ -432,5 +426,105 @@ pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
             drop(session); // close PAM session (pam_close_session)
             Ok(())
         }
+    }
+}
+
+/// Open `/run/velogin/fork-trace.log` for appending, or -1 (tracing off) if that
+/// can't be done safely. Debug aid for hangs on the post-auth path; the
+/// directory is root-only so the trace can't be tampered with or read by users.
+fn open_trace() -> i32 {
+    open_trace_at(c"/run/velogin", c"/run/velogin/fork-trace.log")
+}
+
+/// The directory is created 0700 and refused unless it is a real directory
+/// (not a symlink) owned by the effective user with no group/other access, so
+/// nobody else can plant a symlink or swap the file out. The file is opened
+/// `O_NOFOLLOW` at 0600, and `O_CLOEXEC` means the user's session never
+/// inherits the fd across `execve`.
+fn open_trace_at(dir: &std::ffi::CStr, file: &std::ffi::CStr) -> i32 {
+    unsafe {
+        // EEXIST is fine (earlier run, or pre-created by the admin).
+        libc::mkdir(dir.as_ptr(), 0o700);
+        let mut st: libc::stat = std::mem::zeroed();
+        let ok = libc::lstat(dir.as_ptr(), &mut st) == 0
+            && (st.st_mode & libc::S_IFMT) == libc::S_IFDIR
+            && st.st_uid == libc::geteuid()
+            && st.st_mode & 0o077 == 0;
+        if !ok {
+            return -1;
+        }
+        libc::open(
+            file.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_trace_at;
+    use std::ffi::CString;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("velogin-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+    fn c(p: &std::path::Path) -> CString {
+        CString::new(p.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn trace_creates_private_dir_and_file_with_cloexec() {
+        let dir = scratch("ok");
+        let file = dir.join("trace.log");
+        let fd = open_trace_at(&c(&dir), &c(&file));
+        assert!(fd >= 0, "should open");
+        let dm = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let fm = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dm, 0o700, "dir must be 0700");
+        assert_eq!(fm, 0o600, "file must be 0600");
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags & libc::FD_CLOEXEC != 0, "fd must be close-on-exec");
+        unsafe { libc::close(fd) };
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trace_refuses_group_or_world_accessible_dir() {
+        let dir = scratch("open-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(open_trace_at(&c(&dir), &c(&dir.join("t.log"))), -1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trace_refuses_symlinked_dir() {
+        let real = scratch("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = scratch("link");
+        symlink(&real, &link).unwrap();
+        assert_eq!(open_trace_at(&c(&link), &c(&link.join("t.log"))), -1);
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir_all(&real).unwrap();
+    }
+
+    #[test]
+    fn trace_does_not_follow_a_symlinked_file() {
+        let dir = scratch("symfile");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep me").unwrap();
+        let file = dir.join("trace.log");
+        symlink(&victim, &file).unwrap();
+        assert_eq!(open_trace_at(&c(&dir), &c(&file)), -1, "O_NOFOLLOW must reject it");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

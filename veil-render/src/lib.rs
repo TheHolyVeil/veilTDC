@@ -99,11 +99,9 @@ fn box_avg_rgb(rgba: &[u8], w: u32, h: u32, x0: u32, y0: u32, x1: u32, y1: u32) 
             n += 1;
         }
     }
-    if n == 0 {
-        [0, 0, 0]
-    } else {
-        [(r / n) as u8, (g / n) as u8, (b / n) as u8]
-    }
+    // checked_div: an empty region (clamped fully outside the image) averages to black.
+    let avg = |s: u32| s.checked_div(n).unwrap_or(0) as u8;
+    [avg(r), avg(g), avg(b)]
 }
 
 /// Rec.601 luma, same weights as `compute_luma` / `luma.wgsl`.
@@ -124,6 +122,22 @@ pub enum Threshold {
     MidRange,
 }
 
+/// Per-mode sub-pixel grid: how many sub-pixels each cell is split into, and
+/// how the resulting row-major bitmask maps to a character.
+#[derive(Clone, Copy)]
+struct SubpixelLayout {
+    sub_w: u32,
+    sub_h: u32,
+    glyph: fn(u32) -> char,
+}
+
+fn quadrant_glyph(mask: u32) -> char {
+    QUAD_CP[(mask & 15) as usize]
+}
+
+const BRAILLE_LAYOUT: SubpixelLayout = SubpixelLayout { sub_w: 2, sub_h: 4, glyph: braille_glyph };
+const QUADRANT_LAYOUT: SubpixelLayout = SubpixelLayout { sub_w: 2, sub_h: 2, glyph: quadrant_glyph };
+
 /// Shared core: split each cell into `sub_w × sub_h` box-averaged sub-pixels,
 /// threshold them per `threshold` (brighter → fg, rest → bg),
 /// and let `glyph` turn the row-major bitmask into a character.
@@ -133,11 +147,10 @@ fn rgba_to_subpixel_cells(
     src_h: u32,
     cols: u16,
     rows: u16,
-    sub_w: u32,
-    sub_h: u32,
-    glyph: fn(u32) -> char,
+    layout: SubpixelLayout,
     threshold: Threshold,
 ) -> Vec<BrailleCell> {
+    let SubpixelLayout { sub_w, sub_h, glyph } = layout;
     if cols == 0 || rows == 0 || src_w == 0 || src_h == 0 {
         return Vec::new();
     }
@@ -214,7 +227,7 @@ pub fn rgba_to_braille_with(
     rows: u16,
     threshold: Threshold,
 ) -> Vec<BrailleCell> {
-    rgba_to_subpixel_cells(rgba, src_w, src_h, cols, rows, 2, 4, braille_glyph, threshold)
+    rgba_to_subpixel_cells(rgba, src_w, src_h, cols, rows, BRAILLE_LAYOUT, threshold)
 }
 
 /// 2×2 sub-pixels per cell via quadrant blocks (U+2596 range).
@@ -230,7 +243,7 @@ pub fn rgba_to_quadrant_with(
     rows: u16,
     threshold: Threshold,
 ) -> Vec<BrailleCell> {
-    rgba_to_subpixel_cells(rgba, src_w, src_h, cols, rows, 2, 2, |m| QUAD_CP[(m & 15) as usize], threshold)
+    rgba_to_subpixel_cells(rgba, src_w, src_h, cols, rows, QUADRANT_LAYOUT, threshold)
 }
 
 const LUMA_MAP: &[char] = &[

@@ -357,12 +357,12 @@ fn reexec_into_session(
         libc::fcntl(rd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
     }
 
-    let exe = std::env::current_exe()
-        .or_else(|_| std::fs::read_link("/proc/self/exe"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("velogin"));
-    let Ok(exe_c) = CString::new(exe.as_os_str().as_bytes()) else {
-        return std::io::Error::new(std::io::ErrorKind::InvalidInput, "exe path has NUL");
-    };
+    // Exec via /proc/self/exe, NOT current_exe(): if a package upgrade replaced
+    // the binary while this greeter sat idle, current_exe() resolves to
+    // "/usr/local/bin/velogin (deleted)" and the execv below fails *after* a
+    // successful auth. /proc/self/exe re-execs the already-running inode no
+    // matter what happened to its path.
+    let exe_c = c"/proc/self/exe";
     // name/exec/user carried as argv (no secrets); a NUL in any is fatal but
     // can't occur for real session metadata.
     let args = [
@@ -384,6 +384,13 @@ fn reexec_into_session(
     ptrs.push(std::ptr::null());
 
     unsafe { libc::execv(exe_c.as_ptr(), ptrs.as_ptr()) };
+    // Only reached if that failed (/proc not mounted, which shouldn't happen
+    // under systemd): fall back to the on-disk path before giving up.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(path) = CString::new(exe.as_os_str().as_bytes()) {
+            unsafe { libc::execv(path.as_ptr(), ptrs.as_ptr()) };
+        }
+    }
     std::io::Error::last_os_error() // execv only returns on failure
 }
 
