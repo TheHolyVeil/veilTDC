@@ -208,7 +208,7 @@ pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
     // Session open runs pam_systemd (registers the logind session, spins up
     // user@.service) and then our gkr-pam auto_start line (forks + unlocks the
     // keyring daemon). The eprintln breadcrumbs bracket it in the *journal*
-    // (persistent) rather than the /tmp trace file, which a reboot wipes.
+    // (persistent) rather than the /run/velogin trace file, which a reboot wipes.
     eprintln!(
         "[velogin] opening PAM session (seat0/vt{} + keyring)…",
         vtnr.unwrap_or(0)

@@ -132,7 +132,7 @@ Flow:
 | Up/Down | Navigate session list |
 | Enter | Confirm (username → password → launch) |
 | Esc | Clear current field, go back |
-| Ctrl+C | Emergency exit to TTY |
+| Home | Emergency exit: quits the greeter without starting a session (systemd then restarts it) |
 
 ## Troubleshooting
 

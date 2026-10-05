@@ -70,6 +70,15 @@ pub trait OutputBackend {
     fn poll_events(&mut self, _timeout: std::time::Duration) -> io::Result<bool> {
         Ok(false)
     }
+
+    /// Service seat events (VT enable/disable acks, resume re-modeset) and any
+    /// VT-switch request relayed from the input thread. The main loop calls
+    /// this on EVERY iteration, not only when a frame arrives: an idle screen
+    /// produces no frames, and a Ctrl+Alt+Fn switch must still go through.
+    /// Default: no-op (only DrmOutput owns a seat).
+    fn service_seat(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(PartialEq)]

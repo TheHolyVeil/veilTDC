@@ -439,43 +439,13 @@ impl OutputBackend for DrmOutput {
             *p = p.union(&damage);
         }
 
-        // Service VT enable/disable. While suspended (another VT foreground)
-        // we must not touch any card. This is seat-wide, not per-monitor —
-        // dispatched once regardless of which monitor's render_frame call
-        // happens to trigger it first this tick.
-        let _ = self.seat.dispatch();
-
-        // A Ctrl+Alt+Fn chord caught by the (grabbed) evdev thread — relay it
-        // to libseat. Checked before the is_active early-return: this is how
-        // we switch AWAY, so it must fire even mid-transition. Only needs
-        // doing once per tick; harmless to repeat per-monitor since
-        // `take_pending_vt()` drains the flag on first call.
-        if let Some(vt) = crate::seat::take_pending_vt() {
-            if let Err(e) = self.seat.switch_session(vt) {
-                eprintln!("[veil-host] VT switch to {vt} failed: {e}");
-            }
-        }
-
+        // Service seat events and any pending Ctrl+Alt+Fn request. The main
+        // loop also does this on every iteration (`service_seat`), so an idle
+        // screen can still switch VTs; repeating it here is harmless — both
+        // calls are non-blocking and `take_pending_vt()` drains on first use.
+        self.pump_seat();
+        self.sync_active_state(monitor);
         let active_now = self.seat.is_active();
-        if active_now && !self.monitors[monitor].was_active {
-            // Coming back from a VT switch: whatever had the display in
-            // between left this CRTC in an unknown state, and any flip we
-            // had in flight before switching away is never going to
-            // complete — its fence belonged to the old CRTC config.
-            // Re-assert this monitor's mode before touching page_flip
-            // again, or it'll EINVAL and (since that error propagates out
-            // of the frame loop) take the whole compositor down with it.
-            self.monitors[monitor].flip_pending = false;
-            self.monitors[monitor].needs_flip = false;
-            match self.reassert_crtc(monitor) {
-                Ok(()) => self.monitors[monitor].was_active = true,
-                Err(e) => eprintln!(
-                    "[veil-host] VT resume: re-modeset failed on monitor {monitor}, retrying: {e}"
-                ),
-            }
-        } else {
-            self.monitors[monitor].was_active = active_now;
-        }
 
         if !active_now || !self.monitors[monitor].was_active {
             // Either suspended, or re-modeset still hasn't landed — don't
@@ -599,6 +569,14 @@ impl OutputBackend for DrmOutput {
         self.monitors.iter().any(|m| m.flip_pending)
     }
 
+    fn service_seat(&mut self) -> io::Result<()> {
+        self.pump_seat();
+        for idx in 0..self.monitors.len() {
+            self.sync_active_state(idx);
+        }
+        Ok(())
+    }
+
     fn poll_events(&mut self, timeout: std::time::Duration) -> io::Result<bool> {
         if self.cards.is_empty() {
             return Ok(false);
@@ -647,6 +625,57 @@ impl OutputBackend for DrmOutput {
 }
 
 impl DrmOutput {
+    /// Pump libseat and relay a Ctrl+Alt+Fn request from the input thread.
+    /// Non-blocking; safe to call every loop iteration.
+    ///
+    /// This must NOT depend on a frame arriving. An idle screen produces no
+    /// frames, so if this only ran inside `render_frame` the VT-switch chord
+    /// would never be acted on, libseat's disable event would never be acked
+    /// (the switch hangs), and the evdev thread — which only releases its
+    /// exclusive keyboard grabs once the session flips inactive — would keep
+    /// the keyboard captured on every VT.
+    fn pump_seat(&mut self) {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if let Err(e) = self.seat.dispatch() {
+            // Runs every loop iteration, so report a persistent failure once.
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[veil-host] seat dispatch failed (further errors suppressed): {e}");
+            }
+        }
+        if let Some(vt) = crate::seat::take_pending_vt() {
+            if let Err(e) = self.seat.switch_session(vt) {
+                eprintln!("[veil-host] VT switch to {vt} failed: {e}");
+            }
+        }
+    }
+
+    /// Track the seat's active/inactive state for one monitor, and re-modeset
+    /// it when we come back from another VT.
+    fn sync_active_state(&mut self, monitor: usize) {
+        let active_now = self.seat.is_active();
+        if active_now && !self.monitors[monitor].was_active {
+            // Coming back from a VT switch: whatever had the display in
+            // between left this CRTC in an unknown state, and any flip we
+            // had in flight before switching away is never going to
+            // complete — its fence belonged to the old CRTC config.
+            // Re-assert this monitor's mode before touching page_flip
+            // again, or it'll EINVAL and (since that error propagates out
+            // of the frame loop) take the whole compositor down with it.
+            // The front buffer still holds the last frame, so this also
+            // repaints the screen with no new frame needed.
+            self.monitors[monitor].flip_pending = false;
+            self.monitors[monitor].needs_flip = false;
+            match self.reassert_crtc(monitor) {
+                Ok(()) => self.monitors[monitor].was_active = true,
+                Err(e) => eprintln!(
+                    "[veil-host] VT resume: re-modeset failed on monitor {monitor}, retrying: {e}"
+                ),
+            }
+        } else {
+            self.monitors[monitor].was_active = active_now;
+        }
+    }
+
     /// Re-assert one monitor's CRTC to whatever it last had scanned out.
     /// Pulled out of `render_frame`/`on_vt_switch` since both need the exact
     /// same "front buffer, same connector, same mode" call.

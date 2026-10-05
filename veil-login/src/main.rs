@@ -147,13 +147,13 @@ fn main() {
     ui.on_reboot(|| power_action("reboot"));
     ui.on_switch_tty(switch_vt);
 
-    // Oh-shit key (Ctrl+Shift+\, bound in velogin.slint's killswitch
+    // Oh-shit key (HOME, bound in velogin.slint's killswitch
     // FocusScope): bail exactly like closing the dev window — quit the event
     // loop with no PENDING login set, so the post-run() teardown below (drop
     // ui → release DRM/libseat, sleep, close_lingering_fds) runs and we exit
     // without spawning a session.
     ui.on_emergency_exit(|| {
-        eprintln!("[velogin] emergency exit (Ctrl+Shift+\\) — bailing out");
+        eprintln!("[velogin] emergency exit (HOME) — bailing out");
         let _ = slint::quit_event_loop();
     });
 

@@ -237,7 +237,7 @@ export component LoginWindow inherits Window {
     callback login(string, string, int);       // username, password, session idx
     callback poweroff();
     callback reboot();
-    callback emergency-exit();                 // oh-shit key: Ctrl+Shift+\ — graceful bail
+    callback emergency-exit();                 // oh-shit key: HOME — graceful bail
     callback switch-tty(int);                  // switch to a specific text VT (1..6)
     callback username-edited(string);          // live — reloads avatar
     callback vk-key(int, string);              // field (0=user,1=pass), char
@@ -290,18 +290,21 @@ export component LoginWindow inherits Window {
     }
 
     // ── oh-shit key ──────────────────────────────────────────────────────────
-    // Ctrl+Shift+\ from anywhere (username/password fields included) bails out
+    // HOME from anywhere (username/password fields included) bails out
     // of the greeter — quits the event loop exactly like closing the dev window
     // or an unsuccessful session, which main.rs already tears down gracefully
     // (drops the UI/DRM master, lets libseat disconnect, then exits with no
-    // PENDING login so no session is spawned). Wrapping all content in this
-    // FocusScope is what lets an unhandled combo bubble up here even while a
-    // TextInput has focus — see Slint's key event delivery/bubbling model.
+    // PENDING login so no session is spawned). This uses capture-key-pressed,
+    // which runs BEFORE the focused child sees the key: a plain key-pressed
+    // would never fire for HOME, because a TextInput consumes it to move its
+    // cursor — exactly when you're stuck at a field and need the way out. It
+    // also works on the clock screen, whose own FocusScope accepts every key.
+    // Trade-off: HOME no longer jumps to the start of a field's text.
     killswitch := FocusScope {
         width: 100%;
         height: 100%;
-        key-pressed(event) => {
-            if (event.modifiers.control && event.modifiers.shift && event.text == "\\") {
+        capture-key-pressed(event) => {
+            if (event.text == Key.Home) {
                 root.emergency-exit();
                 accept
             } else {

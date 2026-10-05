@@ -397,6 +397,14 @@ fn main() -> std::io::Result<()> {
     };
 
     while running.load(Ordering::Relaxed) {
+        // Seat events + any Ctrl+Alt+Fn request must be serviced on EVERY
+        // iteration, not only when a frame arrives. An idle screen sends no
+        // frames, so otherwise the VT-switch chord is never acted on and the
+        // seat's disable event is never acked (the switch hangs and the evdev
+        // grabs are never released). The idle recv_timeout below bounds how
+        // long this can wait: ~100 ms.
+        let _ = output.service_seat();
+
         let mut got_any = false;
 
         // Drain any immediately available frames from the channel
