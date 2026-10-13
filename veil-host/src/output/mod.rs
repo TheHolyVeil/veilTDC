@@ -116,8 +116,14 @@ fn is_bare_tty() -> bool {
         }
     };
     if let Some(name) = tty_name {
-        if name.starts_with("/dev/tty") && !name.starts_with("/dev/pts/") {
-            return true;
+        // H3: only /dev/tty<N> is a virtual console. A bare `starts_with`
+        // also matched /dev/ttyS0, /dev/ttyUSB0, /dev/ttyACM0 — serial lines
+        // with no DRM master to take — and sent them down the ~5 s
+        // `Seat::open` wait before falling back.
+        if let Some(n) = name.strip_prefix("/dev/tty") {
+            if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
+                return true;
+            }
         }
     }
     false

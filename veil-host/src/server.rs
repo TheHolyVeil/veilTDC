@@ -299,7 +299,7 @@ pub struct State {
     pub xdg_activation: XdgActivationState,
     pub output_manager: OutputManagerState,
     pub dmabuf_state: DmabufState,
-    pub _dmabuf_global: DmabufGlobal,
+    pub _dmabuf_global: Option<DmabufGlobal>,
     /// GPU dmabuf importer for tiled/non-linear client buffers. `None` when no
     /// render node / EGL is available — veil then stays CPU-only + linear-only.
     pub gpu: Option<GpuImporter>,
@@ -583,11 +583,14 @@ impl CompositorHandler for State {
                 // buffer every single commit. Falls back to an empty Vec
                 // (first commit, or previous buffer type was GPU-detiled and
                 // we don't reuse across that boundary — see note below).
-                let mut dest = self
-                    .surface_buffers
-                    .remove(&surface.id())
-                    .map(|b| b.rgba)
-                    .unwrap_or_default();
+                // S5: every conversion path leaves `dest` untouched when it
+                // returns None (checks run before `out.clear()`, and the GPU
+                // path only assigns on success), so on failure we can put the
+                // previous frame straight back instead of making the window
+                // vanish until the client sends a supported buffer.
+                let old = self.surface_buffers.remove(&surface.id());
+                let old_size = old.as_ref().map(|b| (b.w, b.h));
+                let mut dest = old.map(|b| b.rgba).unwrap_or_default();
 
                 // Try shm first, then dmabuf.
                 let imported = with_buffer_contents(&buffer, |ptr, len, data| {
@@ -643,9 +646,13 @@ impl CompositorHandler for State {
                     }
                 } else {
                     tracing::warn!(
-                        "commit {} — unsupported buffer type, skipping",
+                        "commit {} — unsupported buffer type, keeping previous frame",
                         surface.id()
                     );
+                    if let Some((w, h)) = old_size {
+                        self.surface_buffers
+                            .insert(surface.id(), SurfaceBuf { rgba: dest, w, h });
+                    }
                 }
 
                 // Tell the client's GPU it can reuse/free the buffer now that
@@ -993,13 +1000,48 @@ impl XdgActivationHandler for State {
     fn request_activation(
         &mut self,
         _token: XdgActivationToken,
-        _data: XdgActivationTokenData,
+        data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
-        // Simple policy: always grant — focus the requesting surface for keyboard.
-        let serial = self.next_serial();
-        let kb = self.keyboard.clone();
-        kb.set_focus(self, Some(surface), serial);
+        // N1: this used to grant every request, which (a) let any background
+        // client steal keyboard focus and (b) moved wl_keyboard focus without
+        // touching `layout.focused`, so Close/Swap/Fullscreen then acted on a
+        // different window than the one receiving keystrokes.
+        //
+        // Policy: honor only tokens created in response to real input (they
+        // carry a seat serial) and fresh, and only for a live toplevel on the
+        // active workspace of the active monitor — the same index space every
+        // per-window action uses. Focus then goes through the normal
+        // `layout.focused` → relayout → refocus_keyboard path, so the
+        // keyboard focus and the keybind target can never diverge.
+        // Denied requests are dropped silently, as the protocol allows.
+        if data.serial.is_none() || data.timestamp.elapsed() > Duration::from_secs(10) {
+            tracing::debug!("xdg_activation: denied (no input serial or stale token)");
+            return;
+        }
+        let Some(mon) = self
+            .toplevels
+            .iter()
+            .find(|t| t.alive() && t.wl_surface().as_ref() == Some(&surface))
+            .map(|t| t.monitor)
+        else {
+            return;
+        };
+        if mon != active_monitor_idx(self) {
+            return;
+        }
+        let ws = self.monitors[mon].active_workspace;
+        let Some(i) = self
+            .toplevels
+            .iter()
+            .filter(|t| t.alive() && t.monitor == mon && t.workspace == ws)
+            .position(|t| t.wl_surface().as_ref() == Some(&surface))
+        else {
+            return; // window is on another workspace — don't yank focus there
+        };
+        self.monitors[mon].layout.focused = i;
+        relayout(self);
+        refocus_keyboard(self);
     }
 }
 
@@ -1040,7 +1082,7 @@ delegate_xwayland_shell!(State);
 /// render node's full format+modifier set, so GPU compositors (niri, Hyprland)
 /// and GL/Vulkan apps allocate their native *tiled* buffers, which we detile via
 /// EGLImage. Chromium (feedback-aware) still picks linear and takes the CPU path.
-fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> DmabufFeedback {
+fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> Option<DmabufFeedback> {
     use smithay::backend::allocator::Format;
     use std::os::unix::fs::MetadataExt;
 
@@ -1105,7 +1147,8 @@ fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> DmabufFeedback {
 
     DmabufFeedbackBuilder::new(dev_t, formats)
         .build()
-        .expect("[veil-host] failed to build dmabuf feedback")
+        .map_err(|e| eprintln!("[veil-host] dmabuf feedback build failed: {e} — dmabuf disabled, clients fall back to shm"))
+        .ok()
 }
 
 /// Import a linear dmabuf by mmapping plane 0 and converting pixels to RGBA.
@@ -1140,20 +1183,30 @@ fn import_dmabuf_into(dmabuf: &Dmabuf, out: &mut Vec<u8>) -> Option<(u32, u32)> 
         return None;
     }
 
+    // S5: resolve the pixel layout BEFORE `out.clear()` so every failure path
+    // in this function leaves `out` untouched — the commit handler relies on
+    // that to keep showing the previous frame when a new buffer is rejected.
+    // Byte indices of (r, g, b) within each 4-byte pixel, plus whether the
+    // format has a real alpha channel (S6: keep it, premultiplied, instead of
+    // forcing 255 — X/x formats have padding in that byte, so stay opaque).
+    let ([ri, gi, bi], has_alpha) = match fmt.code {
+        // DRM stores as little-endian u32: ARGB8888 = B,G,R,A in memory
+        Fourcc::Argb8888 => ([2, 1, 0], true),
+        Fourcc::Xrgb8888 => ([2, 1, 0], false),
+        Fourcc::Abgr8888 => ([0, 1, 2], true),
+        Fourcc::Xbgr8888 => ([0, 1, 2], false),
+        Fourcc::Rgbx8888 => ([3, 2, 1], false),
+        Fourcc::Bgrx8888 => ([1, 2, 3], false),
+        _ => return None,
+    };
+
     out.clear();
     out.reserve(w * h * 4);
     for y in 0..h {
         let row = &pixel_data[y * stride..y * stride + w * 4];
         for px in row.chunks_exact(4) {
-            // DRM stores as little-endian u32: ARGB8888 = B,G,R,A in memory
-            let (r, g, b) = match fmt.code {
-                Fourcc::Argb8888 | Fourcc::Xrgb8888 => (px[2], px[1], px[0]),
-                Fourcc::Abgr8888 | Fourcc::Xbgr8888 => (px[0], px[1], px[2]),
-                Fourcc::Rgbx8888 => (px[3], px[2], px[1]),
-                Fourcc::Bgrx8888 => (px[1], px[2], px[3]),
-                _ => return None,
-            };
-            out.extend_from_slice(&[r, g, b, 255]);
+            let a = if has_alpha { px[3] } else { 255 };
+            out.extend_from_slice(&[px[ri], px[gi], px[bi], a]);
         }
     }
     Some((w as u32, h as u32))
@@ -1167,25 +1220,53 @@ fn shm_to_rgba_into(
     data: &smithay::wayland::shm::BufferData,
     out: &mut Vec<u8>,
 ) -> Option<(u32, u32)> {
-    let w = data.width as usize;
-    let h = data.height as usize;
-    let stride = data.stride as usize;
-    if stride < w * 4 || raw.len() < stride * h {
+    // S7: every field here is a client-controlled i32. Reject negatives via
+    // try_from (a bare `as usize` turns -1 into usize::MAX and sails past
+    // the length check), and bounds-check with checked math that includes
+    // `offset`, so a hostile or buggy client can't make the row slice below
+    // panic and abort the compositor.
+    let w = usize::try_from(data.width).ok()?;
+    let h = usize::try_from(data.height).ok()?;
+    let stride = usize::try_from(data.stride).ok()?;
+    let offset = usize::try_from(data.offset).ok()?;
+    let row_bytes = w.checked_mul(4)?;
+    if w == 0 || h == 0 || stride < row_bytes {
         return None;
     }
+    let needed = (h - 1)
+        .checked_mul(stride)?
+        .checked_add(offset)?
+        .checked_add(row_bytes)?;
+    if raw.len() < needed {
+        return None;
+    }
+    // Resolved once, not per pixel. Both layouts are 4 bytes/px; only the
+    // R/B order differs. Unknown formats bail before `out` is touched.
+    // S6: ARGB/ABGR carry real (premultiplied) alpha that we must keep —
+    // forcing 255 turned every transparent pixel (GTK shadows, rounded
+    // corners, popups) into an opaque black box. X formats have a padding
+    // byte, not alpha, so those stay opaque.
+    let (bgr, has_alpha) = match data.format {
+        wl_shm::Format::Xbgr8888 => (false, false),
+        wl_shm::Format::Abgr8888 => (false, true),
+        wl_shm::Format::Xrgb8888 => (true, false),
+        wl_shm::Format::Argb8888 => (true, true),
+        _ => return None,
+    };
 
     out.clear();
-    out.reserve(w * h * 4);
+    out.reserve(row_bytes * h);
     for y in 0..h {
-        let row_start = data.offset as usize + y * stride;
-        let row = &raw[row_start..row_start + w * 4];
+        let row_start = offset + y * stride;
+        let row = &raw[row_start..row_start + row_bytes];
         for px in row.chunks_exact(4) {
-            let (r, g, b) = match data.format {
-                wl_shm::Format::Xbgr8888 | wl_shm::Format::Abgr8888 => (px[0], px[1], px[2]),
-                wl_shm::Format::Xrgb8888 | wl_shm::Format::Argb8888 => (px[2], px[1], px[0]),
-                _ => return None,
+            let (r, g, b) = if bgr {
+                (px[2], px[1], px[0])
+            } else {
+                (px[0], px[1], px[2])
             };
-            out.extend_from_slice(&[r, g, b, 255]);
+            let a = if has_alpha { px[3] } else { 255 };
+            out.extend_from_slice(&[r, g, b, a]);
         }
     }
     Some((w as u32, h as u32))
@@ -1214,12 +1295,17 @@ fn blit(back: &mut [u8], back_w: u32, back_h: u32, src: &SurfaceBuf, x: i32, y: 
             if a == 255 {
                 back[di..di + 4].copy_from_slice(&src.rgba[si..si + 4]);
             } else if a > 0 {
+                // S6: Wayland ARGB/ABGR is PREMULTIPLIED, so the source color
+                // already carries its alpha: out = src + dst * (1 - a).
+                // The old straight-alpha form (src*a + dst*(1-a)) multiplied
+                // by alpha twice and darkened every soft edge. `.min(255)`
+                // guards clients that send color > alpha (invalid, but seen).
                 let inv = 255 - a;
-                back[di] = ((src.rgba[si] as u32 * a + back[di] as u32 * inv) / 255) as u8;
+                back[di] = (src.rgba[si] as u32 + back[di] as u32 * inv / 255).min(255) as u8;
                 back[di + 1] =
-                    ((src.rgba[si + 1] as u32 * a + back[di + 1] as u32 * inv) / 255) as u8;
+                    (src.rgba[si + 1] as u32 + back[di + 1] as u32 * inv / 255).min(255) as u8;
                 back[di + 2] =
-                    ((src.rgba[si + 2] as u32 * a + back[di + 2] as u32 * inv) / 255) as u8;
+                    (src.rgba[si + 2] as u32 + back[di + 2] as u32 * inv / 255).min(255) as u8;
                 back[di + 3] = 255;
             }
         }
@@ -2147,15 +2233,25 @@ fn refocus_keyboard(state: &mut State) {
 /// to `mark_dirty_full` in that case. Deliberately not subsurface-tree-aware:
 /// a toplevel's root surface committing is the common case (most apps render
 /// straight into it), and under-detecting here only costs a full-frame
-/// redraw instead of a partial one — it can never cause a stale-pixel bug,
-/// since full-frame damage always covers whatever a precise rect would have.
+/// redraw instead of a partial one. That only holds if a hit returns the
+/// RIGHT rect: `layout_rects` is indexed by the alive + this-monitor +
+/// active-workspace sequence (same filter as `relayout`/`composite_one_monitor`),
+/// NOT by position in the raw `toplevels` Vec. A window that isn't in that
+/// sequence (dead, other workspace) returns `None` and falls back to full
+/// damage, which is always safe.
 fn toplevel_rect_for(state: &State, surface: &WlSurface) -> Option<(usize, Rect)> {
+    let monitor = state
+        .toplevels
+        .iter()
+        .find(|t| t.wl_surface().as_ref() == Some(surface))?
+        .monitor;
+    let m = state.monitors.get(monitor)?;
     let i = state
         .toplevels
         .iter()
+        .filter(|t| t.alive() && t.monitor == monitor && t.workspace == m.active_workspace)
         .position(|t| t.wl_surface().as_ref() == Some(surface))?;
-    let monitor = state.toplevels[i].monitor;
-    let rect = state.monitors.get(monitor)?.layout_rects.get(i).copied()?;
+    let rect = m.layout_rects.get(i).copied()?;
     Some((monitor, rect))
 }
 
@@ -2510,6 +2606,22 @@ fn composite_and_send(state: &mut State) {
         if now.duration_since(t) < state.composite_interval {
             return;
         }
+    }
+    // S1 backpressure: `prev_frame` is the Arc we last handed to `frame_tx`.
+    // strong_count > 1 means the render side (channel, `latest` slot, or an
+    // in-flight `render_frame`) still holds it, so another composite would
+    // only grow an unbounded queue of ~8 MB frames behind a slow consumer
+    // (serial/SSH). Bail BEFORE touching `dirty`, damage, or frame
+    // callbacks: damage keeps accumulating on each monitor, `dirty` stays
+    // set so the next tick retries, and clients get no frame callback so
+    // they slow down too. Steady state is at most one frame in flight per
+    // monitor, and the `try_unwrap` reclaim below now always succeeds.
+    if state.monitors.iter().any(|m| {
+        m.prev_frame
+            .as_ref()
+            .is_some_and(|a| Arc::strong_count(a) > 1)
+    }) {
+        return;
     }
     state.dirty = false;
     tracing::info!(
@@ -3855,8 +3967,11 @@ pub fn run(
     let mut dmabuf_state = DmabufState::new();
     let dmabuf_feedback = build_dmabuf_feedback(&gpu_probe);
     drop(gpu_probe); // real context recreated lazily by gpu_lazy() when actually needed
-    let _dmabuf_global =
-        dmabuf_state.create_global_with_default_feedback::<State>(&dh, &dmabuf_feedback);
+
+    // H8: feedback build failure now disables dmabuf (clients use shm) instead
+    // of panicking the compositor at startup.
+    let _dmabuf_global = dmabuf_feedback
+        .map(|fb| dmabuf_state.create_global_with_default_feedback::<State>(&dh, &fb));
     // XWayland pairing: lets an X11 window's wl_surface get associated with
     // its X11Surface (see XWaylandShellHandler::surface_associated). Only
     // XWayland clients can bind this global.
