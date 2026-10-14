@@ -25,7 +25,7 @@ drm                   = "0.15"
 libseat               = "0.2"
 
 [profile.release]
-opt-level     = 3
+opt-level     = "z"
 lto           = "fat"
 codegen-units = 1
 panic = "abort"

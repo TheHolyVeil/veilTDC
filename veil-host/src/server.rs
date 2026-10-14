@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use calloop::{
     generic::{FdWrapper, Generic},
     timer::{TimeoutAction, Timer},
-    EventLoop, Interest, Mode as CMode, PostAction,
+    EventLoop, Interest, LoopHandle, Mode as CMode, PostAction,
 };
 
 use smithay::{
@@ -51,9 +51,9 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            with_states, with_surface_tree_downward, BufferAssignment, CompositorClientState,
-            CompositorHandler, CompositorState, SubsurfaceCachedState, SurfaceAttributes,
-            TraversalAction,
+            add_blocker, add_pre_commit_hook, with_states, with_surface_tree_downward,
+            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            SubsurfaceCachedState, SurfaceAttributes, TraversalAction,
         },
         cursor_shape::CursorShapeManagerState,
         dmabuf::{
@@ -379,13 +379,16 @@ pub struct State {
     /// into us (`WAYLAND_DISPLAY=<this>`).
     pub socket_name: String,
     pub popups: PopupManager,
+    /// xdg_popups that asked for a grab (context menus, dropdowns), oldest
+    /// first. A press that lands outside the popup's client dismisses them —
+    /// see `dismiss_popup_grabs_on_press`.
+    pub popup_grabs: Vec<PopupSurface>,
     pub surface_buffers: HashMap<ObjectId, SurfaceBuf>,
-    /// Surfaces whose linux-drm-syncobj acquire-point wait has already timed
-    /// out at least once. See the commit handler for why: once we know a
-    /// client's sync points don't actually resolve against this compositor,
-    /// re-attempting the wait on every subsequent commit is pure blocking
-    /// cost with no chance of success — skip it instead of paying it again.
-    pub sync_wait_broken: std::collections::HashSet<ObjectId>,
+    /// Handle to the main calloop loop, set once the loop exists. The
+    /// pre-commit hook in `new_surface` needs it to register an explicit-sync
+    /// acquire-point source (S4); `None` before startup finishes, in which
+    /// case commits simply aren't held for sync.
+    pub loop_handle: Option<LoopHandle<'static, LoopData>>,
     pub cursor_status: CursorImageStatus,
     /// Cache for the last `pick_focus` result. Stores the surface, its origin
     /// in compositor space, and the tight bounding rect that was hit-tested.
@@ -507,6 +510,43 @@ impl CompositorHandler for State {
         FALLBACK.get_or_init(CompositorClientState::default)
     }
 
+    fn new_surface(&mut self, surface: &WlSurface) {
+        // S4: explicit-sync acquire points become Smithay blockers. The hook
+        // runs before the commit is applied: if the client attached an
+        // acquire point, the commit is held (not blocking the event loop)
+        // until the client's GPU signals it, then `blocker_cleared` releases
+        // it. Replaces a 2 ms synchronous wait that gave up after one timeout
+        // and then read unfinished buffers forever.
+        add_pre_commit_hook::<Self, _>(surface, |state, _dh, surface| {
+            let acquire = with_states(surface, |states| {
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                cached.pending().acquire_point.clone()
+            });
+            let Some(acquire) = acquire else {
+                return;
+            };
+            let (Some(handle), Some(client)) = (state.loop_handle.clone(), surface.client()) else {
+                return;
+            };
+            let (blocker, source) = match acquire.generate_blocker() {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("syncobj acquire blocker unavailable ({e}); not waiting");
+                    return;
+                }
+            };
+            let inserted = handle.insert_source(source, move |_, _, data| {
+                let dh = data.display.handle();
+                let cs = data.state.client_compositor_state(&client);
+                cs.blocker_cleared(&mut data.state, &dh);
+                Ok(())
+            });
+            if inserted.is_ok() {
+                add_blocker(surface, blocker);
+            }
+        });
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
         // Pull the newly-attached buffer (if any) and cache it as RGBA
         // keyed by surface id. We re-composite from all caches on tick.
@@ -526,55 +566,20 @@ impl CompositorHandler for State {
 
         match assign {
             Assign::New(buffer) => {
-                // Explicit sync (linux-drm-syncobj-v1): if this commit carries
-                // an acquire point (client set one via wp_linux_drm_syncobj_
-                // surface_v1), block until the client's GPU signals it before
-                // we touch the buffer's memory below. `.current()` already
-                // reflects this commit — smithay merges the cached state
-                // during its own commit resolution, before our handler runs.
-                //
-                // This is a synchronous, bounded wait on veil's single-
-                // threaded event loop, not smithay's own async blocker
-                // pattern (DrmSyncPoint::generate_blocker + compositor::
-                // add_blocker registered on a calloop source). That's the
-                // "correct" non-stalling approach; this is the pragmatic one.
-                // If a GPU client ever visibly stalls the compositor here,
-                // that's the upgrade path — not a rewrite of this.
-                // No-op (both None) for any surface that never bound the
-                // syncobj-surface protocol object, i.e. every client today.
-                let (acquire_pt, release_pt) = with_states(surface, |states| {
+                // Explicit sync (linux-drm-syncobj-v1): the ACQUIRE wait no
+                // longer happens here. S4: the old code blocked the whole
+                // compositor for 2 ms per commit and, on the first timeout,
+                // marked the surface "broken" forever and read its buffer
+                // unfinished — but a heavy GPU client legitimately signals up
+                // to a frame later. The acquire point is now a Smithay
+                // blocker installed by the pre-commit hook in `new_surface`,
+                // so this commit only runs once the client's GPU is done and
+                // the event loop never stalls. The release point is still
+                // signalled below once we've finished reading the buffer.
+                let release_pt = with_states(surface, |states| {
                     let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
-                    let cur = cached.current();
-                    (cur.acquire_point.clone(), cur.release_point.clone())
+                    cached.current().release_point.clone()
                 });
-                if let Some(pt) = &acquire_pt {
-                    let id = surface.id();
-                    if self.sync_wait_broken.contains(&id) {
-                        // Already know this surface's acquire points don't
-                        // resolve against us — every previous wait here
-                        // timed out, and the buffer gets composited either
-                        // way (see below), so re-waiting bought nothing
-                        // except blocking the whole single-threaded
-                        // compositor for the timeout's full duration, on
-                        // every single commit. Skip straight to using the
-                        // buffer, same as we did after the last timeout.
-                    } else if let Err(e) = pt.wait(2_000_000) {
-                        // Was 16ms (roughly a full 60Hz frame) — a client
-                        // whose sync genuinely works signals near-instantly,
-                        // not in "almost a whole frame", so 2ms is still
-                        // generous for the honest case while capping the
-                        // worst-case stall for a client that never signals
-                        // at 1/8th of what it was. First failure marks the
-                        // surface broken so we don't pay this repeatedly —
-                        // see the `contains` check above.
-                        tracing::warn!(
-                            "commit {} — syncobj acquire wait failed/timed out: {e} \
-                             (compositor will stop waiting on this surface's sync points)",
-                            id
-                        );
-                        self.sync_wait_broken.insert(id);
-                    }
-                }
 
                 // Reuse last frame's backing Vec for this surface instead of
                 // allocating fresh every commit — same-size redraws (by far
@@ -621,16 +626,20 @@ impl CompositorHandler for State {
                     // an importer is up; otherwise unsupported → blank.
                     if dmabuf.format().modifier == Modifier::Linear {
                         import_dmabuf_into(dmabuf, &mut dest)
+                    } else if !surface_size_ok(dmabuf.width() as usize, dmabuf.height() as usize) {
+                        None // S8: don't even start a GPU import for a monster buffer
                     } else if let Some(gpu) = self.gpu_lazy() {
                         // NOTE: GPU detile path still allocates fresh each
                         // call (untouched — didn't want to change detile.rs
                         // without checking its internals first). Reusable
                         // `dest` is dropped here; not a regression, just not
                         // the win the other two paths get.
-                        gpu.import(dmabuf).map(|(rgba, w, h)| {
-                            dest = rgba;
-                            (w, h)
-                        })
+                        gpu.import(dmabuf)
+                            .filter(|(_, w, h)| surface_size_ok(*w as usize, *h as usize))
+                            .map(|(rgba, w, h)| {
+                                dest = rgba;
+                                (w, h)
+                            })
                     } else {
                         None
                     }
@@ -686,6 +695,20 @@ impl CompositorHandler for State {
 
         // Let PopupManager update its internal book-keeping.
         self.popups.commit(surface);
+
+        // S2: an xdg_popup must receive its initial configure before the
+        // client will attach a buffer (Qt and GTK both wait for it), and the
+        // client's first commit is the trigger. Nothing sent one, so context
+        // menus / dropdowns never mapped. Mirrors Smithay's reference
+        // compositor: send it once, from commit, after PopupManager has seen
+        // the commit.
+        if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface) {
+            if !popup.is_initial_configure_sent() {
+                if let Err(e) = popup.send_configure() {
+                    tracing::warn!("popup initial configure failed: {e:?}");
+                }
+            }
+        }
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
@@ -744,8 +767,33 @@ impl XdgShellHandler for State {
             tracing::warn!("track_popup failed: {e:?}");
         }
     }
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
-    fn reposition_request(&mut self, _s: PopupSurface, _p: PositionerState, _t: u32) {}
+    fn grab(&mut self, surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
+        // H9: record the grab so a press outside the popup's client can send
+        // `popup_done` (see `dismiss_popup_grabs_on_press`). Smithay's own
+        // PopupPointerGrab/PopupKeyboardGrab are deliberately not used: Veil
+        // routes input through its own hit-testing and a plain `ptr.button`,
+        // and those grabs would fight it. Keyboard focus stays on the parent
+        // toplevel, which both Qt and GTK handle for menu navigation. The
+        // seat/serial aren't validated — Veil has a single seat.
+        self.popup_grabs.retain(|p| p.alive());
+        self.popup_grabs.push(surface);
+    }
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
+        // H9 (part): was an empty stub. A client that repositions a popup (GTK
+        // and Qt do when a menu would overflow the screen) waits for the
+        // `repositioned` event; answering it keeps the popup from hanging.
+        surface.with_pending_state(|s| {
+            s.geometry = positioner.get_geometry();
+            s.positioner = positioner;
+        });
+        surface.send_repositioned(token);
+        surface.send_pending_configure().ok();
+    }
 
     fn fullscreen_request(
         &mut self,
@@ -810,6 +858,102 @@ impl SeatHandler for State {
     }
 }
 
+/// S9: clipboard pipe I/O with a bound on how long a stalled peer can pin a
+/// thread. Both directions used to block forever — a client that never reads
+/// its paste fd (or never closes/writes the copy-out pipe) leaked a thread
+/// per attempt. Each wait gives up after `CLIP_IO_TIMEOUT_MS` with no
+/// progress, and copy-out is capped at `CLIP_MAX_BYTES` so a client can't make
+/// us buffer without limit. SIGPIPE is ignored by Rust's runtime, so a closed
+/// peer shows up as an EPIPE error here, not a signal.
+const CLIP_IO_TIMEOUT_MS: i32 = 5000;
+const CLIP_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn clip_set_nonblocking(fd: std::os::unix::io::RawFd) {
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// True if `fd` became ready (or hung up / errored — the caller's next
+/// read/write reports which); false on timeout or a real poll failure.
+fn clip_wait(fd: std::os::unix::io::RawFd, events: i16) -> bool {
+    let mut p = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        let r = unsafe { libc::poll(&mut p, 1, CLIP_IO_TIMEOUT_MS) };
+        if r > 0 {
+            return true;
+        }
+        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
+/// Write all of `data` to a client's paste fd, then close it (EOF tells the
+/// client the paste is complete). Gives up quietly on a stalled/closed peer.
+fn clip_write_bounded(fd: OwnedFd, data: &[u8]) {
+    let raw = fd.as_raw_fd();
+    clip_set_nonblocking(raw);
+    let mut off = 0;
+    while off < data.len() {
+        let n = unsafe { libc::write(raw, data[off..].as_ptr().cast(), data.len() - off) };
+        if n > 0 {
+            off += n as usize;
+            continue;
+        }
+        if n == 0 {
+            return;
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::WouldBlock => {
+                if !clip_wait(raw, libc::POLLOUT) {
+                    return;
+                }
+            }
+            std::io::ErrorKind::Interrupted => {}
+            _ => return,
+        }
+    }
+}
+
+/// Read a client's copy-out pipe to EOF. `None` on timeout, error, or if the
+/// client sends more than `CLIP_MAX_BYTES`.
+fn clip_read_bounded(fd: OwnedFd) -> Option<Vec<u8>> {
+    let raw = fd.as_raw_fd();
+    clip_set_nonblocking(raw);
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = unsafe { libc::read(raw, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n > 0 {
+            buf.extend_from_slice(&chunk[..n as usize]);
+            if buf.len() > CLIP_MAX_BYTES {
+                return None;
+            }
+            continue;
+        }
+        if n == 0 {
+            return Some(buf);
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::WouldBlock => {
+                if !clip_wait(raw, libc::POLLIN) {
+                    return None;
+                }
+            }
+            std::io::ErrorKind::Interrupted => {}
+            _ => return None,
+        }
+    }
+}
+
 impl SelectionHandler for State {
     type SelectionUserData = ();
 
@@ -833,7 +977,7 @@ impl SelectionHandler for State {
     fn send_selection(
         &mut self,
         ty: SelectionTarget,
-        _mime_type: String,
+        mime_type: String,
         fd: OwnedFd,
         _seat: Seat<Self>,
         _user_data: &(),
@@ -841,14 +985,17 @@ impl SelectionHandler for State {
         if ty != SelectionTarget::Clipboard {
             return;
         }
+        // S9: only serve the mimes we actually advertised (see the
+        // `set_data_device_selection` call in the paste-in path). Anything
+        // else gets its fd dropped, i.e. an empty paste, instead of text
+        // being handed over as an unrelated type.
+        if mime_type != "text/plain;charset=utf-8" && mime_type != "text/plain" {
+            return;
+        }
         let Some(text) = self.host_clipboard.clone() else {
             return;
         };
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let mut f: std::fs::File = fd.into();
-            let _ = f.write_all(text.as_bytes());
-        });
+        std::thread::spawn(move || clip_write_bounded(fd, text.as_bytes()));
     }
 }
 
@@ -1151,6 +1298,25 @@ fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> Option<DmabufFeedback> {
         .ok()
 }
 
+/// S8: cap on client buffer size. A client picks width/height freely, and the
+/// importers allocate `w*h*4` bytes and convert them on the compositor
+/// thread, so an absurd buffer is a multi-hundred-MB allocation plus a
+/// stalled main loop (and `blit`'s u32 index math overflows past ~2^30
+/// pixels). 16384 per side covers any real output; the pixel cap (64 MP,
+/// 256 MiB of RGBA — 8K x 8K) bounds the allocation and keeps `blit`'s u32
+/// math comfortably in range. Over-limit buffers are rejected like any other
+/// unsupported buffer, so S5 keeps the previous frame on screen.
+const MAX_SURFACE_DIM: usize = 16384;
+const MAX_SURFACE_PIXELS: usize = 64 * 1024 * 1024;
+
+fn surface_size_ok(w: usize, h: usize) -> bool {
+    w > 0
+        && h > 0
+        && w <= MAX_SURFACE_DIM
+        && h <= MAX_SURFACE_DIM
+        && w.saturating_mul(h) <= MAX_SURFACE_PIXELS
+}
+
 /// Import a linear dmabuf by mmapping plane 0 and converting pixels to RGBA.
 /// Only single-plane ARGB/XRGB/ABGR/XBGR 8888 with linear layout are supported.
 /// Writes into `out` in place instead of allocating — see shm_to_rgba_into.
@@ -1168,6 +1334,9 @@ fn import_dmabuf_into(dmabuf: &Dmabuf, out: &mut Vec<u8>) -> Option<(u32, u32)> 
     }
     let w = dmabuf.width() as usize;
     let h = dmabuf.height() as usize;
+    if !surface_size_ok(w, h) {
+        return None; // S8: checked before map_plane so we never mmap a monster
+    }
     let stride = dmabuf.strides().next()? as usize;
     let offset = dmabuf.offsets().next()? as usize;
 
@@ -1230,8 +1399,8 @@ fn shm_to_rgba_into(
     let stride = usize::try_from(data.stride).ok()?;
     let offset = usize::try_from(data.offset).ok()?;
     let row_bytes = w.checked_mul(4)?;
-    if w == 0 || h == 0 || stride < row_bytes {
-        return None;
+    if w == 0 || h == 0 || stride < row_bytes || !surface_size_ok(w, h) {
+        return None; // S8: size cap, checked before any allocation
     }
     let needed = (h - 1)
         .checked_mul(stride)?
@@ -2253,6 +2422,27 @@ fn toplevel_rect_for(state: &State, surface: &WlSurface) -> Option<(usize, Rect)
         .position(|t| t.wl_surface().as_ref() == Some(surface))?;
     let rect = m.layout_rects.get(i).copied()?;
     Some((monitor, rect))
+}
+
+/// H9: a pointer press while grabbing popups are open. If it landed on a
+/// surface of the SAME client as the popup, leave it alone — Qt and GTK
+/// dismiss their own menus on an outside click and expect to see it. If it
+/// landed anywhere else (another client, the bar, empty desktop), no event
+/// reaches the popup's client, so the compositor must send `popup_done`.
+/// Newest popup first, so nested submenus unwind innermost-out.
+fn dismiss_popup_grabs_on_press(state: &mut State, clicked: Option<WlSurface>) {
+    state.popup_grabs.retain(|p| p.alive());
+    let Some(first) = state.popup_grabs.first() else {
+        return;
+    };
+    let popup_client = first.wl_surface().client().map(|c| c.id());
+    let click_client = clicked.as_ref().and_then(|s| s.client()).map(|c| c.id());
+    if popup_client.is_some() && popup_client == click_client {
+        return;
+    }
+    for p in state.popup_grabs.drain(..).rev() {
+        p.send_popup_done();
+    }
 }
 
 /// Marks every monitor's whole output as needing repaint — the safe default
@@ -3401,6 +3591,12 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             };
             const BTN_LEFT: u32 = 0x110;
 
+            // H9: dismiss grabbing popups on an outside press. Before the bar
+            // check below, since a bar click returns early.
+            if pressed {
+                let clicked = state.pointer.current_focus();
+                dismiss_popup_grabs_on_press(state, clicked);
+            }
             // Bar app tile — launch and stop here. A bar click has no
             // client surface behind it to focus or forward the event to,
             // so it takes a completely separate path from the click-to-
@@ -4105,8 +4301,9 @@ pub fn run(
         power_menu: None,
         socket_name: socket_name.to_string(),
         popups: PopupManager::default(),
+        popup_grabs: Vec::new(),
         surface_buffers: HashMap::new(),
-        sync_wait_broken: std::collections::HashSet::new(),
+        loop_handle: None, // set right after the event loop is created
         cursor_status: CursorImageStatus::default_named(),
         focus_cache: None,
         dirty: false,
@@ -4134,6 +4331,8 @@ pub fn run(
     let mut event_loop: EventLoop<'static, LoopData> =
         EventLoop::try_new().map_err(|e| io::Error::other(format!("event_loop: {e}")))?;
     let handle = event_loop.handle();
+    // S4: the surface pre-commit hook registers explicit-sync sources on this.
+    data.state.loop_handle = Some(handle.clone());
     // Grabbed so the stop checks below can actually end `event_loop.run()` —
     // `calloop::EventLoop::run` only returns once this is told to stop; the
     // `stop`/`data.state.running` checks alone don't do that on their own,
@@ -4306,10 +4505,12 @@ pub fn run(
                     .is_ok()
                     {
                         std::thread::spawn(move || {
-                            use std::io::Read;
-                            let mut f: std::fs::File = read_fd.into();
-                            let mut buf = Vec::new();
-                            if f.read_to_end(&mut buf).is_err() || buf.is_empty() {
+                            // S9: bounded read — a client that never closes
+                            // the pipe no longer pins this thread forever.
+                            let Some(buf) = clip_read_bounded(read_fd) else {
+                                return;
+                            };
+                            if buf.is_empty() {
                                 return;
                             }
                             let _ = wl_clipboard_rs::copy::Options::new().copy(
