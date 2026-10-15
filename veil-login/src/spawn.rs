@@ -14,10 +14,11 @@ use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use pam_client2::{conv_null, Context, ConversationHandler, ErrorCode, Flag};
+use pam_client2::{Context, ConversationHandler, ErrorCode, Flag};
 use uzers::os::unix::UserExt;
 
 use crate::session::SessionEntry;
+use std::os::unix::fs::PermissionsExt;
 
 /// Conversation handler for the *visible* greeter stage (see [`verify`]).
 ///
@@ -97,7 +98,8 @@ pub enum LaunchError {
 
 /// Authenticate only — used by the UI thread to validate credentials before
 /// tearing down the greeter. Full session setup happens later in [`launch`],
-/// which does *not* re-authenticate (see there for why).
+/// which re-authenticates on the handle it opens the session on, so the
+/// keyring unlock sees the password (see there).
 ///
 /// `on_message` fires on this thread for every `text_info`/`error_msg` PAM
 /// emits mid-authenticate (e.g. pam_u2f's `cue`: "touch your security key")
@@ -114,7 +116,11 @@ pub fn verify(
     Ok(())
 }
 
-pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
+pub fn launch(
+    username: &str,
+    password: &str,
+    entry: &SessionEntry,
+) -> Result<(), LaunchError> {
     let user = uzers::get_user_by_name(username)
         .ok_or_else(|| LaunchError::UnknownUser(username.to_string()))?;
     let uid = user.uid();
@@ -138,19 +144,26 @@ pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
         }
     }
 
-    // Credentials were already verified once in `verify()`, on the UI
-    // thread, in the still-visible greeter. Calling `ctx.authenticate()`
-    // again here would re-run the whole PAM auth stack from scratch in this
-    // headless process — no window, no conversation UI — which for a
-    // pam_u2f stack means silently demanding a *second* physical touch of
-    // the security key with nothing on screen to say so. That's the
-    // "sits there" bug. This is pam-client2's own sanctioned pattern for
-    // "already authenticated by other means": conv_null + a preset
-    // username, skip authenticate(), go straight to acct_mgmt() +
-    // open_session().
-    let mut ctx = Context::new("velogin", Some(username), conv_null::Conversation::new())?;
+    // Authenticate HERE, on the same PAM handle the session is opened on.
+    // pam_gnome_keyring captures the password during the *auth* phase and its
+    // session hook unlocks the login keyring with what that handle captured.
+    // `verify()` authenticates on a different handle that is already dropped,
+    // so a session opened on a fresh, never-authenticated handle never saw the
+    // password and the keyring stayed locked all session. sddm does
+    // authenticate -> acct_mgmt -> open_session on ONE handle; so do we now.
+    //
+    // This used to skip authenticate() to avoid a second physical touch for
+    // pam_u2f with no UI to explain it. No security key is in use anymore. If
+    // an interactive factor (u2f etc.) is ever added back to
+    // /etc/pam.d/velogin, this headless helper has no UI and will sit on it
+    // again — messages are only logged here.
+    let conv = UiConversation::new(username, password, |msg: String| {
+        eprintln!("[velogin:pam] {msg}");
+    });
+    let mut ctx = Context::new("velogin", Some(username), conv)?;
+    ctx.authenticate(Flag::NONE)?;
     ctx.acct_mgmt(Flag::NONE)?;
-    dbg(dbg_fd, "acct_mgmt done (no re-auth — see comment)\n");
+    dbg(dbg_fd, "authenticate + acct_mgmt done (single PAM handle)\n");
 
     // Controlling TTY (systemd TTYPath=/dev/tty1) and its VT number. Computed
     // *before* open_session because pam_systemd needs the VT to register an
@@ -203,8 +216,45 @@ pub fn launch(username: &str, entry: &SessionEntry) -> Result<(), LaunchError> {
     // activated address whose broker (user@.service) may not be up yet at
     // open_session() time → the daemon blocked on it and auto_start hung. sddm
     // never sets it and its keyring unlock works, so neither do we.
-    std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
-
+    {
+        let runtime_dir = format!("/run/user/{uid}");
+        // If we are root, ensure the runtime dir exists and is owned by the user
+        // so gnome-keyring-daemon (when started by gkr-pam) can create its
+        // control socket there. Best-effort: don't fail the login if this
+        // cannot be created.
+        if unsafe { libc::geteuid() } == 0 {
+            if !std::path::Path::new(&runtime_dir).exists() {
+                // create with default perms, then fix owner/perm
+                let _ = std::fs::create_dir_all(&runtime_dir);
+                if let Ok(dir_cstr) = CString::new(runtime_dir.clone()) {
+                    unsafe {
+                        libc::chown(dir_cstr.as_ptr(), uid as libc::uid_t, gid as libc::gid_t);
+                        libc::chmod(dir_cstr.as_ptr(), 0o700);
+                    }
+                }
+            } else {
+                // Try to fix permissions/ownership if they are wrong (best-effort).
+                if let Ok(metadata) = std::fs::metadata(&runtime_dir) {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        let cur_uid = metadata.uid();
+                        let cur_gid = metadata.gid();
+                        let cur_mode = metadata.permissions().mode() & 0o777;
+                        if cur_uid != uid || cur_gid != gid || cur_mode != 0o700 {
+                            if let Ok(dir_cstr) = CString::new(runtime_dir.clone()) {
+                                unsafe {
+                                    libc::chown(dir_cstr.as_ptr(), uid as libc::uid_t, gid as libc::gid_t);
+                                    libc::chmod(dir_cstr.as_ptr(), 0o700);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
+    }
     // Session open runs pam_systemd (registers the logind session, spins up
     // user@.service) and then our gkr-pam auto_start line (forks + unlocks the
     // keyring daemon). The eprintln breadcrumbs bracket it in the *journal*

@@ -79,6 +79,9 @@ impl InputBackend for EvdevInput {
         // kernel's own VT switching ever sees it, so we emulate it ourselves.
         let mut ctrl_held = false;
         let mut alt_held = false;
+        // Shift joins the chord for the compositor kill key (K3): a bare HOME
+        // (Fn+Left on most laptops) must never tear the compositor down.
+        let mut shift_held = false;
 
         // Poll the device fds directly instead of busy-polling with a sleep.
         // The kernel wakes us the instant an event lands, so we drain promptly
@@ -151,6 +154,16 @@ impl InputBackend for EvdevInput {
                     });
                     alt_held = false;
                 }
+                if shift_held {
+                    for code in [KEY_LEFTSHIFT, KEY_RIGHTSHIFT] {
+                        let _ = tx.send(InputCmd::Key {
+                            keycode: code as u32,
+                            mods: 0,
+                            pressed: false,
+                        });
+                    }
+                    shift_held = false;
+                }
                 was_active = true;
             }
 
@@ -192,6 +205,7 @@ impl InputBackend for EvdevInput {
                             &host_stop,
                             &mut ctrl_held,
                             &mut alt_held,
+                            &mut shift_held,
                         )
                     {
                         moved = true;
@@ -219,6 +233,7 @@ fn handle_event(
     host_stop: &std::sync::atomic::AtomicBool,
     ctrl_held: &mut bool,
     alt_held: &mut bool,
+    shift_held: &mut bool,
 ) -> bool {
     let mut moved = false;
     match ev.destructure() {
@@ -236,6 +251,9 @@ fn handle_event(
             if code == KEY_LEFTALT || code == KEY_RIGHTALT {
                 *alt_held = pressed;
             }
+            if code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT {
+                *shift_held = pressed;
+            }
 
             // VT switch chord: swallow it here rather than forward it — the
             // exclusive grab means the kernel/console never gets a chance to
@@ -249,11 +267,13 @@ fn handle_event(
                 }
             }
 
-            // Compositor kill key. Ctrl-C is forwarded to the hosted app (it
-            // never reaches us on a TTY), so HOME is the escape hatch: it always
-            // tears veil down, even if the guest wedges. The guest never sees it.
-            if code == KEY_HOME && pressed {
-                eprintln!("[veil-host] HOME → shutdown");
+            // Compositor kill chord: Ctrl+Alt+Shift+Home. Ctrl-C is forwarded
+            // to the hosted app (it never reaches us on a TTY), so this is the
+            // escape hatch: it tears veil down even if the guest wedges. It
+            // must be a chord — a bare HOME (Fn+Left on most laptops) used to
+            // kill the compositor from inside any app. The guest never sees it.
+            if code == KEY_HOME && pressed && *ctrl_held && *alt_held && *shift_held {
+                eprintln!("[veil-host] Ctrl+Alt+Shift+Home → shutdown");
                 crate::vt::emergency_restore();
                 running.store(false, Ordering::Relaxed);
                 host_stop.store(true, Ordering::Relaxed);
@@ -324,12 +344,14 @@ fn is_button(key: KeyCode) -> bool {
     (0x110..=0x117).contains(&key.code())
 }
 
-/// evdev KEY_HOME (linux/input-event-codes.h) — our compositor kill key.
+/// evdev KEY_HOME (linux/input-event-codes.h) — last key of the kill chord.
 const KEY_HOME: u16 = 102;
 
 // linux/input-event-codes.h — modifier + function-key codes for the
-// Ctrl+Alt+Fn VT-switch chord.
+// Ctrl+Alt+Fn VT-switch chord and the Ctrl+Alt+Shift+Home kill chord.
 const KEY_LEFTCTRL: u16 = 29;
+const KEY_LEFTSHIFT: u16 = 42;
+const KEY_RIGHTSHIFT: u16 = 54;
 const KEY_LEFTALT: u16 = 56;
 const KEY_RIGHTCTRL: u16 = 97;
 const KEY_RIGHTALT: u16 = 100;

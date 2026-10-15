@@ -403,7 +403,15 @@ impl DrmOutput {
                 Err(e) => {
                     m.needs_flip = false;
                     self.flip_err += 1;
-                    eprintln!("[veil-host] deferred page_flip failed on monitor {idx}: {e}");
+                    // H5: an unplugged monitor fails every flip forever, which
+                    // flooded the log. Log on the 1st, 2nd, 4th, 8th, ... error
+                    // only, with the running total.
+                    if self.flip_err.is_power_of_two() {
+                        eprintln!(
+                            "[veil-host] deferred page_flip failed on monitor {idx}: {e} (error #{})",
+                            self.flip_err
+                        );
+                    }
                 }
             }
         }
@@ -511,7 +519,14 @@ impl OutputBackend for DrmOutput {
                 Err(e) => {
                     self.monitors[monitor].needs_flip = false;
                     self.flip_err += 1;
-                    eprintln!("[veil-host] page_flip failed on monitor {monitor}: {e}");
+                    // H5: log on the 1st, 2nd, 4th, 8th, ... error only — an
+                    // unplugged monitor fails every single flip.
+                    if self.flip_err.is_power_of_two() {
+                        eprintln!(
+                            "[veil-host] page_flip failed on monitor {monitor}: {e} (error #{})",
+                            self.flip_err
+                        );
+                    }
                 }
             }
         } else {

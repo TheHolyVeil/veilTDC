@@ -1373,7 +1373,7 @@ fn import_dmabuf_into(dmabuf: &Dmabuf, out: &mut Vec<u8>) -> Option<(u32, u32)> 
     out.reserve(w * h * 4);
     for y in 0..h {
         let row = &pixel_data[y * stride..y * stride + w * 4];
-        for px in row.chunks_exact(4) {
+        for px in row.as_chunks::<4>().0 {
             let a = if has_alpha { px[3] } else { 255 };
             out.extend_from_slice(&[px[ri], px[gi], px[bi], a]);
         }
@@ -1428,7 +1428,7 @@ fn shm_to_rgba_into(
     for y in 0..h {
         let row_start = offset + y * stride;
         let row = &raw[row_start..row_start + row_bytes];
-        for px in row.chunks_exact(4) {
+        for px in row.as_chunks::<4>().0 {
             let (r, g, b) = if bgr {
                 (px[2], px[1], px[0])
             } else {
@@ -2531,26 +2531,11 @@ fn composite_one_monitor(
         m.composite_buf.resize(needed, 0);
     }
 
-    // Fast background fill: write the 4-byte RGBA color as a u32 across the
-    // whole buffer in one pass — avoids the overhead of chunks_exact_mut(4).
+    // Background fill: one pass over the buffer as 4-byte RGBA pixels. Safe
+    // (no `align_to_mut`; `Vec<u8>` only guarantees 1-byte alignment) and it
+    // compiles to the same vectorised store loop in release builds.
     let bg = state.background;
-    let bg_u32 = u32::from_ne_bytes(bg);
-    // SAFETY: composite_buf is aligned to at least 1; u32 requires 4-byte
-    // alignment and Vec<u8> guarantees that its allocation is at least
-    // max_align_t-aligned (≥ 8 bytes on all supported platforms), so the
-    // cast is safe for the in-bounds slice. bytemuck would be cleaner but
-    // this avoids an extra dep; the debug assert catches any future breakage.
-    debug_assert!(m.composite_buf.as_ptr().align_offset(4) == 0);
-    {
-        let (pre, u32s, post) = unsafe { m.composite_buf.align_to_mut::<u32>() };
-        for b in pre.chunks_exact_mut(4) {
-            b.copy_from_slice(&bg);
-        }
-        u32s.fill(bg_u32);
-        for b in post.chunks_exact_mut(4) {
-            b.copy_from_slice(&bg);
-        }
-    }
+    m.composite_buf.as_chunks_mut::<4>().0.fill(bg);
 
     let ws = m.active_workspace;
     let back = &mut m.composite_buf;
@@ -3419,8 +3404,11 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                     // than `keybinds.mod_key` — same reasoning as
                     // Shift+Alt+E below: this chord is muscle memory across
                     // every DE and shouldn't move if mod_key is remapped.
-                    if sym == keysyms::KEY_Tab && mods.alt {
-                        cycle_focus(st, !mods.shift);
+                    // N5: Shift+Tab resolves to ISO_Left_Tab in `modified_sym`,
+                    // not Tab, so backward cycling never matched before.
+                    let left_tab = sym == keysyms::KEY_ISO_Left_Tab;
+                    if (sym == keysyms::KEY_Tab || left_tab) && mods.alt {
+                        cycle_focus(st, !(mods.shift || left_tab));
                         return FilterResult::Intercept(());
                     }
 
@@ -3663,6 +3651,10 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
         }
 
         InputCmd::Resize { width, height } => {
+            // N8: a terminal shrunk to nothing reports 0 px. Zero extents flow
+            // into relayout, the composite buffer and the encoders, so clamp
+            // to a small floor here instead of trusting the sender.
+            let (width, height) = (width.max(64), height.max(64));
             // Terminal-mode-only event (window resize) — terminal output is
             // always exactly one monitor, so this always targets
             // monitors[0] unconditionally rather than resolving

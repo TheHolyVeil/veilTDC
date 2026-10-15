@@ -78,7 +78,7 @@ impl InputBackend for CrosstermInput {
                         Event::Key(k) if is_ctrl_c(&k) || is_kill_key(&k) => {
                             eprintln!(
                                 "[veil-host] {} → shutdown",
-                                if is_kill_key(&k) { "HOME" } else { "ctrl-c" }
+                                if is_kill_key(&k) { "Ctrl+Alt+Shift+Home" } else { "ctrl-c" }
                             );
                             crate::vt::emergency_restore();
                             running.store(false, Ordering::Relaxed);
@@ -201,11 +201,16 @@ fn is_ctrl_c(k: &KeyEvent) -> bool {
     matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-/// HOME is the compositor kill key — an escape hatch that always tears veil
-/// down even if the guest app wedges. Only fires on press, not release/repeat,
-/// so the shutdown log isn't spammed. The guest never receives HOME.
+/// Ctrl+Alt+Shift+Home is the compositor kill chord — an escape hatch that
+/// tears veil down even if the guest app wedges. A bare Home (Fn+Left on most
+/// laptops) is an ordinary key and must reach the guest. Only fires on press,
+/// not release/repeat. Ctrl-C stays as a second exit; some terminals swallow
+/// Shift+Home for scrollback, which is why Ctrl-C is kept here.
 fn is_kill_key(k: &KeyEvent) -> bool {
-    matches!(k.code, KeyCode::Home) && k.kind != KeyEventKind::Release
+    let chord = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
+    matches!(k.code, KeyCode::Home)
+        && k.kind != KeyEventKind::Release
+        && k.modifiers.contains(chord)
 }
 
 /// Map a crossterm KeyEvent → evdev keycodes and forward it as a discrete

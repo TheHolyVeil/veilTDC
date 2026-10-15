@@ -404,13 +404,16 @@ fn run_session_helper(argv: &[String]) {
     let exec = argv.get(4).cloned().unwrap_or_default();
     let rd: i32 = argv.get(5).and_then(|s| s.parse().ok()).unwrap_or(-1);
 
-    read_pipe_password(rd); // drains and closes the pipe fd; password not re-used (no double-auth)
+    // Drains and closes the pipe fd. The password is needed here: launch()
+    // authenticates on the same PAM handle it opens the session on, which is
+    // what lets gnome-keyring's session hook unlock the login keyring.
+    let password = read_pipe_password(rd);
     let entry = session::SessionEntry { name, exec };
     eprintln!(
         "[velogin:session] clean helper up, launching {username} into {:?}",
         entry.name
     );
-    match spawn::launch(&username, &entry) {
+    match spawn::launch(&username, &password, &entry) {
         Ok(()) => eprintln!("[velogin:session] session ended, exiting (systemd respawns greeter)"),
         Err(e) => {
             eprintln!("[velogin:session] launch failed: {e}");

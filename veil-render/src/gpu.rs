@@ -1,8 +1,16 @@
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use wgpu::util::DeviceExt;
 
 const HB_SHADER: &str = include_str!("shaders/halfblock.wgsl");
 const LUMA_SHADER: &str = include_str!("shaders/luma.wgsl");
+
+/// Longest we block the frame loop waiting for one frame's GPU work (G1). A
+/// healthy encode of this size takes a few ms; if it takes this long the GPU
+/// is hung or reset, and waiting forever would freeze the whole compositor.
+const READBACK_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct GpuEncoder {
     device: wgpu::Device,
@@ -11,6 +19,16 @@ pub struct GpuEncoder {
     luma_pipeline: wgpu::ComputePipeline,
     hb_res: Option<FrameRes>,
     luma_res: Option<FrameRes>,
+    /// Set once the device can't be trusted (uncaptured wgpu error, device
+    /// lost, readback timeout). Every `encode_*` then returns `None` and the
+    /// caller drops this encoder and uses the CPU path for good.
+    dead: Arc<AtomicBool>,
+    /// Device limits, cached: largest source texture side, largest output
+    /// buffer. Anything bigger is refused up front (`None`) instead of
+    /// tripping wgpu's validation, which panics under `panic = "abort"` (G2).
+    max_dim: u32,
+    max_buf: u64,
+    warned_limits: bool,
     /// Set from `VEIL_GPU_TRACE=1` at construction. When on, `encode_*`
     /// prints upload/dispatch time vs readback/poll time separately every
     /// 60 calls, so a regression can be pinned to a phase instead of guessed
@@ -54,9 +72,16 @@ impl GpuEncoder {
             display: None,
         });
 
+        // G4: two tiny compute shaders don't justify waking a discrete GPU on a
+        // hybrid-graphics laptop. LowPower is the default; VEIL_GPU_POWER=high
+        // restores the old behaviour.
+        let power_preference = match std::env::var("VEIL_GPU_POWER").as_deref() {
+            Ok("high") => wgpu::PowerPreference::HighPerformance,
+            _ => wgpu::PowerPreference::LowPower,
+        };
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                power_preference,
                 compatible_surface: None,
                 force_fallback_adapter: false,
                 // New in wgpu 30: adjusts adapter limits/features to match a
@@ -79,11 +104,14 @@ impl GpuEncoder {
         }
         eprintln!("[veil-gpu] {}", info.name);
 
+        // G2: ask for what the adapter really supports. The old
+        // `Limits::default()` capped textures at 8192 px per side, so a wide
+        // virtual desktop made `create_texture` fail.
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 trace: wgpu::Trace::Off,
@@ -91,8 +119,39 @@ impl GpuEncoder {
             .await
             .ok()?;
 
+        // wgpu's default uncaptured-error handler panics, which aborts the
+        // whole compositor under `panic = "abort"`. Replace it: log, mark the
+        // encoder dead, and let the caller fall back to the CPU path.
+        let dead = Arc::new(AtomicBool::new(false));
+        {
+            let dead = dead.clone();
+            device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+                eprintln!("[veil-gpu] wgpu error, disabling GPU encoder: {e}");
+                dead.store(true, Ordering::Relaxed);
+            }));
+        }
+        {
+            let dead = dead.clone();
+            device.set_device_lost_callback(move |reason, msg| {
+                // `Destroyed` also fires on a normal drop; only a real loss matters.
+                if matches!(reason, wgpu::DeviceLostReason::Unknown) {
+                    eprintln!("[veil-gpu] device lost ({msg}), disabling GPU encoder");
+                    dead.store(true, Ordering::Relaxed);
+                }
+            });
+        }
+        let limits = device.limits();
+        let max_dim = limits.max_texture_dimension_2d;
+        let max_buf = limits
+            .max_buffer_size
+            .min(limits.max_storage_buffer_binding_size);
+
         let hb_pipeline = make_pipeline(&device, HB_SHADER, "halfblock");
         let luma_pipeline = make_pipeline(&device, LUMA_SHADER, "luma");
+        if dead.load(Ordering::Relaxed) {
+            // Pipeline/shader creation already failed: not worth keeping.
+            return None;
+        }
         let trace = std::env::var("VEIL_GPU_TRACE").is_ok();
         if trace {
             eprintln!("[veil-gpu] VEIL_GPU_TRACE on — timing every 60th encode call");
@@ -105,9 +164,65 @@ impl GpuEncoder {
             luma_pipeline,
             hb_res: None,
             luma_res: None,
+            dead,
+            max_dim,
+            max_buf,
+            warned_limits: false,
             trace,
             trace_n: 0,
         })
+    }
+
+    /// True once the device is unusable (see the `dead` field). The caller
+    /// should drop this encoder and stay on the CPU path.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
+    }
+
+    /// Cheap pre-flight for one frame. `false` means "use the CPU path for
+    /// this frame": dead device, a degenerate geometry (a terminal shrunk to
+    /// 1 row gives zero usable rows → zero-size buffers, G3), a short pixel
+    /// buffer, or a size beyond the device limits (G2).
+    fn can_encode(
+        &mut self,
+        rgba_len: usize,
+        src_w: u32,
+        src_h: u32,
+        cols: u16,
+        rows: u16,
+        out_bytes: u64,
+    ) -> bool {
+        if self.is_dead() || cols == 0 || rows == 0 || src_w == 0 || src_h == 0 {
+            return false;
+        }
+        if (rgba_len as u64) < src_w as u64 * src_h as u64 * 4 {
+            return false;
+        }
+        if src_w > self.max_dim || src_h > self.max_dim || out_bytes > self.max_buf {
+            if !self.warned_limits {
+                self.warned_limits = true;
+                eprintln!(
+                    "[veil-gpu] {src_w}x{src_h} -> {cols}x{rows} exceeds device limits \
+                     (max texture {}, max buffer {} B) — using the CPU encoder for such frames",
+                    self.max_dim, self.max_buf
+                );
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Pass a readback result through, poisoning the encoder on failure: a
+    /// timed-out or failed map means the GPU can't be trusted any more.
+    fn finish<T>(&self, out: Option<T>) -> Option<T> {
+        if out.is_none() {
+            self.dead.store(true, Ordering::Relaxed);
+        }
+        if self.is_dead() {
+            None
+        } else {
+            out
+        }
     }
 
     /// GPU halfblock encode: upload RGBA → compute shader samples top/bot
@@ -117,6 +232,11 @@ impl GpuEncoder {
     /// only rebuilt when `(src_w, src_h, cols, rows)` changes (i.e. on
     /// terminal resize) — the steady-state per-frame path just writes new
     /// pixels into the existing texture and re-dispatches.
+    ///
+    /// Returns `None` when this frame can't or shouldn't go through the GPU
+    /// (zero-size grid, over device limits, short buffer, GPU hang/loss). The
+    /// caller then encodes on the CPU, and drops the encoder if
+    /// [`Self::is_dead`].
     pub fn encode_halfblock(
         &mut self,
         rgba: &[u8],
@@ -124,8 +244,11 @@ impl GpuEncoder {
         src_h: u32,
         cols: u16,
         rows: u16,
-    ) -> Vec<crate::ColorCell> {
+    ) -> Option<Vec<crate::ColorCell>> {
         let bytes = cols as u64 * rows as u64 * 8; // 2 × u32 per cell
+        if !self.can_encode(rgba.len(), src_w, src_h, cols, rows, bytes) {
+            return None;
+        }
         let t0 = self.trace.then(std::time::Instant::now);
         let (res, rebuilt) = ensure_res(
             &self.device,
@@ -175,22 +298,25 @@ impl GpuEncoder {
         self.queue.submit([enc.finish()]);
         let t1 = self.trace.then(std::time::Instant::now);
 
-        let raw = readback(&self.device, &res.staging, bytes);
+        let cells = readback(&self.device, &res.staging, |raw| {
+            // G5: decode straight from the mapped range — no intermediate
+            // `to_vec()` and no alignment-sensitive `cast_slice`.
+            raw.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| {
+                    let w0 = u32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
+                    let w1 = u32::from_ne_bytes([c[4], c[5], c[6], c[7]]);
+                    crate::ColorCell {
+                        fg: [byte(w0, 0), byte(w0, 1), byte(w0, 2)],
+                        bg: [byte(w1, 0), byte(w1, 1), byte(w1, 2)],
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
         let t2 = self.trace.then(std::time::Instant::now);
         self.trace_tick("hb", rebuilt, t0, t1, t2);
-
-        let u32s: &[u32] = bytemuck::cast_slice(&raw);
-        let n = cols as usize * rows as usize;
-        (0..n)
-            .map(|i| {
-                let w0 = u32s[i * 2];
-                let w1 = u32s[i * 2 + 1];
-                crate::ColorCell {
-                    fg: [byte(w0, 0), byte(w0, 1), byte(w0, 2)],
-                    bg: [byte(w1, 0), byte(w1, 1), byte(w1, 2)],
-                }
-            })
-            .collect()
+        self.finish(cells)
     }
 
     /// GPU luma encode: upload RGBA → compute shader computes Rec.601 luma
