@@ -28,26 +28,32 @@ impl GpuPower {
     }
 }
 
+/// Render quality ladder (`quality` in config.lua), best to last resort:
+/// Kitty graphics, then halfblock in truecolor / 256 / 16 colours, then ASCII.
+/// `Sixel` parses but is not implemented; it resolves like `Auto`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Quality {
     Auto,
-    Pixel,     // color halfblock (▀, 24-bit truecolor) — best for GUI apps
-    AsciiLuma, // greyscale luma chars — works everywhere
+    Kitty,     // kitty graphics protocol (real pixels)
+    Pixel,     // halfblock ▀, 24-bit truecolor: the readable baseline
+    Pixel256,  // halfblock, xterm 256-colour palette
+    Pixel16,   // halfblock, 16-colour palette, ordered dither (Linux VT)
+    AsciiLuma, // greyscale luma chars: works everywhere
     AsciiEdge, // luma + edge detection overlay
-    Sixel,     // sixel inline images (not yet implemented)
-    Kitty,     // kitty graphics protocol (not yet implemented)
+    Sixel,     // not implemented; falls back to auto-detection
 }
 
 impl Quality {
     pub fn parse_str(s: &str) -> Self {
         match s {
             "auto" => Self::Auto,
+            "kitty" => Self::Kitty,
             "pixel" => Self::Pixel,
-            "ascii" => Self::AsciiLuma,
-            "ascii_luma" => Self::AsciiLuma,
+            "pixel256" => Self::Pixel256,
+            "pixel16" => Self::Pixel16,
+            "ascii" | "ascii_luma" => Self::AsciiLuma,
             "ascii_edge" => Self::AsciiEdge,
             "sixel" => Self::Sixel,
-            "kitty" => Self::Kitty,
             _ => Self::Auto,
         }
     }
@@ -55,38 +61,67 @@ impl Quality {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Kitty => "kitty",
             Self::Pixel => "pixel",
+            Self::Pixel256 => "pixel256",
+            Self::Pixel16 => "pixel16",
             Self::AsciiLuma => "ascii_luma",
             Self::AsciiEdge => "ascii_edge",
             Self::Sixel => "sixel",
-            Self::Kitty => "kitty",
         }
     }
 }
 
-/// Detect the best supported render mode from terminal environment variables.
+/// Detect the best supported render mode from the process environment.
+/// The one resolver: `config.lua`'s `quality = "auto"` and the terminal
+/// backend both go through it. Never returns `Auto` or `Sixel`.
 pub fn detect_quality() -> Quality {
-    let term = std::env::var("TERM").unwrap_or_default();
-    let colorterm = std::env::var("COLORTERM").unwrap_or_default();
+    detect_quality_with(|k| std::env::var(k).ok())
+}
 
-    // Kitty graphics protocol
-    if term == "xterm-kitty" {
+/// [`detect_quality`] over an arbitrary environment lookup (testable).
+pub fn detect_quality_with(env: impl Fn(&str) -> Option<String>) -> Quality {
+    let get = |k: &str| env(k).unwrap_or_default();
+    let term = get("TERM");
+    let colorterm = get("COLORTERM");
+    let program = get("TERM_PROGRAM").to_lowercase();
+
+    // Graphics protocol terminals. (Env sniffing only; no DA1/`a=q` probe yet.)
+    if term == "xterm-kitty"
+        || term == "xterm-ghostty"
+        || program.contains("wezterm")
+        || program == "ghostty"
+        || env("KITTY_WINDOW_ID").is_some()
+    {
         return Quality::Kitty;
     }
-    if let Ok(prog) = std::env::var("TERM_PROGRAM") {
-        if prog == "WezTerm" || prog.to_lowercase().contains("wezterm") {
-            return Quality::Kitty;
-        }
+
+    // Halfblock needs UTF-8. Downgrade only when a locale IS set and is not
+    // UTF-8; an unset locale (services, minimal sessions) is not evidence.
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .map(|k| get(k))
+        .find(|v| !v.is_empty())
+        .unwrap_or_default()
+        .to_lowercase();
+    if !locale.is_empty() && !locale.contains("utf-8") && !locale.contains("utf8") {
+        return Quality::AsciiLuma;
     }
 
-    // Sixel
-    if term.contains("sixel") || term == "mlterm" {
-        return Quality::Sixel;
-    }
-
-    // Truecolor — halfblock pixel rendering works great
     if colorterm == "truecolor" || colorterm == "24bit" {
         return Quality::Pixel;
+    }
+    if term.contains("256color") {
+        return Quality::Pixel256;
+    }
+    // Linux console and plain xterm-family/multiplexer terminals: 16 colours.
+    if term == "linux"
+        || term == "xterm"
+        || term == "screen"
+        || term == "tmux"
+        || term.starts_with("rxvt")
+    {
+        return Quality::Pixel16;
     }
 
     Quality::AsciiLuma
@@ -697,12 +732,16 @@ pub fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
 }
 
 impl VeilConfig {
-    /// Resolve `Quality::Auto` to a concrete mode based on terminal capabilities.
+    /// Resolve the configured quality to a concrete mode. `Auto` runs the
+    /// detector; `Sixel` (unimplemented) is treated like `Auto` with a warning.
     pub fn resolved_quality(&self) -> Quality {
-        if self.quality == Quality::Auto {
-            detect_quality()
-        } else {
-            self.quality.clone()
+        match self.quality {
+            Quality::Auto => detect_quality(),
+            Quality::Sixel => {
+                eprintln!("[veil-config] quality = \"sixel\" is not implemented; auto-detecting");
+                detect_quality()
+            }
+            ref q => q.clone(),
         }
     }
 }
@@ -807,6 +846,62 @@ pub fn load(path: &Path) -> VeilConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn detect_ladder() {
+        let q = |p: &[(&str, &str)]| detect_quality_with(env_of(p));
+        assert_eq!(q(&[("TERM", "xterm-kitty")]), Quality::Kitty);
+        assert_eq!(q(&[("TERM_PROGRAM", "WezTerm")]), Quality::Kitty);
+        assert_eq!(
+            q(&[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]),
+            Quality::Pixel
+        );
+        assert_eq!(q(&[("TERM", "xterm-256color")]), Quality::Pixel256);
+        assert_eq!(q(&[("TERM", "linux")]), Quality::Pixel16);
+        assert_eq!(q(&[("TERM", "vt100")]), Quality::AsciiLuma);
+        assert_eq!(q(&[]), Quality::AsciiLuma);
+    }
+
+    #[test]
+    fn detect_locale_downgrades_only_when_set_and_not_utf8() {
+        let tc = ("COLORTERM", "truecolor");
+        let q = |p: &[(&str, &str)]| detect_quality_with(env_of(p));
+        assert_eq!(q(&[tc, ("LANG", "C")]), Quality::AsciiLuma);
+        assert_eq!(q(&[tc, ("LANG", "en_US.UTF-8")]), Quality::Pixel);
+        assert_eq!(q(&[tc]), Quality::Pixel); // unset locale is not evidence
+        // LC_ALL wins over LANG.
+        assert_eq!(
+            q(&[tc, ("LC_ALL", "en_US.utf8"), ("LANG", "C")]),
+            Quality::Pixel
+        );
+        // Kitty graphics don't depend on glyphs.
+        assert_eq!(q(&[("TERM", "xterm-kitty"), ("LANG", "C")]), Quality::Kitty);
+    }
+
+    #[test]
+    fn quality_roundtrip() {
+        for q in [
+            Quality::Auto,
+            Quality::Kitty,
+            Quality::Pixel,
+            Quality::Pixel256,
+            Quality::Pixel16,
+            Quality::AsciiLuma,
+            Quality::AsciiEdge,
+            Quality::Sixel,
+        ] {
+            assert_eq!(Quality::parse_str(q.as_str()), q);
+        }
+    }
 
     #[test]
     fn hex_color_with_hash() {

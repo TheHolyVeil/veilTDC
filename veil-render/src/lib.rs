@@ -2,7 +2,11 @@ use flate2::{write::ZlibEncoder, Compression};
 use image::imageops;
 use std::io::Write as _;
 pub mod gpu;
+pub mod halfblock_out;
+pub mod palette;
 pub use gpu::GpuEncoder;
+pub use halfblock_out::{ColorDepth, HalfblockEmitter};
+pub use palette::{bayer4, rgb_to_ansi16, rgb_to_ansi256};
 
 /// Zero-copy view over an already-owned RGBA buffer for feeding into
 /// `image::imageops::resize`, which only needs `GenericImageView` — it

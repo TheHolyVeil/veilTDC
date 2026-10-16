@@ -12,16 +12,35 @@ use std::io::{self, Write};
 use veil_render::gpu::GpuEncoder;
 use veil_render::{
     apply_hysteresis, compute_luma, luma_to_chars, render_kitty_frame, rgba_to_halfblocks,
+    ColorDepth, HalfblockEmitter,
 };
 
-use super::OutputBackend;
+use super::{OutputBackend, TerminalOpts};
 
 #[derive(Copy, Clone, Debug)]
 pub enum TerminalMode {
     Kitty,
-    Halfblock,
+    Halfblock(ColorDepth),
     Ascii,
     AsciiEdge,
+}
+
+impl TerminalMode {
+    /// Map a (resolved) config quality onto a render mode. `Auto`/`Sixel`
+    /// shouldn't arrive here (`resolved_quality` removes them) but fall back
+    /// to the detector rather than guessing.
+    fn from_quality(q: &veil_config::Quality) -> Self {
+        use veil_config::Quality as Q;
+        match q {
+            Q::Kitty => Self::Kitty,
+            Q::Pixel => Self::Halfblock(ColorDepth::True),
+            Q::Pixel256 => Self::Halfblock(ColorDepth::Ansi256),
+            Q::Pixel16 => Self::Halfblock(ColorDepth::Ansi16),
+            Q::AsciiLuma => Self::Ascii,
+            Q::AsciiEdge => Self::AsciiEdge,
+            Q::Auto | Q::Sixel => Self::from_quality(&veil_config::detect_quality()),
+        }
+    }
 }
 
 pub struct TerminalOutput {
@@ -33,6 +52,8 @@ pub struct TerminalOutput {
     rows: u16,
     gpu: Option<GpuEncoder>,
     stable_luma: Vec<u8>,
+    /// Remembers the last halfblock frame so only changed cells are sent.
+    halfblock: HalfblockEmitter,
     /// Pre-allocated render scratch buffer reused across frames to avoid
     /// per-frame heap allocation in the hot render path.
     render_buf: String,

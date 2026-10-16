@@ -75,12 +75,8 @@ Configure your system to launch Abyss on TTY1:
 # Disable getty on tty1
 sudo systemctl disable getty@tty1.service
 
-# Enable seatd (session management)
-sudo systemctl enable --now seatd.service
-
-# Install Abyss service
-sudo systemctl enable abyss.service
-sudo systemctl start abyss.service
+# Install velogin service
+sudo systemctl enable --now velogin.service
 ```
 
 On next boot, you'll see Abyss instead of a text login prompt.

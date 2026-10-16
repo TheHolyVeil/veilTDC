@@ -89,17 +89,6 @@ install -Dm755 "$BIN_SRC" /usr/local/bin/velogin
 install -Dm644 "$PAM_SRC" /etc/pam.d/velogin
 install -Dm644 "$SERVICE_SRC" /etc/systemd/system/velogin.service
 
-SEAT_USER_ADDED=""
-if command -v getent >/dev/null 2>&1 && getent group seat >/dev/null 2>&1; then
-    seat_user="${SUDO_USER:-}"
-    if [ -n "$seat_user" ] && [ "$seat_user" != "root" ] && command -v usermod >/dev/null 2>&1; then
-        if ! id -nG "$seat_user" | tr ' ' '\n' | grep -qx seat; then
-            usermod -aG seat "$seat_user"
-            SEAT_USER_ADDED="$seat_user"
-        fi
-    fi
-fi
-
 systemctl daemon-reload
 
 cat <<EOF
@@ -108,12 +97,7 @@ cat <<EOF
   /etc/pam.d/velogin
   /etc/systemd/system/velogin.service
 
-$(if [ -n "$SEAT_USER_ADDED" ]; then
-    printf '[velogin] added %s to the seat group (re-login may be needed).\n\n' "$SEAT_USER_ADDED"
-fi)
-
 [velogin] next:
-  systemctl enable --now seatd.service
   systemctl disable getty@tty1.service
   systemctl enable velogin.service
 

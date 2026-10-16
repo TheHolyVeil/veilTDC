@@ -46,10 +46,25 @@ fn check_prerequisites(dry_run: bool) {
         eprintln!("[velogin] not running as root — auth will fail for other users");
         eprintln!("[velogin] (set VELOGIN_DRY_RUN=1 to test the UI without logging in)");
     }
-    if !std::path::Path::new("/run/seatd.sock").exists() {
-        eprintln!("[velogin] /run/seatd.sock missing — linuxkms needs seatd on a bare TTY");
-        eprintln!("[velogin] systemctl enable --now seatd.service");
+}
+
+struct GreeterConv;
+
+impl pam_client2::ConversationHandler for GreeterConv {
+    fn prompt_echo_on(
+        &mut self,
+        _prompt: &std::ffi::CStr,
+    ) -> Result<std::ffi::CString, pam_client2::ErrorCode> {
+        Ok(std::ffi::CString::default())
     }
+    fn prompt_echo_off(
+        &mut self,
+        _prompt: &std::ffi::CStr,
+    ) -> Result<std::ffi::CString, pam_client2::ErrorCode> {
+        Ok(std::ffi::CString::default())
+    }
+    fn text_info(&mut self, _msg: &std::ffi::CStr) {}
+    fn error_msg(&mut self, _msg: &std::ffi::CStr) {}
 }
 
 fn main() {
@@ -71,6 +86,49 @@ fn main() {
         "[velogin] sessions: {:?}",
         sessions.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
     );
+
+    let current_tty = detect_current_tty();
+
+    // Register an active greeter session with systemd-logind (seat0/tty{current_tty})
+    // so libseat can acquire DRM master cleanly over D-Bus without seatd.
+    let mut greeter_ctx = if !dry_run
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+        && std::env::var_os("DISPLAY").is_none()
+        && unsafe { libc::geteuid() } == 0
+    {
+        pam_client2::Context::new("velogin", Some("root"), GreeterConv).ok()
+    } else {
+        None
+    };
+
+    let greeter_session = if let Some(ctx) = &mut greeter_ctx {
+        let _ = ctx.set_tty(Some(&format!("tty{current_tty}")));
+        let _ = ctx.putenv(format!("XDG_VTNR={current_tty}"));
+        let _ = ctx.putenv("XDG_SEAT=seat0");
+        let _ = ctx.putenv("XDG_SESSION_CLASS=greeter");
+        let _ = ctx.putenv("XDG_SESSION_TYPE=wayland");
+
+        eprintln!("[velogin] opening logind greeter session on seat0/tty{current_tty}…");
+        match ctx.open_session(pam_client2::Flag::NONE) {
+            Ok(session) => {
+                for (k, v) in session.envlist().iter_tuples() {
+                    if k == "XDG_SESSION_ID" {
+                        std::env::set_var("XDG_SESSION_ID", v);
+                    }
+                }
+                std::env::set_var("XDG_SEAT", "seat0");
+                std::env::set_var("XDG_VTNR", current_tty.to_string());
+                std::env::set_var("LIBSEAT_BACKEND", "logind");
+                Some(session)
+            }
+            Err(e) => {
+                eprintln!("[velogin] warning: failed to open logind greeter session: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let ui = match LoginWindow::new() {
         Ok(ui) => ui,
@@ -113,7 +171,6 @@ fn main() {
         load_avatar(&ui, first_user);
     }
 
-    let current_tty = detect_current_tty();
     ui.set_current_tty(current_tty);
 
     // Clock for the stage-0 screen; ticks fast enough that seconds never skip.
@@ -268,14 +325,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Release the window/backend (DRM master) before spawning the session.
+    // Release the window/backend (DRM master) and logind greeter session before spawning.
     drop(ui);
-    // Give the backend's own teardown (its libseat disconnect is a graceful
-    // handshake, not just a socket close) a moment to actually run before we
-    // resort to force-closing fds. Yanking the seatd connection out from
-    // under an in-flight disable request is what was tripping a seatd
-    // assertion crash (seat.c get_tty_path) on every login attempt.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(greeter_session);
+    drop(greeter_ctx);
     close_lingering_fds();
 
     // ── launch session, if a login succeeded ────────────────────────────────
@@ -529,16 +582,10 @@ fn switch_vt(n: i32) {
 
 /// Force-close every fd above stderr in this still-running process.
 ///
-/// `drop(ui)` tears down Slint's linuxkms backend at the Rust level, but its
-/// libseat connection to seatd may live on a background I/O thread that a
-/// Drop impl only *asks* to stop rather than joining — no guarantee it has
-/// actually disconnected by the time we return. This process stays alive for
-/// the whole session (waiting in launch()'s waitpid), so if that seatd
-/// socket is still open, we are still the seat's active client and the
-/// incoming compositor (e.g. niri via systemd --user) will block forever
-/// trying to acquire DRM master that we never gave up. Closing every fd
-/// forces an immediate socket EOF instead of trusting an async teardown that
-/// may never run before it matters.
+/// `drop(ui)` tears down Slint's linuxkms backend at the Rust level. Closing
+/// any lingering device descriptors ensures that graphics/input fds are cleanly
+/// released so that the incoming compositor can acquire DRM master via logind
+/// without contention.
 fn close_lingering_fds() {
     // Use opendir/readdir/dirfd directly so we can exclude the directory's
     // own fd from the close list.  The previous read_dir approach collected

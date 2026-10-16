@@ -108,11 +108,9 @@ wget -qO- https://raw.githubusercontent.com/viewerofall/veilTDC/main/install.sh 
 curl -fsSL https://raw.githubusercontent.com/viewerofall/veilTDC/main/veil-login/dist/install.sh | sudo bash
 ```
 
-After installation, enable seat management and `velogin`:
+After installation, enable `velogin`:
 
 ```bash
-sudo systemctl enable --now seatd.service
-sudo usermod -aG seat $USER
 sudo systemctl disable getty@tty1.service
 sudo systemctl enable velogin.service
 sudo reboot

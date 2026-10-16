@@ -297,6 +297,7 @@ pub fn launch(
     if let Some(vt) = vtnr {
         set_default("XDG_VTNR", vt.to_string());
     }
+    set_default("LIBSEAT_BACKEND", "logind".to_string());
     set_default("XDG_SESSION_TYPE", "wayland".to_string());
     set_default("XDG_SESSION_CLASS", "user".to_string());
     set_default("XDG_CURRENT_DESKTOP", "veil".to_string());

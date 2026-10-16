@@ -1,27 +1,23 @@
-# Velogin login manager (temporary rename of Abyss, for isolating issues)
+# Velogin login manager (veil-login)
 # — install to /etc/systemd/system/velogin.service
 #
 # Full install (needs root):
 #   install -Dm644 dist/pam.d/velogin /etc/pam.d/velogin
 #   install -Dm644 dist/velogin.service /etc/systemd/system/velogin.service
 #   install -Dm755 target/release/velogin /usr/local/bin/velogin
-#   systemctl enable --now seatd.service
 #   systemctl disable getty@tty1.service
 #   systemctl enable velogin.service
 #
 # Restart=always is load-bearing: velogin exits after each session ends
 # (one login per process life), and systemd respawning it IS the
 # return-to-greeter loop.
-#
-# linuxkms needs libseat. seatd is the reliable backend on a bare TTY;
-# SupplementaryGroups=seat grants the socket when seatd runs with -g seat.
 
 [Unit]
 Description=Velogin login manager (veil-login)
 Conflicts=getty@tty1.service
 After=systemd-user-sessions.service getty@tty1.service plymouth-quit-wait.service
-After=systemd-logind.service seatd.service
-Wants=seatd.service
+After=systemd-logind.service
+Wants=systemd-logind.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -30,8 +26,8 @@ Restart=always
 RestartSec=1
 Environment=XDG_SEAT=seat0
 Environment=XDG_VTNR=1
-Environment=LIBSEAT_BACKEND=seatd
-SupplementaryGroups=seat video input render
+Environment=LIBSEAT_BACKEND=logind
+SupplementaryGroups=video input render
 TTYPath=/dev/tty1
 StandardInput=tty
 StandardOutput=journal

@@ -3,32 +3,17 @@
 #
 #   install -Dm644 dist/pam.d/velogin /etc/pam.d/velogin
 #
-# Without this file every login shows "authentication failed" — spawn.rs
-# calls pam_start("velogin", …). Delegates to the distro's local-login stack
-# (faillock, unix auth, pam_systemd session/XDG_RUNTIME_DIR, limits, env).
-# No pam_securetty, so root login works — that's deliberate.
+# Used for both the pre-auth greeter session (XDG_SESSION_CLASS=greeter)
+# to acquire DRM master under systemd-logind, and the post-auth user
+# session (XDG_SESSION_CLASS=user) to launch the desktop compositor.
+#
+# Delegates to the distro's local-login stack (faillock, unix auth,
+# pam_systemd session/XDG_RUNTIME_DIR, limits, env).
 #
 # gnome-keyring/kwallet unlock: without these the login password never
 # reaches the keyring, so it stays locked all session and browsers etc. come
 # up looking "reset". These lines are the same as the WORKING /etc/pam.d/sddm
-# on this machine — including `auto_start`. That word is the whole fix:
-#
-#   WITH auto_start   gkr-pam forks and *owns* gnome-keyring-daemon itself,
-#                     then unlocks it synchronously over its own control
-#                     socket → journal shows "gkr-pam: unlocked login keyring".
-#   WITHOUT auto_start gkr-pam starts no daemon; systemd --user socket-
-#                     activates its own gnome-keyring-daemon (uid 1000) in
-#                     parallel, and gkr-pam — running as root (euid 0) —
-#                     blocks forever on the peer-cred handshake trying to
-#                     unlock that foreign daemon. open_session() never returns.
-#
-# Hardware journal (boot -1) proved the no-auto_start hang: daemon started and
-# printed GNOME_KEYRING_CONTROL, but "unlocked login keyring" never came. An
-# earlier auto_start attempt also hung — but that was spawn.rs pre-seeding
-# DBUS_SESSION_BUS_ADDRESS at a socket-activated bus whose broker wasn't up
-# yet; that pre-seed is gone now (sddm never set it and works), so auto_start
-# is clear. pam_kwallet5 isn't installed here — the `-` prefix makes that line
-# a silent no-op, kept for parity with sddm.
+# on this machine — including `auto_start`.
 auth      include   system-local-login
 -auth     optional  pam_gnome_keyring.so
 -auth     optional  pam_kwallet5.so
@@ -39,5 +24,6 @@ password  include   system-local-login
 -password optional  pam_gnome_keyring.so  use_authtok
 
 session   include   system-local-login
+-session  optional  pam_systemd.so
 -session  optional  pam_gnome_keyring.so  auto_start
 -session  optional  pam_kwallet5.so       auto_start
