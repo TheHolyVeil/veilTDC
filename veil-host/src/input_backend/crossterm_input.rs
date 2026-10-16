@@ -76,10 +76,12 @@ impl InputBackend for CrosstermInput {
                     tracing::debug!("event: {ev:?}");
                     match ev {
                         Event::Key(k) if is_ctrl_c(&k) || is_kill_key(&k) => {
-                            eprintln!(
-                                "[veil-host] {} → shutdown",
-                                if is_kill_key(&k) { "Ctrl+Alt+Shift+Home" } else { "ctrl-c" }
-                            );
+                            let which = if is_kill_key(&k) {
+                                "Ctrl+Alt+Shift+Home"
+                            } else {
+                                "ctrl-c"
+                            };
+                            eprintln!("[veil-host] {which} → shutdown");
                             crate::vt::emergency_restore();
                             running.store(false, Ordering::Relaxed);
                             host_stop.store(true, Ordering::Relaxed);

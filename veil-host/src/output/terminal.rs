@@ -39,12 +39,10 @@ pub struct TerminalOutput {
 }
 
 impl TerminalOutput {
-    /// `gpu_render`: mirrors config.lua's `gpu_render` (default true). Was
-    /// previously ignored entirely — this constructor always tried to spin
-    /// up a GpuEncoder regardless of what the user set. Now `false` skips
-    /// GPU init outright, same effect as if no Vulkan adapter existed, and
-    /// the CPU path in veil-render is used instead.
-    pub fn new(gpu_render: bool) -> io::Result<Self> {
+    /// `gpu`: from config.lua. `None` (`gpu_render = false`) skips GPU init
+    /// outright, same effect as if no Vulkan adapter existed, and the CPU path
+    /// in veil-render is used instead. `Some(power)` is `gpu_power`.
+    pub fn new(gpu: Option<veil_config::GpuPower>) -> io::Result<Self> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let stdout = std::io::stdout();
 
@@ -69,10 +67,11 @@ impl TerminalOutput {
         // Try to init GPU encoder (only useful for halfblock/ascii modes) —
         // gated on config.lua's gpu_render, and skipped for Kitty mode
         // (which never used the GPU path to begin with).
-        let gpu = if matches!(mode, TerminalMode::Kitty) || !gpu_render {
-            None
-        } else {
-            GpuEncoder::new()
+        let gpu = match gpu {
+            Some(power) if !matches!(mode, TerminalMode::Kitty) => {
+                GpuEncoder::new(power == veil_config::GpuPower::Low)
+            }
+            _ => None,
         };
 
         let (pw, ph) = Self::term_pixel_size().unwrap_or((cols as u32 * 8, rows as u32 * 16));
@@ -126,6 +125,24 @@ impl TerminalOutput {
         TerminalMode::Ascii
     }
 
+    /// Run `f` on the GPU encoder if there is one. `None` means "encode this
+    /// frame on the CPU" (no GPU, or it declined the frame). If the encoder
+    /// reports itself dead (hang, device loss, wgpu error) it is dropped here,
+    /// so every later frame goes straight to the CPU path. Takes the field,
+    /// not `&mut self`, so callers can keep `self.render_buf` borrowed.
+    fn gpu_or_none<T>(
+        gpu: &mut Option<GpuEncoder>,
+        f: impl FnOnce(&mut GpuEncoder) -> Option<T>,
+    ) -> Option<T> {
+        let g = gpu.as_mut()?;
+        let r = f(g);
+        if g.is_dead() {
+            eprintln!("[veil-host] GPU encoder lost, CPU encoder from now on");
+            *gpu = None;
+        }
+        r
+    }
+
     /// Renders directly into `self.render_buf`. No return value — the caller
     /// reads `self.render_buf` afterward. This avoids the `.to_vec()` clone
     /// that previously threw away the whole point of the reusable buffer.
@@ -150,28 +167,28 @@ impl TerminalOutput {
                 ));
             }
             TerminalMode::Halfblock => {
-                let cells = if let Some(ref mut g) = self.gpu {
-                    g.encode_halfblock(rgba, self.width, self.height, cols, usable_rows)
-                } else {
-                    rgba_to_halfblocks(rgba, self.width, self.height, cols, usable_rows)
-                };
+                let (w, h) = (self.width, self.height);
+                let cells = Self::gpu_or_none(&mut self.gpu, |g| {
+                    g.encode_halfblock(rgba, w, h, cols, usable_rows)
+                })
+                .unwrap_or_else(|| rgba_to_halfblocks(rgba, w, h, cols, usable_rows));
                 Self::emit_halfblocks(out, &cells, cols, usable_rows);
             }
             TerminalMode::Ascii => {
-                let luma = if let Some(ref mut g) = self.gpu {
-                    g.encode_luma(rgba, self.width, self.height, cols, usable_rows)
-                } else {
-                    compute_luma(rgba, self.width, self.height, cols, usable_rows)
-                };
+                let (w, h) = (self.width, self.height);
+                let luma = Self::gpu_or_none(&mut self.gpu, |g| {
+                    g.encode_luma(rgba, w, h, cols, usable_rows)
+                })
+                .unwrap_or_else(|| compute_luma(rgba, w, h, cols, usable_rows));
                 let chars = luma_to_chars(&luma, cols, usable_rows);
                 Self::emit_chars_vec(out, &chars, cols, usable_rows);
             }
             TerminalMode::AsciiEdge => {
-                let luma = if let Some(ref mut g) = self.gpu {
-                    g.encode_luma(rgba, self.width, self.height, cols, usable_rows)
-                } else {
-                    compute_luma(rgba, self.width, self.height, cols, usable_rows)
-                };
+                let (w, h) = (self.width, self.height);
+                let luma = Self::gpu_or_none(&mut self.gpu, |g| {
+                    g.encode_luma(rgba, w, h, cols, usable_rows)
+                })
+                .unwrap_or_else(|| compute_luma(rgba, w, h, cols, usable_rows));
                 if self.stable_luma.len() != luma.len() {
                     self.stable_luma = luma.clone();
                 }

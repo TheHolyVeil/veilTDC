@@ -325,7 +325,8 @@ fn main() -> std::io::Result<()> {
     }
 
     // ── Create output backend (auto-detect terminal vs DRM/KMS) ────────────────
-    let mut output = veil_host::output::detect(vcfg.output, vcfg.gpu_render)?;
+    let gpu = vcfg.gpu_render.then_some(vcfg.gpu_power);
+    let mut output = veil_host::output::detect(vcfg.output, gpu)?;
     let n_monitors = output.monitor_count();
     let sizes: Vec<(u32, u32)> = (0..n_monitors).map(|i| output.get_size(i)).collect();
     eprintln!(
@@ -661,6 +662,7 @@ fn cmd_probe() -> std::io::Result<()> {
             "off"
         }
     );
+    println!("gpu_power       : {}", vcfg.gpu_power.as_str());
     println!("config output   : {:?}", vcfg.output);
     println!("config mod_key  : {}", vcfg.keybinds.mod_key.label());
     println!(

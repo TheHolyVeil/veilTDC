@@ -1,6 +1,33 @@
 use mlua::Lua;
 use std::path::Path;
 
+/// Which GPU the frame encoder asks for (`gpu_power` in config.lua).
+/// `High` is the default: fastest adapter, never a surprise slowdown on
+/// weak hardware. `Low` prefers the integrated GPU, so a hybrid-graphics
+/// laptop doesn't wake the discrete one for two tiny compute shaders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuPower {
+    #[default]
+    High,
+    Low,
+}
+
+impl GpuPower {
+    pub fn parse_str(s: &str) -> Self {
+        match s {
+            "low" => Self::Low,
+            _ => Self::High,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Low => "low",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Quality {
     Auto,
@@ -616,6 +643,8 @@ pub struct VeilConfig {
     /// Whether to use GPU compute shaders for frame encoding (halfblock/luma).
     /// Defaults to true. Set `gpu_render = false` in config.lua to disable.
     pub gpu_render: bool,
+    /// Which GPU to prefer when `gpu_render` is on: "high" (default) or "low".
+    pub gpu_power: GpuPower,
     pub keybinds: Keybinds,
     pub output: OutputPref,
     /// Bare background color (RGB), shown wherever no window covers —
@@ -643,6 +672,7 @@ impl Default for VeilConfig {
             cage_timeout_secs: 8,
             input: true,
             gpu_render: true,
+            gpu_power: GpuPower::High,
             keybinds: Keybinds::default(),
             output: OutputPref::Auto,
             background: [0x8c, 0x8c, 0x8c],
@@ -743,6 +773,10 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
             .unwrap_or(d.cage_timeout_secs),
         input: gl.get::<bool>("input").unwrap_or(d.input),
         gpu_render: gl.get::<bool>("gpu_render").unwrap_or(d.gpu_render),
+        gpu_power: gl
+            .get::<String>("gpu_power")
+            .map(|s| GpuPower::parse_str(&s))
+            .unwrap_or(d.gpu_power),
         keybinds: parse_keybinds(&gl),
         output: gl
             .get::<String>("output")

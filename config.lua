@@ -6,6 +6,7 @@ fps = 60 -- compositor frame rate cap
 cage_timeout_secs = 8 -- timeout for caged output
 input = true -- enable input forwarding
 gpu_render = true -- use GPU for frame encoding
+gpu_power = "high" -- high | low  (low = prefer the integrated GPU on hybrid laptops)
 
 -- Color theme applied to the launcher overlay, help overlay, and background
 -- (sidebar/bar will pick it up too once built). Does NOT recolor hosted app

@@ -313,6 +313,12 @@ pub fn compute_luma(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -
     /// while smooth gradients and solid-colour regions don't.
     const TEXT_CONTRAST_T: u8 = 60;
 
+    // A terminal shrunk to 1 row has 0 usable rows. Without this the `.max(1)`
+    // below made a 0x0 grid return one bogus cell.
+    if cols == 0 || rows == 0 {
+        return Vec::new();
+    }
+
     let cols_u = (cols as u32).max(1);
     let rows_u = (rows as u32).max(1);
     let mut out = Vec::with_capacity(cols as usize * rows as usize);

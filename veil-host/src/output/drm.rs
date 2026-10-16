@@ -364,27 +364,51 @@ impl DrmOutput {
         Ok((card, monitors))
     }
 
-    /// Drain any completed page-flip events for one monitor's card,
-    /// clearing that monitor's `flip_pending` and presenting any queued frame.
+    /// Drain the page-flip events queued on one card and present any frames
+    /// that were waiting on them.
+    ///
+    /// H1: `receive_events()` empties the card's whole queue, which can hold
+    /// completions for several monitors. Each event carries the `crtc` that
+    /// flipped, so route it to the monitor that owns that crtc. The old code
+    /// cleared only `idx`'s `flip_pending` on *any* event: monitor 0's drain
+    /// swallowed monitor 1's completion and monitor 1 stayed pending forever.
     fn drain_flips(&mut self, idx: usize) -> io::Result<bool> {
         let card_idx = self.monitors[idx].card_idx;
-        let card = &self.cards[card_idx];
         let mut got_event = false;
 
-        match card.receive_events() {
+        match self.cards[card_idx].receive_events() {
             Ok(events) => {
-                for _ in events {
+                for ev in events {
                     got_event = true;
+                    if let drm::control::Event::PageFlip(pf) = ev {
+                        for m in self
+                            .monitors
+                            .iter_mut()
+                            .filter(|m| m.card_idx == card_idx && m.crtc == pf.crtc)
+                        {
+                            m.flip_pending = false;
+                        }
+                    }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e),
         }
 
-        if got_event {
-            self.monitors[idx].flip_pending = false;
+        // Events for every monitor on this card were consumed above, so
+        // present for all of them, not just `idx`: nobody else will see them.
+        for i in 0..self.monitors.len() {
+            if self.monitors[i].card_idx == card_idx {
+                self.present_queued(i);
+            }
         }
 
+        Ok(got_event)
+    }
+
+    /// Page-flip monitor `idx`'s queued frame if its previous flip retired.
+    fn present_queued(&mut self, idx: usize) {
+        let card_idx = self.monitors[idx].card_idx;
         if !self.monitors[idx].flip_pending && self.monitors[idx].needs_flip {
             let m = &mut self.monitors[idx];
             let crtc = m.crtc;
@@ -415,8 +439,6 @@ impl DrmOutput {
                 }
             }
         }
-
-        Ok(got_event)
     }
 }
 

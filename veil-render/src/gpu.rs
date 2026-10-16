@@ -59,11 +59,12 @@ impl GpuEncoder {
     /// CPU path (`veil_render::rgba_to_halfblocks` / `compute_luma`) doesn't
     /// pay. Returning `None` here means the caller falls back to that CPU
     /// path automatically, which is strictly faster in that situation.
-    pub fn new() -> Option<Self> {
-        pollster::block_on(Self::init())
+    /// `low_power` (config.lua `gpu_power = "low"`) prefers the integrated GPU.
+    pub fn new(low_power: bool) -> Option<Self> {
+        pollster::block_on(Self::init(low_power))
     }
 
-    async fn init() -> Option<Self> {
+    async fn init(low_power: bool) -> Option<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             flags: wgpu::InstanceFlags::default(),
@@ -72,12 +73,13 @@ impl GpuEncoder {
             display: None,
         });
 
-        // G4: two tiny compute shaders don't justify waking a discrete GPU on a
-        // hybrid-graphics laptop. LowPower is the default; VEIL_GPU_POWER=high
-        // restores the old behaviour.
-        let power_preference = match std::env::var("VEIL_GPU_POWER").as_deref() {
-            Ok("high") => wgpu::PowerPreference::HighPerformance,
-            _ => wgpu::PowerPreference::LowPower,
+        // G4: adapter choice comes from config.lua's `gpu_power`. High (the
+        // default) takes the fastest adapter; low prefers the integrated one,
+        // for hybrid laptops where waking the discrete GPU costs battery.
+        let power_preference = if low_power {
+            wgpu::PowerPreference::LowPower
+        } else {
+            wgpu::PowerPreference::HighPerformance
         };
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -329,8 +331,11 @@ impl GpuEncoder {
         src_h: u32,
         cols: u16,
         rows: u16,
-    ) -> Vec<u8> {
+    ) -> Option<Vec<u8>> {
         let bytes = cols as u64 * rows as u64 * 4; // 1 × u32 per cell
+        if !self.can_encode(rgba.len(), src_w, src_h, cols, rows, bytes) {
+            return None;
+        }
         let t0 = self.trace.then(std::time::Instant::now);
         let (res, rebuilt) = ensure_res(
             &self.device,
@@ -382,12 +387,16 @@ impl GpuEncoder {
         self.queue.submit([enc.finish()]);
         let t1 = self.trace.then(std::time::Instant::now);
 
-        let raw = readback(&self.device, &res.staging, bytes);
+        let luma = readback(&self.device, &res.staging, |raw| {
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_ne_bytes(*c) as u8)
+                .collect::<Vec<_>>()
+        });
         let t2 = self.trace.then(std::time::Instant::now);
         self.trace_tick("luma", rebuilt, t0, t1, t2);
-
-        let u32s: &[u32] = bytemuck::cast_slice(&raw);
-        u32s.iter().map(|&v| (v & 0xFF) as u8).collect()
+        self.finish(luma)
     }
 
     /// Print upload/dispatch time vs readback/poll time every 60th call,
@@ -518,34 +527,42 @@ fn staging_buf(device: &wgpu::Device, size: u64, label: &'static str) -> wgpu::B
     })
 }
 
-fn readback(device: &wgpu::Device, staging: &wgpu::Buffer, size: u64) -> Vec<u8> {
+/// Map `staging`, run `f` over the bytes, unmap. Bounded by
+/// `READBACK_TIMEOUT` (G1): `None` on a hang, a failed map, or a failed
+/// `get_mapped_range`, which the caller treats as a dead GPU. `staging` is
+/// cached across frames, so every path (failure included) must unmap it or
+/// every later `map_async` on it would be poisoned.
+fn readback<T>(
+    device: &wgpu::Device,
+    staging: &wgpu::Buffer,
+    f: impl FnOnce(&[u8]) -> T,
+) -> Option<T> {
     let slice = staging.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
-    let _ = device.poll(wgpu::PollType::Wait {
+    if let Err(e) = device.poll(wgpu::PollType::Wait {
         submission_index: None,
-        timeout: None,
-    });
-    let mapped = rx.recv().ok().and_then(|r| r.ok()).is_some();
-    if !mapped {
-        // map_async was still issued (and, per wgpu, must be balanced by an
-        // unmap even on failure) — `staging` outlives this call now that
-        // it's cached, so skipping this would leave it stuck "mapped" and
-        // poison every future frame's map_async on the same buffer.
+        timeout: Some(READBACK_TIMEOUT),
+    }) {
+        eprintln!("[veil-gpu] readback wait failed ({e}): GPU hung or lost");
         staging.unmap();
-        return vec![0u8; size as usize];
+        return None;
+    }
+    if !matches!(rx.recv_timeout(Duration::from_millis(100)), Ok(Ok(()))) {
+        staging.unmap();
+        return None;
     }
     let out = match slice.get_mapped_range() {
         Ok(data) => {
-            let out = data.to_vec();
+            let r = f(&data);
             drop(data);
-            out
+            Some(r)
         }
         Err(e) => {
             eprintln!("[veil-gpu] get_mapped_range failed: {e}");
-            vec![0u8; size as usize]
+            None
         }
     };
     staging.unmap();
