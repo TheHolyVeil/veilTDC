@@ -1,4 +1,4 @@
-//! Velogin — graphical TTY login manager (veil-login crate, temporarily renamed from Abyss).
+//! Velogin — graphical TTY login manager (veil-login crate).
 //!
 //! Slint greeter (DRM/KMS bare-TTY, or winit window when developing nested)
 //! → PAM auth → fork/setuid/exec into the chosen session. One login per
@@ -248,6 +248,29 @@ impl pam_client2::ConversationHandler for GreeterConv {
     fn error_msg(&mut self, _msg: &std::ffi::CStr) {}
 }
 
+/// Boolean env var: unset, empty, `0`, `false`, `no`, `off` are all false.
+/// (`VELOGIN_DRY_RUN=0` used to *enable* dry run because only presence counted.)
+fn parse_flag(v: &str) -> bool {
+    !matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| parse_flag(&v))
+}
+
+/// `fd` is a pipe (the password pipe the greeter hands over), not a regular
+/// file, tty or a stray low fd someone smuggled in through argv.
+fn fd_is_pipe(fd: i32) -> bool {
+    if fd <= 2 {
+        return false;
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe { libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO }
+}
+
 fn main() {
     // Second stage: re-exec'd clean session helper (see reexec_into_session).
     // A fresh process image — no Slint/GL/libseat threads, no possibly-wedged
@@ -259,7 +282,7 @@ fn main() {
         return;
     }
 
-    let dry_run = std::env::var("VELOGIN_DRY_RUN").is_ok();
+    let dry_run = env_flag("VELOGIN_DRY_RUN");
     check_prerequisites(dry_run);
 
     let sessions = session::detect();
@@ -325,8 +348,8 @@ fn main() {
     if let Ok(hn) = std::fs::read_to_string("/etc/hostname") {
         ui.set_hostname(hn.trim().into());
     }
-    if let Some(img) = state::wallpaper_path().and_then(|p| load_image(&p)) {
-        ui.set_wallpaper(img);
+    if let Some(buf) = state::wallpaper_path().and_then(|p| decode_image(&p, &WALLPAPER_CAPS)) {
+        ui.set_wallpaper(slint::Image::from_rgba8(buf));
         ui.set_has_wallpaper(true);
     }
     // User enumeration & preselection
@@ -387,7 +410,7 @@ fn main() {
     // Oh-shit key (HOME, bound in velogin.slint's killswitch
     // FocusScope): bail exactly like closing the dev window — quit the event
     // loop with no PENDING login set, so the post-run() teardown below (drop
-    // ui → release DRM/libseat, sleep, close_lingering_fds) runs and we exit
+    // ui → release DRM/libseat, close_lingering_fds) runs and we exit
     // without spawning a session.
     ui.on_emergency_exit(|| {
         eprintln!("[velogin] emergency exit (HOME) — bailing out");
@@ -640,10 +663,22 @@ fn reexec_into_session(
 /// waits for the session and closes PAM when it ends. Then we exit and systemd
 /// (Restart=always) respawns the greeter.
 fn run_session_helper(argv: &[String]) {
+    // The helper does no authentication of its own beyond what PAM does with
+    // the piped password, and it trusts argv for user/exec. Only the greeter
+    // (root) is supposed to start it; refuse anyone else outright, and refuse
+    // a password fd that isn't the pipe the greeter made.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("[velogin:session] refusing to run: the session helper must be started by the root greeter");
+        std::process::exit(1);
+    }
     let username = argv.get(2).cloned().unwrap_or_default();
     let name = argv.get(3).cloned().unwrap_or_default();
     let exec = argv.get(4).cloned().unwrap_or_default();
     let rd: i32 = argv.get(5).and_then(|s| s.parse().ok()).unwrap_or(-1);
+    if !fd_is_pipe(rd) {
+        eprintln!("[velogin:session] refusing to run: fd {rd} is not the password pipe");
+        std::process::exit(1);
+    }
 
     // Drains and closes the pipe fd. The password is needed here: launch()
     // authenticates on the same PAM handle it opens the session on, which is
@@ -694,21 +729,95 @@ fn read_pipe_password(fd: i32) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// Limits for decoding an image file. Avatars come from a user-writable
+/// settings panel and are decoded *as root before login*, so they are hard
+/// capped (file size, dimensions, decoder allocation) and decoded off the UI
+/// thread. The wallpaper lives in root-owned `/etc/velogin` and gets roomier
+/// limits (a 5K/8K background is legitimate).
+struct ImageCaps {
+    max_bytes: u64,
+    max_dim: u32,
+    max_alloc: u64,
+}
+
+const AVATAR_CAPS: ImageCaps = ImageCaps {
+    max_bytes: 2 * 1024 * 1024,
+    max_dim: 2048,
+    max_alloc: 64 * 1024 * 1024,
+};
+
+const WALLPAPER_CAPS: ImageCaps = ImageCaps {
+    max_bytes: 64 * 1024 * 1024,
+    max_dim: 16384,
+    max_alloc: 1024 * 1024 * 1024,
+};
+
+type Pixels = slint::SharedPixelBuffer<slint::Rgba8Pixel>;
+
+/// Latest avatar request; a decode that finishes for an older one is dropped.
+static AVATAR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn avatar_cache() -> &'static Mutex<std::collections::HashMap<String, Option<Pixels>>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Option<Pixels>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn apply_avatar(ui: &LoginWindow, px: Option<Pixels>) {
+    match px {
+        Some(buf) => {
+            ui.set_avatar(slint::Image::from_rgba8(buf));
+            ui.set_has_avatar(true);
+        }
+        None => ui.set_has_avatar(false),
+    }
+}
+
+/// Update the initial letter at once; the avatar image only when a file exists,
+/// from cache or from a worker thread (never a decode on the UI thread, and
+/// never twice for the same user, since this runs on every typed character).
 fn load_avatar(ui: &LoginWindow, username: &str) {
-    let initial = username
-        .trim()
+    use std::sync::atomic::Ordering::SeqCst;
+    let name = username.trim();
+    let initial = name
         .chars()
         .next()
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_else(|| "?".into());
     ui.set_user_initial(initial.into());
-    match state::avatar_path(username.trim()).and_then(|p| load_image(&p)) {
-        Some(img) => {
-            ui.set_avatar(img);
-            ui.set_has_avatar(true);
-        }
-        None => ui.set_has_avatar(false),
+
+    let generation = AVATAR_GEN.fetch_add(1, SeqCst) + 1;
+    let Some(path) = state::avatar_path(name) else {
+        ui.set_has_avatar(false);
+        return;
+    };
+    let cached = avatar_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .cloned();
+    if let Some(px) = cached {
+        apply_avatar(ui, px);
+        return;
     }
+    ui.set_has_avatar(false);
+    let weak = ui.as_weak();
+    let key = name.to_string();
+    std::thread::spawn(move || {
+        let px = decode_image(&path, &AVATAR_CAPS);
+        avatar_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, px.clone());
+        let _ = slint::invoke_from_event_loop(move || {
+            if AVATAR_GEN.load(SeqCst) != generation {
+                return;
+            }
+            if let Some(ui) = weak.upgrade() {
+                apply_avatar(&ui, px);
+            }
+        });
+    });
 }
 
 /// Local time as ("HH:MM:SS", "Weekday, Month D") via libc — no chrono dep.
@@ -727,13 +836,39 @@ fn now_strings() -> (String, String) {
 }
 
 /// Decode an image by *content*, not extension — AccountsService avatars are
-/// extensionless, which Slint's own load_from_path can't identify.
-fn load_image(path: &std::path::Path) -> Option<slint::Image> {
-    let bytes = std::fs::read(path).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.into_rgba8();
+/// extensionless, which Slint's own load_from_path can't identify. Reads at
+/// most `max_bytes + 1` (so a huge or endless file can't balloon memory) and
+/// runs the decoder under dimension and allocation limits. `None` on anything
+/// over a cap or not a PNG/JPEG.
+fn decode_image(path: &std::path::Path, caps: &ImageCaps) -> Option<Pixels> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(caps.max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > caps.max_bytes {
+        eprintln!("[velogin] {} is over {} bytes; ignoring", path.display(), caps.max_bytes);
+        return None;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(caps.max_dim);
+    limits.max_image_height = Some(caps.max_dim);
+    limits.max_alloc = Some(caps.max_alloc);
+    reader.limits(limits);
+    let img = match reader.decode() {
+        Ok(i) => i.into_rgba8(),
+        Err(e) => {
+            eprintln!("[velogin] cannot decode {}: {e}", path.display());
+            return None;
+        }
+    };
     let (w, h) = img.dimensions();
-    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(img.as_raw(), w, h);
-    Some(slint::Image::from_rgba8(buf))
+    Some(Pixels::clone_from_slice(img.as_raw(), w, h))
 }
 
 /// Drop the last char of a string (UTF-8 aware) — Slint can't slice strings.
@@ -843,5 +978,66 @@ fn power_action(verb: &str) {
     let st = std::process::Command::new("systemctl").arg(verb).status();
     if !st.map(|s| s.success()).unwrap_or(false) {
         eprintln!("[velogin] systemctl {verb} failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_png(name: &str, w: u32, h: u32) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("velogin-img-{name}-{}", std::process::id()));
+        image::RgbaImage::new(w, h)
+            .save_with_format(&p, image::ImageFormat::Png)
+            .unwrap();
+        p
+    }
+
+    #[test]
+    fn flag_parsing() {
+        for t in ["1", "true", "yes", "on", "TRUE", " 1 ", "anything"] {
+            assert!(parse_flag(t), "{t:?}");
+        }
+        for f in ["", "0", "false", "no", "off", "OFF", "  "] {
+            assert!(!parse_flag(f), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn fd_is_pipe_accepts_pipes_only() {
+        let mut p = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        assert!(fd_is_pipe(p[0]));
+        let f = std::fs::File::open("/dev/null").unwrap();
+        use std::os::fd::AsRawFd;
+        assert!(!fd_is_pipe(f.as_raw_fd()));
+        assert!(!fd_is_pipe(0) && !fd_is_pipe(-1) && !fd_is_pipe(2));
+        unsafe {
+            libc::close(p[0]);
+            libc::close(p[1]);
+        }
+    }
+
+    #[test]
+    fn decode_accepts_small_png() {
+        let p = write_png("ok", 16, 8);
+        let px = decode_image(&p, &AVATAR_CAPS).expect("decodes");
+        assert_eq!((px.width(), px.height()), (16, 8));
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn decode_rejects_oversize_dimensions_bytes_and_garbage() {
+        let wide = write_png("wide", 3000, 4);
+        assert!(decode_image(&wide, &AVATAR_CAPS).is_none(), "3000px > 2048 cap");
+        assert!(decode_image(&wide, &WALLPAPER_CAPS).is_some(), "fine for a wallpaper");
+        let tiny_cap = ImageCaps { max_bytes: 10, max_dim: 2048, max_alloc: 1 << 20 };
+        assert!(decode_image(&wide, &tiny_cap).is_none(), "over the byte cap");
+        std::fs::remove_file(wide).unwrap();
+
+        let junk = std::env::temp_dir().join(format!("velogin-img-junk-{}", std::process::id()));
+        std::fs::write(&junk, b"not an image at all").unwrap();
+        assert!(decode_image(&junk, &AVATAR_CAPS).is_none());
+        std::fs::remove_file(junk).unwrap();
     }
 }

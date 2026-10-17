@@ -1,5 +1,9 @@
 # Velogin login manager (veil-login)
-# — install to /etc/systemd/system/velogin.service
+#
+# Source-install paths (dist/install.sh): /usr/local/bin/velogin and this file
+# in /etc/systemd/system. A package install uses /usr/bin and
+# /usr/lib/systemd/system instead; don't mix the two (the /etc copy would
+# shadow the packaged unit after an upgrade).
 #
 # Full install (needs root):
 #   install -Dm644 dist/pam.d/velogin /etc/pam.d/velogin
@@ -11,6 +15,10 @@
 # Restart=always is load-bearing: velogin exits after each session ends
 # (one login per process life), and systemd respawning it IS the
 # return-to-greeter loop.
+#
+# The VT is whatever TTYPath points at: velogin derives it from its own stdin
+# tty (no XDG_VTNR needed). To run on another VT, change TTYPath here and the
+# getty@ttyN name in Conflicts/After.
 
 [Unit]
 Description=Velogin login manager (veil-login)
@@ -25,7 +33,6 @@ ExecStart=/usr/local/bin/velogin
 Restart=always
 RestartSec=1
 Environment=XDG_SEAT=seat0
-Environment=XDG_VTNR=1
 Environment=LIBSEAT_BACKEND=logind
 SupplementaryGroups=video input render
 TTYPath=/dev/tty1

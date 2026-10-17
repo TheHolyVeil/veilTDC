@@ -36,12 +36,15 @@ struct UiConversation<F: FnMut(String) + Send> {
 }
 
 impl<F: FnMut(String) + Send> UiConversation<F> {
-    fn new(username: &str, password: &str, on_message: F) -> Self {
-        Self {
-            username: CString::new(username).unwrap_or_default(),
-            password: CString::new(password).unwrap_or_default(),
+    /// Fails on an embedded NUL instead of silently turning the credential into
+    /// an empty string (which would authenticate against "" and tell the user
+    /// nothing useful). PAM speaks C strings, so such a password can't be sent.
+    fn new(username: &str, password: &str, on_message: F) -> Result<Self, std::ffi::NulError> {
+        Ok(Self {
+            username: CString::new(username)?,
+            password: CString::new(password)?,
             on_message,
-        }
+        })
     }
 }
 
@@ -92,7 +95,7 @@ pub enum LaunchError {
     UnknownUser(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
-    #[error("user field contains NUL")]
+    #[error("username or password contains a NUL byte")]
     BadString(#[from] std::ffi::NulError),
 }
 
@@ -108,8 +111,8 @@ pub fn verify(
     username: &str,
     password: &str,
     on_message: impl FnMut(String) + Send + 'static,
-) -> Result<(), pam_client2::Error> {
-    let conv = UiConversation::new(username, password, on_message);
+) -> Result<(), LaunchError> {
+    let conv = UiConversation::new(username, password, on_message)?;
     let mut ctx = Context::new("velogin", Some(username), conv)?;
     ctx.authenticate(Flag::NONE)?;
     ctx.acct_mgmt(Flag::NONE)?;
@@ -159,7 +162,7 @@ pub fn launch(
     // again — messages are only logged here.
     let conv = UiConversation::new(username, password, |msg: String| {
         eprintln!("[velogin:pam] {msg}");
-    });
+    })?;
     let mut ctx = Context::new("velogin", Some(username), conv)?;
     ctx.authenticate(Flag::NONE)?;
     ctx.acct_mgmt(Flag::NONE)?;
@@ -553,6 +556,14 @@ mod tests {
     }
     fn c(p: &std::path::Path) -> CString {
         CString::new(p.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn conversation_rejects_nul_instead_of_blanking_the_credential() {
+        use super::UiConversation;
+        assert!(UiConversation::new("abyss", "pass\0word", |_| {}).is_err());
+        assert!(UiConversation::new("ab\0yss", "pw", |_| {}).is_err());
+        assert!(UiConversation::new("abyss", "pw", |_| {}).is_ok());
     }
 
     #[test]

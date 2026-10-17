@@ -10,7 +10,7 @@ Abyss is a modern, minimal login manager built with Slint UI that runs on bare T
 - **PAM Authentication** — Full two-stage PAM flow, keyring support, account lockout respect
 - **Session Selection** — Choose between VoidWM (Veil), shell, or custom sessions
 - **Avatar Support** — Load user avatars from system (fallback to placeholder)
-- **Wallpaper Background** — Custom background image at `/etc/abyss/background.png`
+- **Wallpaper Background** — Custom background image at `/etc/velogin/background.png`
 - **Login Cooldown** — Progressive backoff after failed attempts (security)
 - **Virtual Keyboard** — Onscreen keyboard support for touch/accessibility
 - **GPU Rendering** — Slint with GPU via EGL/GBM, fallback to software
@@ -24,14 +24,14 @@ See main Void/Veil README for installation instructions.
 
 ### Background Image
 
-Place your background image at `/etc/velogin/background.png` (or `/etc/abyss/background.png` legacy path):
+Place your background image at `/etc/velogin/background.png`:
 
 ```bash
 sudo mkdir -p /etc/velogin
 sudo cp your-background.png /etc/velogin/background.png
 ```
 
-Supported formats: PNG, JPEG. Recommended: 1920×1080 or higher. Note: Existing wallpapers in `/etc/abyss/background.png` are automatically detected via fallback—no file renaming is required.
+Supported formats: PNG, JPEG. Recommended: 1920×1080 or higher.
 
 ### Custom Sessions
 
@@ -154,12 +154,12 @@ Flow:
 
 ### No background image showing
 
-**Cause:** `/etc/abyss/background.png` missing or invalid.
+**Cause:** `/etc/velogin/background.png` missing or invalid.
 
 **Fix:**
-1. Verify file exists: `ls -la /etc/abyss/background.png`
-2. Check permissions: `sudo chmod 644 /etc/abyss/background.png`
-3. Verify format: `file /etc/abyss/background.png`
+1. Verify file exists: `ls -la /etc/velogin/background.png`
+2. Check permissions: `sudo chmod 644 /etc/velogin/background.png`
+3. Verify format: `file /etc/velogin/background.png`
 4. If missing, Abyss will use solid background (fallback works fine)
 
 ### GPU rendering not working, falling back to software
@@ -191,9 +191,9 @@ cd veil/veil-login
 
 cargo build --release
 
-sudo install -m755 target/release/velogin /usr/bin/abyss
-sudo install -m755 dist/velogin.service /etc/systemd/system/abyss.service
-sudo install -m755 dist/pam.d/velogin /etc/pam.d/abyss
+sudo install -m755 target/release/velogin /usr/local/bin/velogin
+sudo install -m644 dist/velogin.service /etc/systemd/system/velogin.service
+sudo install -m644 dist/pam.d/velogin /etc/pam.d/velogin
 ```
 
 ## Dependencies
