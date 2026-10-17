@@ -599,7 +599,7 @@ impl CompositorHandler for State {
 
                 // Try shm first, then dmabuf.
                 let imported = with_buffer_contents(&buffer, |ptr, len, data| {
-                    tracing::info!(
+                    tracing::debug!(
                         "commit {} shm {}x{} fmt={:?}",
                         surface.id(),
                         data.width,
@@ -613,7 +613,7 @@ impl CompositorHandler for State {
                 .flatten()
                 .or_else(|| {
                     let dmabuf = get_dmabuf(&buffer).ok()?;
-                    tracing::info!(
+                    tracing::debug!(
                         "commit {} dma {}x{} fmt={:?} mod={:?}",
                         surface.id(),
                         dmabuf.width(),
@@ -646,7 +646,7 @@ impl CompositorHandler for State {
                 });
 
                 if let Some((w, h)) = imported {
-                    tracing::info!("commit {} → surface_buffers {}x{}", surface.id(), w, h);
+                    tracing::debug!("commit {} → surface_buffers {}x{}", surface.id(), w, h);
                     self.surface_buffers
                         .insert(surface.id(), SurfaceBuf { rgba: dest, w, h });
                     match toplevel_rect_for(self, surface) {
@@ -801,7 +801,8 @@ impl XdgShellHandler for State {
         _output: Option<wl_output::WlOutput>,
     ) {
         let wl = surface.wl_surface().clone();
-        let idx = active_monitor_idx(self);
+        // The window's own monitor, not the one under the pointer (S10).
+        let idx = window_monitor(self, &wl).unwrap_or_else(|| active_monitor_idx(self));
         let ws = self.monitors[idx].active_workspace;
         if let Some(i) = self
             .toplevels
@@ -812,20 +813,13 @@ impl XdgShellHandler for State {
             self.monitors[idx].layout.focused = i;
         }
         self.monitors[idx].fullscreen = Some(wl);
-        relayout(self);
+        relayout_monitor(self, idx);
         refocus_keyboard(self);
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        // Client-initiated, not keyboard-triggered — don't assume this is
-        // the active (cursor) monitor. Look up which monitor actually has
-        // this window fullscreen instead. Known 2a/2b limitation: relayout()
-        // below still only ever retiles the ACTIVE monitor internally (see
-        // its doc), so if this window's monitor isn't the active one, its
-        // own retile is delayed until that monitor next goes dirty for some
-        // other reason. Invisible with one monitor (today); a real fix
-        // means relayout() accepting an explicit monitor instead of always
-        // resolving its own — noted for Phase 2b/3, not fixed here.
+        // Client-initiated, not keyboard-triggered — look up which monitor
+        // actually has this window fullscreen and retile THAT monitor.
         let wl = surface.wl_surface().clone();
         if let Some(idx) = self
             .monitors
@@ -833,7 +827,7 @@ impl XdgShellHandler for State {
             .position(|m| m.fullscreen.as_ref() == Some(&wl))
         {
             self.monitors[idx].fullscreen = None;
-            relayout(self);
+            relayout_monitor(self, idx);
         }
     }
 }
@@ -1882,6 +1876,16 @@ fn active_monitor_idx(state: &State) -> usize {
         .unwrap_or(0)
 }
 
+/// The monitor a toplevel lives on, by its root surface (`None` if unknown).
+fn window_monitor(state: &State, surface: &WlSurface) -> Option<usize> {
+    state
+        .toplevels
+        .iter()
+        .find(|t| t.wl_surface().as_ref() == Some(surface))
+        .map(|t| t.monitor)
+        .filter(|&m| m < state.monitors.len())
+}
+
 /// Run a Combo-4 keybind action against the live layout, then re-tile and
 /// re-focus so the client sees the result immediately.
 /// Alt+Tab / Alt+Shift+Tab: advance `layout.focused` through live windows
@@ -2271,8 +2275,15 @@ const BAR_HEIGHT: u32 = 12;
 /// whenever the live window set or the output size changes. Also marks the
 /// focused window Activated (others deactivated) so clients render focus state.
 fn relayout(state: &mut State) {
-    state.focus_cache = None;
     let idx = active_monitor_idx(state);
+    relayout_monitor(state, idx);
+}
+
+/// [`relayout`] for an explicit monitor. Client-driven requests (fullscreen,
+/// unfullscreen) concern the window's own monitor, which need not be the one
+/// under the pointer.
+fn relayout_monitor(state: &mut State, idx: usize) {
+    state.focus_cache = None;
     let ws = state.monitors[idx].active_workspace;
     let n = state
         .toplevels
@@ -3998,7 +4009,7 @@ impl XwmHandler for State {
         let Some(wl) = window.wl_surface() else {
             return;
         };
-        let idx = active_monitor_idx(self);
+        let idx = window_monitor(self, &wl).unwrap_or_else(|| active_monitor_idx(self));
         let ws = self.monitors[idx].active_workspace;
         if let Some(i) = self
             .toplevels
@@ -4009,7 +4020,7 @@ impl XwmHandler for State {
             self.monitors[idx].layout.focused = i;
         }
         self.monitors[idx].fullscreen = Some(wl);
-        relayout(self);
+        relayout_monitor(self, idx);
         refocus_keyboard(self);
     }
 
@@ -4023,7 +4034,7 @@ impl XwmHandler for State {
                 .position(|m| m.fullscreen.as_ref() == Some(&wl))
             {
                 self.monitors[idx].fullscreen = None;
-                relayout(self);
+                relayout_monitor(self, idx);
             }
         }
     }
@@ -4651,4 +4662,114 @@ pub fn run(
     crate::vt::emergency_restore();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use smithay::wayland::shm::BufferData;
+
+    fn bd(w: i32, h: i32, stride: i32, offset: i32, format: wl_shm::Format) -> BufferData {
+        BufferData {
+            offset,
+            width: w,
+            height: h,
+            stride,
+            format,
+        }
+    }
+
+    #[test]
+    fn shm_argb_swaps_channels_and_keeps_alpha() {
+        let raw = [10u8, 20, 30, 128, 1, 2, 3, 255]; // two BGRA px
+        let mut out = Vec::new();
+        let got = shm_to_rgba_into(&raw, &bd(2, 1, 8, 0, wl_shm::Format::Argb8888), &mut out);
+        assert_eq!(got, Some((2, 1)));
+        assert_eq!(out, [30, 20, 10, 128, 3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn shm_x_formats_force_opaque() {
+        let raw = [10u8, 20, 30, 0];
+        let mut out = Vec::new();
+        shm_to_rgba_into(&raw, &bd(1, 1, 4, 0, wl_shm::Format::Xrgb8888), &mut out).unwrap();
+        assert_eq!(out, [30, 20, 10, 255]);
+        shm_to_rgba_into(&raw, &bd(1, 1, 4, 0, wl_shm::Format::Xbgr8888), &mut out).unwrap();
+        assert_eq!(out, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn shm_offset_is_part_of_the_bounds_check() {
+        let mut out = Vec::new();
+        let raw = [9u8, 9, 9, 9, 1, 2, 3, 4];
+        let f = wl_shm::Format::Abgr8888;
+        assert!(shm_to_rgba_into(&raw, &bd(1, 1, 4, 4, f), &mut out).is_some());
+        assert_eq!(out, [1, 2, 3, 4]);
+        // offset + row no longer fits: must be None, not a slice panic (S7).
+        assert!(shm_to_rgba_into(&raw[..7], &bd(1, 1, 4, 4, f), &mut out).is_none());
+        // last row of a multi-row buffer overruns once offset is added
+        assert!(shm_to_rgba_into(&raw, &bd(1, 2, 4, 4, f), &mut out).is_none());
+    }
+
+    #[test]
+    fn shm_rejects_hostile_geometry_without_touching_out() {
+        let raw = [0u8; 64];
+        let f = wl_shm::Format::Argb8888;
+        let mut out = vec![1u8, 2, 3];
+        for d in [
+            bd(-1, 1, 4, 0, f),
+            bd(1, -1, 4, 0, f),
+            bd(1, 1, -4, 0, f),
+            bd(1, 1, 4, -4, f),
+            bd(0, 1, 4, 0, f),
+            bd(4, 1, 8, 0, f), // stride < row bytes
+            bd(i32::MAX, i32::MAX, i32::MAX, i32::MAX, f),
+            bd(1, 1, 4, 0, wl_shm::Format::Rgb565), // unsupported format
+        ] {
+            assert!(shm_to_rgba_into(&raw, &d, &mut out).is_none());
+            assert_eq!(out, [1, 2, 3], "dest must survive a rejected buffer (S5)");
+        }
+    }
+
+    #[test]
+    fn surface_size_caps() {
+        assert!(surface_size_ok(1920, 1080));
+        assert!(!surface_size_ok(0, 10));
+        assert!(!surface_size_ok(MAX_SURFACE_DIM + 1, 1));
+        assert!(!surface_size_ok(usize::MAX, usize::MAX));
+    }
+
+    fn buf(px: [u8; 4]) -> SurfaceBuf {
+        SurfaceBuf { rgba: px.to_vec(), w: 1, h: 1 }
+    }
+
+    #[test]
+    fn blit_opaque_transparent_and_premultiplied() {
+        let mut back = vec![100u8, 100, 100, 255];
+        blit(&mut back, 1, 1, &buf([7, 8, 9, 255]), 0, 0);
+        assert_eq!(back, [7, 8, 9, 255]);
+
+        let mut back = vec![100u8, 100, 100, 255];
+        blit(&mut back, 1, 1, &buf([50, 50, 50, 0]), 0, 0);
+        assert_eq!(back, [100, 100, 100, 255], "alpha 0 leaves dst alone");
+
+        // premultiplied: out = src + dst * (255 - a) / 255 = 50 + 100 * 127 / 255
+        let mut back = vec![100u8, 100, 100, 255];
+        blit(&mut back, 1, 1, &buf([50, 50, 50, 128]), 0, 0);
+        assert_eq!(back, [99, 99, 99, 255]);
+
+        // colour brighter than alpha (invalid but seen) clamps instead of wrapping
+        let mut back = vec![200u8, 200, 200, 255];
+        blit(&mut back, 1, 1, &buf([250, 250, 250, 128]), 0, 0);
+        assert_eq!(back, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn blit_clips_to_the_back_buffer() {
+        let mut back = vec![0u8; 2 * 2 * 4];
+        let src = SurfaceBuf { rgba: vec![255; 3 * 3 * 4], w: 3, h: 3 };
+        blit(&mut back, 2, 2, &src, -1, -1); // overhangs top-left
+        blit(&mut back, 2, 2, &src, 5, 5); // entirely outside: no-op, no panic
+        assert!(back.iter().all(|&b| b == 255));
+    }
 }

@@ -86,19 +86,28 @@ struct Monitor {
 
 /// Enumerate `/dev/dri/card*` primary nodes, numerically sorted.
 pub(crate) fn list_cards() -> Vec<String> {
-    let mut cards: Vec<String> = std::fs::read_dir("/dev/dri")
+    let names = std::fs::read_dir("/dev/dri")
         .into_iter()
         .flatten()
         .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            name.strip_prefix("card")
-                .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
-                .map(|_| format!("/dev/dri/{name}"))
+        .filter_map(|e| e.file_name().into_string().ok());
+    sort_cards(names)
+}
+
+/// Keep `cardN` names, sorted by N (string order would put `card10` before `card2`).
+fn sort_cards(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut cards: Vec<(u32, String)> = names
+        .into_iter()
+        .filter_map(|name| {
+            let n = name.strip_prefix("card")?;
+            if n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            Some((n.parse().ok()?, format!("/dev/dri/{name}")))
         })
         .collect();
     cards.sort();
-    cards
+    cards.into_iter().map(|(_, p)| p).collect()
 }
 
 pub struct DrmOutput {
@@ -807,5 +816,20 @@ fn blit_rgba_to_xrgb(
         if copy_w < dw as usize {
             drow[copy_w * 4..].fill(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_cards;
+
+    #[test]
+    fn cards_sort_numerically_and_ignore_other_nodes() {
+        let names = ["card10", "renderD128", "card2", "card0", "card", "card1-DP-1", "by-path"]
+            .map(String::from);
+        assert_eq!(
+            sort_cards(names),
+            ["/dev/dri/card0", "/dev/dri/card2", "/dev/dri/card10"]
+        );
     }
 }
