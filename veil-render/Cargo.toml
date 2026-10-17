@@ -9,3 +9,7 @@ flate2 = { workspace = true }
 wgpu        = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
 pollster    = "1"
 bytemuck    = { version = "1.25", features = ["derive"] }
+
+[dev-dependencies]
+# braille_preview example reads arbitrary screenshots and writes PNGs.
+image = { workspace = true, features = ["png", "jpeg"] }

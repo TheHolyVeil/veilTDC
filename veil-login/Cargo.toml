@@ -3,7 +3,7 @@ name    = "veil-login"
 version = "0.1.0"
 edition = "2021"
 
-# Abyss — graphical TTY login manager for the Veil/Void ecosystem.
+# Velogin: graphical TTY login manager for the Veil ecosystem.
 # Slint UI on DRM/KMS (no X11/Wayland needed), PAM auth, session spawn.
 
 [[bin]]
@@ -20,7 +20,8 @@ slint = { version = "1.18", default-features = false, features = [
     "renderer-software",    # fallback for weak/embedded hardware
 ] }
 pam-client2 = "0.5"
-image       = { workspace = true }
+# Pre-auth decoder runs as root on untrusted files: PNG + JPEG only (LG7).
+image       = { workspace = true, features = ["png", "jpeg"] }
 uzers       = "0.12"
 thiserror   = "2"
 libc        = { workspace = true }
