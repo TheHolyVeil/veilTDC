@@ -568,3 +568,72 @@ fn base64_encode(data: &[u8]) -> String {
     }
     String::from_utf8(out).unwrap()
 }
+
+#[cfg(test)]
+mod subpixel_tests {
+    use super::*;
+
+    fn rgba(px: &[[u8; 3]]) -> Vec<u8> {
+        px.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect()
+    }
+    const WHITE: [u8; 3] = [255, 255, 255];
+    const BLACK: [u8; 3] = [0, 0, 0];
+
+    #[test]
+    fn glyph_tables() {
+        assert_eq!(braille_glyph(0), ' ');
+        assert_eq!(braille_glyph(0xFF), '\u{28FF}');
+        assert_eq!(braille_glyph(0b01), '\u{2801}'); // UL dot
+        assert_eq!(braille_glyph(0b10), '\u{2808}'); // UR dot
+        assert_eq!(quadrant_glyph(0), ' ');
+        assert_eq!(quadrant_glyph(15), '█');
+        assert_eq!(quadrant_glyph(0b0011), '▀'); // top row
+        assert_eq!(quadrant_glyph(0b1100), '▄'); // bottom row
+        assert_eq!(quadrant_glyph(0b0101), '▌'); // left column
+        assert_eq!(quadrant_glyph(0b1010), '▐'); // right column
+        assert_eq!(QUAD_CP.len(), 16);
+    }
+
+    #[test]
+    fn degenerate_sizes_do_not_panic() {
+        let one = rgba(&[WHITE]);
+        assert!(rgba_to_quadrant(&one, 1, 1, 0, 5).is_empty());
+        assert!(rgba_to_quadrant(&one, 1, 1, 5, 0).is_empty());
+        assert!(rgba_to_braille(&one, 0, 1, 2, 2).is_empty());
+        assert!(rgba_to_braille(&one, 1, 0, 2, 2).is_empty());
+        // 1x1 source, 1x1 cell, and a source far smaller than the cell grid.
+        assert_eq!(rgba_to_quadrant(&one, 1, 1, 1, 1).len(), 1);
+        assert_eq!(rgba_to_braille(&one, 1, 1, 4, 3).len(), 12);
+    }
+
+    #[test]
+    fn uniform_cell_is_blank_with_matching_colours() {
+        let img = rgba(&[[10, 20, 30]; 4]);
+        let c = &rgba_to_quadrant(&img, 2, 2, 1, 1)[0];
+        assert_eq!(c.ch, ' ');
+        assert_eq!(c.fg, c.bg);
+        assert_eq!(c.bg, [10, 20, 30]);
+    }
+
+    #[test]
+    fn top_bright_bottom_dark_is_upper_half_block() {
+        let img = rgba(&[WHITE, WHITE, BLACK, BLACK]);
+        let c = &rgba_to_quadrant(&img, 2, 2, 1, 1)[0];
+        assert_eq!((c.ch, c.fg, c.bg), ('▀', WHITE, BLACK));
+    }
+
+    #[test]
+    fn midrange_keeps_the_stroke_mean_would_smear() {
+        // luma 0, 0, 100, 200: mean (75) lights two sub-pixels, the mid-range
+        // cut (100) lights only the brightest.
+        let img = rgba(&[BLACK, BLACK, [100; 3], [200; 3]]);
+        assert_eq!(rgba_to_quadrant_with(&img, 2, 2, 1, 1, Threshold::Mean)[0].ch, '▄');
+        assert_eq!(rgba_to_quadrant_with(&img, 2, 2, 1, 1, Threshold::MidRange)[0].ch, '▗');
+        // Below the 60-level contrast bar MidRange falls back to Mean.
+        let flat = rgba(&[[100; 3], [100; 3], [110; 3], [120; 3]]);
+        assert_eq!(
+            rgba_to_quadrant_with(&flat, 2, 2, 1, 1, Threshold::MidRange)[0].ch,
+            rgba_to_quadrant_with(&flat, 2, 2, 1, 1, Threshold::Mean)[0].ch
+        );
+    }
+}
