@@ -1,7 +1,7 @@
 -- veil-host configuration file
 -- Place at ./config.lua or ~/.config/veil/config.lua
 
-quality = "auto" -- auto | kitty | pixel | ascii | ascii_edge
+quality = "auto" -- auto | kitty | pixel | pixel256 | pixel16 | ascii | ascii_edge
 fps = 60 -- compositor frame rate cap
 cage_timeout_secs = 8 -- timeout for caged output
 input = true -- enable input forwarding

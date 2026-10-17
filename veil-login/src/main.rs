@@ -22,16 +22,197 @@ slint::include_modules!();
 /// Handoff from the auth thread to the main thread across the event-loop quit.
 static PENDING: Mutex<Option<(String, String, usize)>> = Mutex::new(None);
 
-fn detect_current_tty() -> i32 {
-    if let Ok(active) = std::fs::read_to_string("/sys/class/tty/tty0/active") {
-        let active = active.trim();
-        if let Some(num_str) = active.strip_prefix("tty") {
-            if let Ok(num) = num_str.parse::<i32>() {
-                return num;
-            }
+/// VT switch requested from the greeter UI (0 = none). The switch is performed
+/// *after* the UI/DRM/seat are torn down (see `main`), never from inside the
+/// running event loop: Slint's linuxkms backend cannot survive its seat being
+/// disabled underneath it (`SeatEvent::Disable => unimplemented!`, or an EACCES
+/// on the next page flip, which is the "Permission denied" crash we saw).
+static SWITCH_TO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn active_vt() -> Option<i32> {
+    std::fs::read_to_string("/sys/class/tty/tty0/active")
+        .ok()?
+        .trim()
+        .strip_prefix("tty")?
+        .parse()
+        .ok()
+}
+
+/// The VT this greeter *belongs to*: the VT of its own stdin tty (the unit sets
+/// `TTYPath=/dev/tty1`), then `$XDG_VTNR`, and only then whichever VT happens
+/// to be in front. Using the foreground VT first (the old behaviour) made every
+/// respawn land on whatever VT you had just switched to, so velogin hijacked
+/// tty2/tty3 and registered its logind session on the wrong VT.
+fn own_vt() -> i32 {
+    let from_tty = unsafe {
+        let name = libc::ttyname(0);
+        if name.is_null() {
+            None
+        } else {
+            std::ffi::CStr::from_ptr(name)
+                .to_str()
+                .ok()
+                .and_then(|s| s.strip_prefix("/dev/tty"))
+                .and_then(|n| n.parse::<i32>().ok())
+        }
+    };
+    from_tty
+        .or_else(|| std::env::var("XDG_VTNR").ok()?.parse().ok())
+        .or_else(active_vt)
+        .unwrap_or(1)
+}
+
+/// Idle (no DRM, no logind session, no UI) until `vt` is in front. After a
+/// VT switch the greeter exits and systemd respawns it at once; the respawn must
+/// not grab the display from the VT you switched to, so it waits here until you
+/// come back. A 0.3s sysfs poll costs nothing.
+fn wait_until_vt_active(vt: i32) {
+    if active_vt().is_none_or(|a| a == vt) {
+        return;
+    }
+    eprintln!("[velogin] tty{vt} is not in front; waiting for it");
+    while active_vt().is_some_and(|a| a != vt) {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+/// Owns the forked process that holds the greeter's logind session open.
+/// Dropping it closes the keepalive pipe (the holder sees EOF, closes its PAM
+/// session, exits) and reaps it, so the session is gone before we go on.
+struct GreeterHolder {
+    keepalive: i32,
+    pid: libc::pid_t,
+}
+
+impl Drop for GreeterHolder {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.keepalive);
+            let mut st = 0;
+            libc::waitpid(self.pid, &mut st, 0);
         }
     }
-    1
+}
+
+/// Register the greeter with logind from a *forked holder process* and return
+/// its session id.
+///
+/// pam_systemd moves the process that calls `pam_open_session` into the new
+/// session's scope. If the main velogin process did that, it would still be
+/// "in a session" when it later opens the *user's* PAM session, and logind
+/// refuses to create a second session for a process that is already in one
+/// ("Already running in a session"). pam_systemd treats that as success and
+/// only logs at debug level, so the login appeared to work: PAM said OK, no
+/// logind session for the user was ever created, and the compositor's libseat
+/// (logind backend) died in ~300 ms. With the holder, the main process never
+/// joins a session; it reads the id and exports `XDG_SESSION_ID`, which
+/// libseat uses when the process is not itself in a session.
+fn open_greeter_session(vt: i32) -> Option<(GreeterHolder, String)> {
+    let mut info = [0i32; 2];
+    let mut keep = [0i32; 2];
+    unsafe {
+        if libc::pipe2(info.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            return None;
+        }
+        if libc::pipe2(keep.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            libc::close(info[0]);
+            libc::close(info[1]);
+            return None;
+        }
+    }
+    // Forked before Slint/GL start any thread, so running ordinary Rust (PAM)
+    // in the child is safe.
+    match unsafe { libc::fork() } {
+        -1 => {
+            unsafe {
+                for fd in [info[0], info[1], keep[0], keep[1]] {
+                    libc::close(fd);
+                }
+            }
+            None
+        }
+        0 => {
+            unsafe {
+                libc::close(info[0]);
+                libc::close(keep[1]);
+            }
+            greeter_holder_child(vt, info[1], keep[0])
+        }
+        pid => {
+            unsafe {
+                libc::close(info[1]);
+                libc::close(keep[0]);
+            }
+            let holder = GreeterHolder {
+                keepalive: keep[1],
+                pid,
+            };
+            let mut buf = [0u8; 32];
+            let n = loop {
+                let n = unsafe { libc::read(info[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break n;
+                }
+            };
+            unsafe { libc::close(info[0]) };
+            let id = if n > 0 {
+                String::from_utf8_lossy(&buf[..n as usize]).trim().to_string()
+            } else {
+                String::new()
+            };
+            if id.is_empty() || id == "-" {
+                return None; // holder exits on its own; Drop reaps it
+            }
+            Some((holder, id))
+        }
+    }
+}
+
+/// Child side of [`open_greeter_session`]: open the PAM/logind session, report
+/// its id, then park until the parent closes the keepalive pipe (or dies, which
+/// also reads as EOF, so a crashed greeter can't leak its session).
+fn greeter_holder_child(vt: i32, info_wr: i32, keep_rd: i32) -> ! {
+    let fail = |msg: &str| -> ! {
+        eprintln!("[velogin] greeter session: {msg}");
+        unsafe {
+            libc::write(info_wr, b"-".as_ptr() as *const _, 1);
+            libc::_exit(1)
+        }
+    };
+    let Ok(mut ctx) = pam_client2::Context::new("velogin", Some("root"), GreeterConv) else {
+        fail("PAM context failed")
+    };
+    let _ = ctx.set_tty(Some(&format!("tty{vt}")));
+    let _ = ctx.putenv(format!("XDG_VTNR={vt}"));
+    let _ = ctx.putenv("XDG_SEAT=seat0");
+    let _ = ctx.putenv("XDG_SESSION_CLASS=greeter");
+    let _ = ctx.putenv("XDG_SESSION_TYPE=wayland");
+    let session = match ctx.open_session(pam_client2::Flag::NONE) {
+        Ok(s) => s,
+        Err(e) => fail(&format!("open_session failed: {e}")),
+    };
+    let mut id = String::new();
+    for (k, v) in session.envlist().iter_tuples() {
+        if k == "XDG_SESSION_ID" {
+            id = v.to_string_lossy().into_owned();
+        }
+    }
+    if id.is_empty() {
+        fail("pam_systemd did not create a logind session (no XDG_SESSION_ID)");
+    }
+    unsafe { libc::write(info_wr, format!("{id}\n").as_ptr() as *const _, id.len() + 1) };
+    unsafe { libc::close(info_wr) };
+    let mut b = [0u8; 1];
+    loop {
+        let n = unsafe { libc::read(keep_rd, b.as_mut_ptr() as *mut _, 1) };
+        if n == 0 || (n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR))
+        {
+            break;
+        }
+    }
+    drop(session); // pam_close_session
+    drop(ctx);
+    unsafe { libc::_exit(0) }
 }
 
 fn check_prerequisites(dry_run: bool) {
@@ -87,42 +268,34 @@ fn main() {
         sessions.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
     );
 
-    let current_tty = detect_current_tty();
-
-    // Register an active greeter session with systemd-logind (seat0/tty{current_tty})
-    // so libseat can acquire DRM master cleanly over D-Bus without seatd.
-    let mut greeter_ctx = if !dry_run
+    // Pinned to our own VT, not whichever is in front (see own_vt). If the user
+    // is on another VT right now (we were respawned after a VT switch), idle
+    // here instead of grabbing the display from them.
+    let current_tty = own_vt();
+    let bare_tty = !dry_run
         && std::env::var_os("WAYLAND_DISPLAY").is_none()
         && std::env::var_os("DISPLAY").is_none()
-        && unsafe { libc::geteuid() } == 0
-    {
-        pam_client2::Context::new("velogin", Some("root"), GreeterConv).ok()
-    } else {
-        None
-    };
+        && unsafe { libc::geteuid() } == 0;
+    if bare_tty {
+        wait_until_vt_active(current_tty);
+    }
 
-    let greeter_session = if let Some(ctx) = &mut greeter_ctx {
-        let _ = ctx.set_tty(Some(&format!("tty{current_tty}")));
-        let _ = ctx.putenv(format!("XDG_VTNR={current_tty}"));
-        let _ = ctx.putenv("XDG_SEAT=seat0");
-        let _ = ctx.putenv("XDG_SESSION_CLASS=greeter");
-        let _ = ctx.putenv("XDG_SESSION_TYPE=wayland");
-
+    // Register an active greeter session with systemd-logind (seat0/tty{current_tty})
+    // so libseat can acquire DRM master cleanly over D-Bus without seatd. Done
+    // from a forked holder process: see open_greeter_session for why this
+    // process must never join a logind session itself.
+    let greeter_holder = if bare_tty {
         eprintln!("[velogin] opening logind greeter session on seat0/tty{current_tty}…");
-        match ctx.open_session(pam_client2::Flag::NONE) {
-            Ok(session) => {
-                for (k, v) in session.envlist().iter_tuples() {
-                    if k == "XDG_SESSION_ID" {
-                        std::env::set_var("XDG_SESSION_ID", v);
-                    }
-                }
+        match open_greeter_session(current_tty) {
+            Some((holder, id)) => {
+                std::env::set_var("XDG_SESSION_ID", id);
                 std::env::set_var("XDG_SEAT", "seat0");
                 std::env::set_var("XDG_VTNR", current_tty.to_string());
                 std::env::set_var("LIBSEAT_BACKEND", "logind");
-                Some(session)
+                Some(holder)
             }
-            Err(e) => {
-                eprintln!("[velogin] warning: failed to open logind greeter session: {e}");
+            None => {
+                eprintln!("[velogin] warning: failed to open logind greeter session");
                 None
             }
         }
@@ -202,7 +375,14 @@ fn main() {
 
     ui.on_poweroff(|| power_action("poweroff"));
     ui.on_reboot(|| power_action("reboot"));
-    ui.on_switch_tty(switch_vt);
+    // Don't switch from inside the event loop: quit it, and `main` switches
+    // after the display and seat have been released (see SWITCH_TO).
+    ui.on_switch_tty(|n| {
+        if n > 0 {
+            SWITCH_TO.store(n, std::sync::atomic::Ordering::SeqCst);
+            let _ = slint::quit_event_loop();
+        }
+    });
 
     // Oh-shit key (HOME, bound in velogin.slint's killswitch
     // FocusScope): bail exactly like closing the dev window — quit the event
@@ -327,9 +507,17 @@ fn main() {
 
     // Release the window/backend (DRM master) and logind greeter session before spawning.
     drop(ui);
-    drop(greeter_session);
-    drop(greeter_ctx);
+    drop(greeter_holder);
     close_lingering_fds();
+
+    // VT switch requested from the UI: now that the display and seat are
+    // released, switch, then exit. systemd respawns us immediately and the
+    // respawn idles in wait_until_vt_active() until our VT is back in front.
+    let target = SWITCH_TO.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if target > 0 {
+        switch_vt(target);
+        return;
+    }
 
     // ── launch session, if a login succeeded ────────────────────────────────
     let Some((username, password, idx)) = PENDING.lock().unwrap().take() else {

@@ -129,14 +129,23 @@ fn is_bare_tty() -> bool {
     false
 }
 
+/// Terminal-backend settings from config.lua, passed as one value so adding a
+/// setting doesn't grow `detect`'s signature.
+#[derive(Clone)]
+pub struct TerminalOpts {
+    /// `None` when `gpu_render = false`, otherwise `Some(gpu_power)`.
+    pub gpu: Option<veil_config::GpuPower>,
+    /// Resolved `quality` (never `Auto`/`Sixel`).
+    pub quality: veil_config::Quality,
+}
+
 /// Auto-detect best output backend for current environment.
 ///
-/// `gpu` comes from config.lua: `None` when `gpu_render = false`, otherwise
-/// `Some(gpu_power)`. Forwarded straight to `TerminalOutput::new` — it has no
-/// effect on `DrmOutput`, which doesn't use the GPU encoder at all.
+/// `opts` is forwarded straight to `TerminalOutput::new`: it has no effect on
+/// `DrmOutput`, which doesn't use the GPU encoder or the terminal quality ladder.
 pub fn detect(
     pref: veil_config::OutputPref,
-    gpu: Option<veil_config::GpuPower>,
+    opts: TerminalOpts,
 ) -> io::Result<Box<dyn OutputBackend>> {
     let force = match std::env::var("VEIL_OUTPUT").ok().as_deref() {
         Some("drm") | Some("kms") => Some(Force::Drm),
@@ -146,7 +155,7 @@ pub fn detect(
 
     if force == Some(Force::Terminal) {
         eprintln!("[veil-host] VEIL_OUTPUT=terminal → terminal output");
-        return Ok(Box::new(TerminalOutput::new(gpu)?));
+        return Ok(Box::new(TerminalOutput::new(opts.clone())?));
     }
 
     if force == Some(Force::Drm) {
@@ -175,12 +184,12 @@ pub fn detect(
     // If running under a Wayland/X11 compositor, use terminal output.
     if std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("DISPLAY").is_ok() {
         eprintln!("[veil-host] detected compositor via env, using terminal output");
-        return Ok(Box::new(TerminalOutput::new(gpu)?));
+        return Ok(Box::new(TerminalOutput::new(opts.clone())?));
     }
 
     if pref == veil_config::OutputPref::Terminal {
         eprintln!("[veil-host] config.lua output=terminal → terminal output");
-        return Ok(Box::new(TerminalOutput::new(gpu)?));
+        return Ok(Box::new(TerminalOutput::new(opts.clone())?));
     }
 
     if pref == veil_config::OutputPref::Drm {
@@ -191,7 +200,7 @@ pub fn detect(
     // If SSH session (and not on a bare TTY console), use terminal output
     if std::env::var("SSH_CLIENT").is_ok() || std::env::var("SSH_TTY").is_ok() {
         eprintln!("[veil-host] detected SSH session, using terminal output");
-        return Ok(Box::new(TerminalOutput::new(gpu)?));
+        return Ok(Box::new(TerminalOutput::new(opts.clone())?));
     }
 
     // Fallback: try DRM/KMS
@@ -206,7 +215,7 @@ pub fn detect(
                 return Err(e);
             }
             eprintln!("[veil-host] falling back to terminal output");
-            Ok(Box::new(TerminalOutput::new(gpu)?))
+            Ok(Box::new(TerminalOutput::new(opts.clone())?))
         }
     }
 }

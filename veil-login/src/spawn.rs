@@ -263,8 +263,25 @@ pub fn launch(
         "[velogin] opening PAM session (seat0/vt{} + keyring)…",
         vtnr.unwrap_or(0)
     );
+    // The greeter exports its own logind session id for the greeter's libseat;
+    // it must not be visible to pam_systemd when it creates the *user's* session.
+    std::env::remove_var("XDG_SESSION_ID");
     let session = ctx.open_session(Flag::NONE)?;
     eprintln!("[velogin] PAM session opened, proceeding to fork/exec");
+    // pam_systemd returns success without creating a session when this process
+    // is already inside one (it logs only at debug level). The compositor's
+    // libseat (logind backend) then has no session and dies at startup, so say
+    // so loudly instead of leaving a silent 300 ms "login".
+    if !session
+        .envlist()
+        .iter_tuples()
+        .any(|(k, _)| k == "XDG_SESSION_ID")
+    {
+        eprintln!(
+            "[velogin] WARNING: pam_systemd created no logind session for {username} \
+             (no XDG_SESSION_ID); the compositor will not be able to take the seat"
+        );
+    }
     dbg(dbg_fd, "open_session done\n");
 
     // ── prepare EVERYTHING the child needs before forking ──────────────────
@@ -469,6 +486,16 @@ pub fn launch(
                 }
             }
             SESSION_PGID.store(0, Ordering::SeqCst);
+            // Log *how* it ended: a compositor that dies at startup used to
+            // be indistinguishable from a normal logout.
+            let how = if libc::WIFEXITED(status) {
+                format!("exit code {}", libc::WEXITSTATUS(status))
+            } else if libc::WIFSIGNALED(status) {
+                format!("signal {}", libc::WTERMSIG(status))
+            } else {
+                format!("status {status:#x}")
+            };
+            eprintln!("[velogin] session process ended: {how}");
 
             // Take the TTY back before the next greeter respawn.
             if let Some(tty) = &tty_c {

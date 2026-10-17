@@ -66,7 +66,6 @@ fn print_help() {
     println!("                            it's unregistered: -a auto-discovery won't find it");
     println!("                            (pass -s on both ends), and it needs its own -s to");
     println!("                            bind at all, since the default socket's taken.");
-    println!("  -m, --mode <mode>         Force a render mode (see list-modes for options)");
     println!("  -d, --debug               Redirect all logs to $XDG_STATE_HOME/veil/veil.log");
     println!("  -w, --width <px>          Override compositor width  (default: cols × 8)");
     println!("  -h, --height <px>         Override compositor height (default: rows × 16)");
@@ -92,7 +91,7 @@ fn print_help() {
     println!();
     println!("CONFIG");
     println!("  Place config.lua at ./config.lua or ~/.config/veil/config.lua");
-    println!("    quality = \"auto\"   -- auto | kitty | pixel | ascii | ascii_edge");
+    println!("    quality = \"auto\"   -- auto | kitty | pixel | pixel256 | pixel16 | ascii | ascii_edge");
     println!("    fps     = 60       -- compositor frame rate cap");
 }
 
@@ -325,8 +324,11 @@ fn main() -> std::io::Result<()> {
     }
 
     // ── Create output backend (auto-detect terminal vs DRM/KMS) ────────────────
-    let gpu = vcfg.gpu_render.then_some(vcfg.gpu_power);
-    let mut output = veil_host::output::detect(vcfg.output, gpu)?;
+    let opts = veil_host::output::TerminalOpts {
+        gpu: vcfg.gpu_render.then_some(vcfg.gpu_power),
+        quality: vcfg.resolved_quality(),
+    };
+    let mut output = veil_host::output::detect(vcfg.output, opts)?;
     let n_monitors = output.monitor_count();
     let sizes: Vec<(u32, u32)> = (0..n_monitors).map(|i| output.get_size(i)).collect();
     eprintln!(
@@ -570,22 +572,32 @@ fn cmd_list_modes() {
         (
             "kitty",
             "Kitty Graphics Protocol — native pixel images, best quality",
-            "$TERM=xterm-kitty or WezTerm",
+            "$TERM=xterm-kitty, ghostty, or WezTerm",
         ),
         (
-            "halfblock",
-            "Unicode ▀ half-blocks with 24-bit truecolor, 2× vertical res",
+            "pixel",
+            "Unicode ▀ half-blocks, 24-bit truecolor, 2× vertical res",
             "$COLORTERM=truecolor or 24bit",
         ),
         (
-            "ascii",
-            "Luma-mapped ASCII characters, works in any terminal",
-            "any",
+            "pixel256",
+            "Half-blocks on the xterm 256-colour palette",
+            "$TERM contains 256color",
         ),
         (
-            "ascii-edge",
-            "Luma with hysteresis edge-detection, sharper than ascii",
-            "any",
+            "pixel16",
+            "Half-blocks on 16 colours, ordered dither (Linux console)",
+            "$TERM=linux, xterm, screen or tmux",
+        ),
+        (
+            "ascii_luma",
+            "Luma-mapped ASCII characters, works in any terminal",
+            "any (also chosen when the locale is not UTF-8)",
+        ),
+        (
+            "ascii_edge",
+            "Luma with hysteresis edge-detection, sharper than ascii_luma",
+            "any (config only, never auto-selected)",
         ),
     ];
 
@@ -600,6 +612,7 @@ fn cmd_list_modes() {
         println!();
     }
 
+    println!("Set one with `quality = \"...\"` in config.lua (default \"auto\").");
     println!("Output backend auto-detects based on environment (terminal vs DRM/KMS).");
 }
 

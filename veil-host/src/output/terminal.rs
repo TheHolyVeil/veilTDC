@@ -7,7 +7,6 @@ use crossterm::{
     cursor, execute,
     terminal::{self, ClearType},
 };
-use std::fmt::Write as _;
 use std::io::{self, Write};
 use veil_render::gpu::GpuEncoder;
 use veil_render::{
@@ -60,10 +59,11 @@ pub struct TerminalOutput {
 }
 
 impl TerminalOutput {
-    /// `gpu`: from config.lua. `None` (`gpu_render = false`) skips GPU init
-    /// outright, same effect as if no Vulkan adapter existed, and the CPU path
-    /// in veil-render is used instead. `Some(power)` is `gpu_power`.
-    pub fn new(gpu: Option<veil_config::GpuPower>) -> io::Result<Self> {
+    /// `opts.gpu`: from config.lua. `None` (`gpu_render = false`) skips GPU
+    /// init outright, same effect as if no Vulkan adapter existed, and the CPU
+    /// path in veil-render is used instead. `Some(power)` is `gpu_power`.
+    /// `opts.quality`: the resolved config.lua `quality`.
+    pub fn new(opts: TerminalOpts) -> io::Result<Self> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let stdout = std::io::stdout();
 
@@ -82,13 +82,13 @@ impl TerminalOutput {
         stdout_ref.write_all(b"\x1b[?1003h\x1b[?1006h")?;
         stdout_ref.flush()?;
 
-        // Detect terminal capabilities for render mode
-        let mode = Self::detect_mode();
+        // Render mode comes from config.lua's `quality` (already resolved).
+        let mode = TerminalMode::from_quality(&opts.quality);
 
         // Try to init GPU encoder (only useful for halfblock/ascii modes) —
         // gated on config.lua's gpu_render, and skipped for Kitty mode
         // (which never used the GPU path to begin with).
-        let gpu = match gpu {
+        let gpu = match opts.gpu {
             Some(power) if !matches!(mode, TerminalMode::Kitty) => {
                 GpuEncoder::new(power == veil_config::GpuPower::Low)
             }
@@ -110,6 +110,7 @@ impl TerminalOutput {
             rows,
             gpu,
             stable_luma: Vec::new(),
+            halfblock: HalfblockEmitter::new(),
             render_buf: String::with_capacity(render_cap),
         })
     }
@@ -123,27 +124,6 @@ impl TerminalOutput {
         } else {
             None
         }
-    }
-
-    /// Detect best render mode based on terminal capabilities.
-    fn detect_mode() -> TerminalMode {
-        let term = std::env::var("TERM").unwrap_or_default();
-        let colorterm = std::env::var("COLORTERM").unwrap_or_default();
-
-        if term == "xterm-kitty" {
-            return TerminalMode::Kitty;
-        }
-        if let Ok(prog) = std::env::var("TERM_PROGRAM") {
-            if prog == "WezTerm" || prog.to_lowercase().contains("wezterm") {
-                return TerminalMode::Kitty;
-            }
-        }
-
-        if colorterm == "truecolor" || colorterm == "24bit" {
-            return TerminalMode::Halfblock;
-        }
-
-        TerminalMode::Ascii
     }
 
     /// Run `f` on the GPU encoder if there is one. `None` means "encode this
@@ -164,10 +144,10 @@ impl TerminalOutput {
         r
     }
 
-    /// Renders directly into `self.render_buf`. No return value — the caller
-    /// reads `self.render_buf` afterward. This avoids the `.to_vec()` clone
-    /// that previously threw away the whole point of the reusable buffer.
-    fn render_output(&mut self, rgba: &[u8]) {
+    /// Renders directly into `self.render_buf`; the caller reads it afterward.
+    /// Returns `false` when there is nothing to write (an unchanged halfblock
+    /// frame), so the caller can skip the write entirely.
+    fn render_output(&mut self, rgba: &[u8]) -> bool {
         let cols = self.cols;
         let rows = self.rows;
         let usable_rows = rows.saturating_sub(1);
@@ -175,10 +155,10 @@ impl TerminalOutput {
         // Reuse the pre-allocated scratch buffer — clear without freeing.
         self.render_buf.clear();
         let out = &mut self.render_buf;
-        let _ = write!(out, "\x1b[H");
 
         match self.mode {
             TerminalMode::Kitty => {
+                out.push_str("\x1b[H");
                 out.push_str(&render_kitty_frame(
                     rgba,
                     self.width,
@@ -187,15 +167,18 @@ impl TerminalOutput {
                     usable_rows,
                 ));
             }
-            TerminalMode::Halfblock => {
+            TerminalMode::Halfblock(depth) => {
                 let (w, h) = (self.width, self.height);
                 let cells = Self::gpu_or_none(&mut self.gpu, |g| {
                     g.encode_halfblock(rgba, w, h, cols, usable_rows)
                 })
                 .unwrap_or_else(|| rgba_to_halfblocks(rgba, w, h, cols, usable_rows));
-                Self::emit_halfblocks(out, &cells, cols, usable_rows);
+                // Cell-diffed: positions itself with absolute cursor moves,
+                // so no leading home sequence.
+                return self.halfblock.emit(out, &cells, cols, usable_rows, depth);
             }
             TerminalMode::Ascii => {
+                out.push_str("\x1b[H");
                 let (w, h) = (self.width, self.height);
                 let luma = Self::gpu_or_none(&mut self.gpu, |g| {
                     g.encode_luma(rgba, w, h, cols, usable_rows)
@@ -205,6 +188,7 @@ impl TerminalOutput {
                 Self::emit_chars_vec(out, &chars, cols, usable_rows);
             }
             TerminalMode::AsciiEdge => {
+                out.push_str("\x1b[H");
                 let (w, h) = (self.width, self.height);
                 let luma = Self::gpu_or_none(&mut self.gpu, |g| {
                     g.encode_luma(rgba, w, h, cols, usable_rows)
@@ -218,27 +202,7 @@ impl TerminalOutput {
                 Self::emit_chars_vec(out, &chars, cols, usable_rows);
             }
         }
-    }
-
-    fn emit_halfblocks(out: &mut String, cells: &[veil_render::ColorCell], cols: u16, rows: u16) {
-        for row in 0..rows as usize {
-            if row > 0 {
-                let _ = write!(out, "\r\n");
-            }
-            for col in 0..cols as usize {
-                let idx = row * cols as usize + col;
-                if idx < cells.len() {
-                    let fg = cells[idx].fg;
-                    let bg = cells[idx].bg;
-                    let _ = write!(
-                        out,
-                        "\x1b[38;2;{};{};{};48;2;{};{};{}m▀",
-                        fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]
-                    );
-                }
-            }
-        }
-        let _ = write!(out, "\x1b[0m");
+        true
     }
 
     fn emit_chars_vec(out: &mut String, chars: &[char], cols: u16, rows: u16) {
@@ -275,19 +239,20 @@ impl OutputBackend for TerminalOutput {
         // default `monitor_count() == 1` applies and this is always called
         // with `0`.
         //
-        // _damage unused: halfblock/ascii/kitty encoding walks the full cell
-        // grid every call today (see render_output below), no partial-region
-        // path yet. That's real, separate follow-up work — not silently
-        // dropped, just not part of this pass. Full redraw every tick, same
-        // behavior as before this parameter existed.
+        // _damage unused: the encoders walk the full cell grid every call.
+        // Halfblock output is cell-diffed against the previous frame
+        // (HalfblockEmitter), so unchanged cells cost nothing on the wire;
+        // ASCII/Kitty still redraw fully.
         self.width = width;
         self.height = height;
 
         // render_output fills self.render_buf in place — no allocation here.
-        self.render_output(rgba);
-        // Single write_all for the entire frame — avoids many small write syscalls.
-        self.stdout.write_all(self.render_buf.as_bytes())?;
-        self.stdout.flush()?;
+        // `false` = unchanged halfblock frame: nothing to write.
+        if self.render_output(rgba) {
+            // Single write_all for the entire frame — avoids many small write syscalls.
+            self.stdout.write_all(self.render_buf.as_bytes())?;
+            self.stdout.flush()?;
+        }
 
         Ok(())
     }
@@ -304,6 +269,8 @@ impl OutputBackend for TerminalOutput {
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
+        // The terminal reflowed/cleared: the remembered frame is wrong.
+        self.halfblock.invalidate();
         // Re-size the render scratch buffer to match the new terminal size.
         let needed = cols as usize * rows as usize * 48;
         if self.render_buf.capacity() < needed {
