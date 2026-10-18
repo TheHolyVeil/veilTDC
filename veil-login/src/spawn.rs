@@ -20,6 +20,44 @@ use uzers::os::unix::UserExt;
 use crate::session::SessionEntry;
 use std::os::unix::fs::PermissionsExt;
 
+/// Overwrite a byte slice with zeroes using volatile writes to prevent compiler optimization,
+/// followed by a compiler fence.
+pub fn zeroize_bytes(slice: &mut [u8]) {
+    for b in slice.iter_mut() {
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Zeroize a String's buffer in memory and clear it.
+pub fn zeroize_string(s: &mut String) {
+    unsafe {
+        zeroize_bytes(s.as_bytes_mut());
+    }
+    s.clear();
+}
+
+/// Handle to zeroize the password held inside [`UiConversation`] as soon as PAM
+/// authentication completes, rather than keeping credentials in memory.
+pub struct PasswordHandle(std::sync::Arc<std::sync::Mutex<Option<CString>>>);
+
+impl PasswordHandle {
+    pub fn zeroize(&self) {
+        if let Ok(mut lock) = self.0.lock() {
+            if let Some(pw) = lock.take() {
+                let mut bytes = pw.into_bytes_with_nul();
+                zeroize_bytes(&mut bytes);
+            }
+        }
+    }
+}
+
+impl Drop for PasswordHandle {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
 /// Conversation handler for the *visible* greeter stage (see [`verify`]).
 ///
 /// Non-interactively supplies the given username/password like conv_mock
@@ -31,7 +69,7 @@ use std::os::unix::fs::PermissionsExt;
 /// sitting there with no feedback.
 struct UiConversation<F: FnMut(String) + Send> {
     username: CString,
-    password: CString,
+    password: std::sync::Arc<std::sync::Mutex<Option<CString>>>,
     on_message: F,
 }
 
@@ -39,12 +77,21 @@ impl<F: FnMut(String) + Send> UiConversation<F> {
     /// Fails on an embedded NUL instead of silently turning the credential into
     /// an empty string (which would authenticate against "" and tell the user
     /// nothing useful). PAM speaks C strings, so such a password can't be sent.
-    fn new(username: &str, password: &str, on_message: F) -> Result<Self, std::ffi::NulError> {
-        Ok(Self {
-            username: CString::new(username)?,
-            password: CString::new(password)?,
-            on_message,
-        })
+    fn new(
+        username: &str,
+        password: &str,
+        on_message: F,
+    ) -> Result<(Self, PasswordHandle), std::ffi::NulError> {
+        let pw_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(CString::new(password)?)));
+        let handle = PasswordHandle(pw_slot.clone());
+        Ok((
+            Self {
+                username: CString::new(username)?,
+                password: pw_slot,
+                on_message,
+            },
+            handle,
+        ))
     }
 }
 
@@ -54,7 +101,12 @@ impl<F: FnMut(String) + Send> ConversationHandler for UiConversation<F> {
     }
 
     fn prompt_echo_off(&mut self, _prompt: &CStr) -> Result<CString, ErrorCode> {
-        Ok(self.password.clone())
+        self.password
+            .lock()
+            .map_err(|_| ErrorCode::CONV_ERR)?
+            .as_ref()
+            .cloned()
+            .ok_or(ErrorCode::CONV_ERR)
     }
 
     fn text_info(&mut self, msg: &CStr) {
@@ -112,16 +164,20 @@ pub fn verify(
     password: &str,
     on_message: impl FnMut(String) + Send + 'static,
 ) -> Result<(), LaunchError> {
-    let conv = UiConversation::new(username, password, on_message)?;
+    let (conv, pw_handle) = UiConversation::new(username, password, on_message)?;
     let mut ctx = Context::new("velogin", Some(username), conv)?;
-    ctx.authenticate(Flag::NONE)?;
-    ctx.acct_mgmt(Flag::NONE)?;
-    Ok(())
+    let res = (|| {
+        ctx.authenticate(Flag::NONE)?;
+        ctx.acct_mgmt(Flag::NONE)?;
+        Ok(())
+    })();
+    pw_handle.zeroize();
+    res
 }
 
 pub fn launch(
     username: &str,
-    password: &str,
+    mut password: String,
     entry: &SessionEntry,
 ) -> Result<(), LaunchError> {
     let user = uzers::get_user_by_name(username)
@@ -160,13 +216,20 @@ pub fn launch(
     // an interactive factor (u2f etc.) is ever added back to
     // /etc/pam.d/velogin, this headless helper has no UI and will sit on it
     // again — messages are only logged here.
-    let conv = UiConversation::new(username, password, |msg: String| {
+    let (conv, pw_handle) = UiConversation::new(username, &password, |msg: String| {
         eprintln!("[velogin:pam] {msg}");
     })?;
     let mut ctx = Context::new("velogin", Some(username), conv)?;
     ctx.authenticate(Flag::NONE)?;
     ctx.acct_mgmt(Flag::NONE)?;
-    dbg(dbg_fd, "authenticate + acct_mgmt done (single PAM handle)\n");
+    dbg(
+        dbg_fd,
+        "authenticate + acct_mgmt done (single PAM handle)\n",
+    );
+
+    // Zeroize password credentials in memory immediately after PAM authentication.
+    pw_handle.zeroize();
+    zeroize_string(&mut password);
 
     // Controlling TTY (systemd TTYPath=/dev/tty1) and its VT number. Computed
     // *before* open_session because pam_systemd needs the VT to register an
@@ -247,7 +310,11 @@ pub fn launch(
                         if cur_uid != uid || cur_gid != gid || cur_mode != 0o700 {
                             if let Ok(dir_cstr) = CString::new(runtime_dir.clone()) {
                                 unsafe {
-                                    libc::chown(dir_cstr.as_ptr(), uid as libc::uid_t, gid as libc::gid_t);
+                                    libc::chown(
+                                        dir_cstr.as_ptr(),
+                                        uid as libc::uid_t,
+                                        gid as libc::gid_t,
+                                    );
                                     libc::chmod(dir_cstr.as_ptr(), 0o700);
                                 }
                             }
@@ -567,6 +634,26 @@ mod tests {
     }
 
     #[test]
+    fn password_handle_zeroizes_credential_memory() {
+        use super::{zeroize_string, UiConversation};
+        use pam_client2::ConversationHandler;
+        let (mut conv, handle) = UiConversation::new("abyss", "secret123", |_| {}).unwrap();
+        assert_eq!(
+            conv.prompt_echo_off(c"Password:")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "secret123"
+        );
+        handle.zeroize();
+        assert!(conv.prompt_echo_off(c"Password:").is_err());
+
+        let mut s = "my-secret-password".to_string();
+        zeroize_string(&mut s);
+        assert!(s.is_empty());
+    }
+
+    #[test]
     fn trace_creates_private_dir_and_file_with_cloexec() {
         let dir = scratch("ok");
         let file = dir.join("trace.log");
@@ -612,7 +699,11 @@ mod tests {
         std::fs::write(&victim, "keep me").unwrap();
         let file = dir.join("trace.log");
         symlink(&victim, &file).unwrap();
-        assert_eq!(open_trace_at(&c(&dir), &c(&file)), -1, "O_NOFOLLOW must reject it");
+        assert_eq!(
+            open_trace_at(&c(&dir), &c(&file)),
+            -1,
+            "O_NOFOLLOW must reject it"
+        );
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -152,8 +152,14 @@ mod tests {
     #[test]
     fn ini_get_reads_only_the_named_section() {
         let ini = "[Other]\nExec=wrong\n[Desktop Entry]\nName = Foo\nExec=right --x\n";
-        assert_eq!(ini_get(ini, "Desktop Entry", "Exec").as_deref(), Some("right --x"));
-        assert_eq!(ini_get(ini, "Desktop Entry", "Name").as_deref(), Some("Foo"));
+        assert_eq!(
+            ini_get(ini, "Desktop Entry", "Exec").as_deref(),
+            Some("right --x")
+        );
+        assert_eq!(
+            ini_get(ini, "Desktop Entry", "Name").as_deref(),
+            Some("Foo")
+        );
         assert_eq!(ini_get(ini, "Desktop Entry", "Missing"), None);
         assert_eq!(ini_get(ini, "Nope", "Exec"), None);
     }
@@ -175,7 +181,10 @@ mod tests {
     #[test]
     fn shell_quote_leaves_safe_paths_and_quotes_the_rest() {
         assert_eq!(shell_quote("/usr/bin/veil-host"), "/usr/bin/veil-host");
-        assert_eq!(shell_quote("/opt/my dir/veil-host"), "'/opt/my dir/veil-host'");
+        assert_eq!(
+            shell_quote("/opt/my dir/veil-host"),
+            "'/opt/my dir/veil-host'"
+        );
         assert_eq!(shell_quote("/x;rm -rf ~"), "'/x;rm -rf ~'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote(""), "''");

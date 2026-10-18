@@ -1,7 +1,23 @@
-// Palette (deep sage): bg #0b100c, accent #9db08a, secondary #b7c9a3.
+// Palette defaults (deep sage); src/theme.rs overrides them from the wallpaper at startup.
 // Flow: clock screen → (click) → username → (enter) → password → login.
 // A remembered user skips straight from the clock to the password field.
 // Runs fullscreen on the linuxkms backend; sized window under winit for dev.
+
+// Every colour in this file comes from here. The defaults are the sage
+// palette; src/theme.rs derives a palette from the wallpaper at startup and
+// overwrites these (see `theme::apply`). Keep this list in sync with
+// `theme::Palette`.
+export global Theme {
+    in property <color> accent: #9db08a;
+    in property <color> secondary: #b7c9a3;
+    in property <color> accent-dark: #7d9369;
+    in property <color> surface: #141f17;
+    in property <color> surface-card: #18211a;
+    in property <color> surface-focused: #1c271f;
+    in property <color> surface-deep: #121a14;
+    in property <color> background: #0b100c;
+    in property <color> text: #e4e9dd;
+}
 
 // ── flat action button (power / reboot / keyboard toggle) ──────────────────
 component IconButton inherits Rectangle {
@@ -11,9 +27,9 @@ component IconButton inherits Rectangle {
     width: 48px;
     height: 48px;
     border-radius: 14px;
-    background: ta.has-hover ? #9db08a22 : transparent;
+    background: ta.has-hover ? Theme.accent.transparentize(0.85) : transparent;
     border-width: 1px;
-    border-color: ta.has-hover ? #9db08a88 : #9db08a33;
+    border-color: ta.has-hover ? Theme.accent.transparentize(0.4) : Theme.accent.transparentize(0.8);
     animate background, border-color { duration: 120ms; }
 
     Text {
@@ -22,7 +38,7 @@ component IconButton inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: root.label;
-        color: ta.has-hover ? #9db08a : #9db08a99;
+        color: ta.has-hover ? Theme.accent : Theme.accent.with-alpha(0.600);
         font-size: 19px;
         animate color { duration: 120ms; }
     }
@@ -48,11 +64,11 @@ component ThemedInput inherits Rectangle {
 
     height: 44px;
     border-radius: 12px;
-    background: ti.has-focus ? #1c271f : #18211a;
+    background: ti.has-focus ? Theme.surface-focused : Theme.surface-card;
     border-width: 1px;
-    border-color: ti.has-focus ? #9db08a : #9db08a33;
+    border-color: ti.has-focus ? Theme.accent : Theme.accent.with-alpha(0.200);
     drop-shadow-blur: ti.has-focus ? 8px : 0px;
-    drop-shadow-color: #9db08a44;
+    drop-shadow-color: Theme.accent.with-alpha(0.267);
     animate border-color, background { duration: 150ms; }
     clip: true;
 
@@ -61,7 +77,7 @@ component ThemedInput inherits Rectangle {
         height: parent.height;
         vertical-alignment: center;
         text: root.icon;
-        color: ti.has-focus ? #9db08a : #9db08a77;
+        color: ti.has-focus ? Theme.accent : Theme.accent.with-alpha(0.467);
         font-size: 15px;
         animate color { duration: 150ms; }
     }
@@ -71,11 +87,11 @@ component ThemedInput inherits Rectangle {
         width: parent.width - (root.icon != "" ? 50px : 32px) - (root.password ? 28px : 0px) - (root.password && root.caps-lock-on ? 55px : 0px);
         height: parent.height;
         vertical-alignment: center;
-        color: root.password && !root.reveal ? transparent : #e4e9dd;
+        color: root.password && !root.reveal ? transparent : Theme.text;
         font-size: 15px;
         font-family: "Inconsolata";
         single-line: true;
-        input-type: InputType.text;
+        input-type: (root.password && !root.reveal) ? InputType.password : InputType.text;
         text <=> root.text;
         accepted => { root.accepted(); }
         edited => { root.edited(self.text); }
@@ -89,7 +105,7 @@ component ThemedInput inherits Rectangle {
         height: 100%;
         vertical-alignment: center;
         text: root.placeholder;
-        color: #e4e9dd55;
+        color: Theme.text.with-alpha(0.333);
         font-size: 15px;
         font-family: "Inconsolata";
         visible: root.text == "";
@@ -134,7 +150,7 @@ component ThemedInput inherits Rectangle {
             width: 8px;
             height: 8px;
             border-radius: 4px;
-            background: #9db08a;
+            background: Theme.accent;
         }
     }
 
@@ -145,7 +161,7 @@ component ThemedInput inherits Rectangle {
         width: 60px;
         height: parent.height;
         background: @linear-gradient(90deg,
-            transparent 0%, #e4e9dd66 42%, #ffffffdd 50%, #e4e9dd66 58%, transparent 100%);
+            transparent 0%, Theme.text.with-alpha(0.400) 42%, #ffffffdd 50%, Theme.text.with-alpha(0.400) 58%, transparent 100%);
         animate x { duration: 420ms; easing: cubic-bezier(0.3, 0, 0.2, 1); }
     }
 
@@ -160,7 +176,7 @@ component ThemedInput inherits Rectangle {
             horizontal-alignment: center;
             vertical-alignment: center;
             text: root.reveal ? "HIDE" : "SHOW";
-            color: #9db08aaa;
+            color: Theme.accent.with-alpha(0.667);
             font-size: 11px;
             font-family: "Inconsolata";
         }
@@ -181,9 +197,9 @@ component VkKey inherits Rectangle {
     width: root.key-width;
     height: 46px;
     border-radius: 10px;
-    background: ta.pressed ? #9db08a55 : (ta.has-hover ? #9db08a22 : #18211a);
+    background: ta.pressed ? Theme.accent.with-alpha(0.333) : (ta.has-hover ? Theme.accent.with-alpha(0.133) : Theme.surface-card);
     border-width: 1px;
-    border-color: ta.pressed ? #9db08a : #9db08a2a;
+    border-color: ta.pressed ? Theme.accent : Theme.accent.with-alpha(0.165);
     animate background { duration: 80ms; }
 
     Text {
@@ -192,7 +208,7 @@ component VkKey inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: root.label;
-        color: #e4e9dd;
+        color: Theme.text;
         font-size: 17px;
         font-family: "Inconsolata";
     }
@@ -206,7 +222,7 @@ export component LoginWindow inherits Window {
     title: "Abyss";
     preferred-width: 1280px;
     preferred-height: 800px;
-    background: #0b100c;
+    background: Theme.background;
 
     // ── state from Rust ─────────────────────────────────────────────────────
     in-out property <string> username;
@@ -322,13 +338,13 @@ export component LoginWindow inherits Window {
     if !root.has-wallpaper : Rectangle {
         width: 100%;
         height: 100%;
-        background: @linear-gradient(160deg, #0b100c 0%, #16211a 55%, #0b100c 100%);
+        background: @linear-gradient(160deg, Theme.background 0%, Theme.surface-card 55%, Theme.background 100%);
     }
     // dim veil over the wallpaper so the card always reads
     Rectangle {
         width: 100%;
         height: 100%;
-        background: #0b100c;
+        background: Theme.background;
         opacity: root.has-wallpaper ? 0.45 : 0;
     }
 
@@ -344,16 +360,16 @@ export component LoginWindow inherits Window {
         Rectangle {
             height: 28px;
             border-radius: 14px;
-            background: #121a1499;
+            background: Theme.surface-deep.with-alpha(0.600);
             border-width: 1px;
-            border-color: #9db08a33;
+            border-color: Theme.accent.with-alpha(0.200);
             HorizontalLayout {
                 padding-left: 12px;
                 padding-right: 12px;
                 alignment: center;
                 Text {
                     text: root.hostname;
-                    color: #b7c9a3ee;
+                    color: Theme.secondary.with-alpha(0.933);
                     font-size: 13px;
                     font-family: "Syne";
                     letter-spacing: 1px;
@@ -366,16 +382,16 @@ export component LoginWindow inherits Window {
         if root.stage == 1 : Rectangle {
             height: 28px;
             border-radius: 14px;
-            background: #121a1499;
+            background: Theme.surface-deep.with-alpha(0.600);
             border-width: 1px;
-            border-color: #9db08a33;
+            border-color: Theme.accent.with-alpha(0.200);
             HorizontalLayout {
                 padding-left: 14px;
                 padding-right: 14px;
                 alignment: center;
                 Text {
                     text: root.clock-time;
-                    color: #e4e9ddee;
+                    color: Theme.text.with-alpha(0.933);
                     font-size: 13px;
                     font-family: "Inconsolata";
                     vertical-alignment: center;
@@ -389,9 +405,9 @@ export component LoginWindow inherits Window {
             Rectangle {
                 height: 28px;
                 border-radius: 14px;
-                background: tty-badge-ta.has-hover ? #9db08a33 : #121a1499;
+                background: tty-badge-ta.has-hover ? Theme.accent.with-alpha(0.200) : Theme.surface-deep.with-alpha(0.600);
                 border-width: 1px;
-                border-color: tty-badge-ta.has-hover ? #9db08aaa : #9db08a33;
+                border-color: tty-badge-ta.has-hover ? Theme.accent.with-alpha(0.667) : Theme.accent.with-alpha(0.200);
                 animate background, border-color { duration: 150ms; }
                 HorizontalLayout {
                     padding-left: 10px;
@@ -399,7 +415,7 @@ export component LoginWindow inherits Window {
                     alignment: center;
                     Text {
                         text: "TTY " + root.current-tty + " [v]";
-                        color: tty-badge-ta.has-hover ? #e4e9dd : #9db08aaa;
+                        color: tty-badge-ta.has-hover ? Theme.text : Theme.accent.with-alpha(0.667);
                         font-size: 12px;
                         font-family: "Inconsolata";
                         vertical-alignment: center;
@@ -417,7 +433,7 @@ export component LoginWindow inherits Window {
         x: (parent.width - self.width) / 2;
         y: 64px;
         text: "v e i l";
-        color: #9db08a3a;
+        color: Theme.accent.with-alpha(0.227);
         font-size: 14px;
         font-family: "Syne";
         letter-spacing: 6px;
@@ -435,9 +451,9 @@ export component LoginWindow inherits Window {
             + (root.stage == 1 ? 0px : 26px);
         animate x { duration: 70ms; easing: ease-in-out; }
         border-radius: 24px;
-        background: @linear-gradient(145deg, #141f17ee 0%, #0a110dee 100%);
+        background: @linear-gradient(145deg, Theme.surface.with-alpha(0.933) 0%, Theme.background.with-alpha(0.933) 100%);
         border-width: 1px;
-        border-color: #9db08a55;
+        border-color: Theme.accent.with-alpha(0.333);
         drop-shadow-blur: 40px;
         drop-shadow-color: #000000dd;
         opacity: root.stage == 1 ? 1 : 0;
@@ -451,7 +467,7 @@ export component LoginWindow inherits Window {
             y: 0px;
             width: parent.width;
             height: 2px;
-            background: @linear-gradient(90deg, transparent 0%, #9db08a66 25%, #e4e9dddd 50%, #9db08a66 75%, transparent 100%);
+            background: @linear-gradient(90deg, transparent 0%, Theme.accent.with-alpha(0.400) 25%, Theme.text.with-alpha(0.867) 50%, Theme.accent.with-alpha(0.400) 75%, transparent 100%);
         }
 
         VerticalLayout {
@@ -468,9 +484,9 @@ export component LoginWindow inherits Window {
                 for u in root.users : Rectangle {
                     height: 26px;
                     border-radius: 13px;
-                    background: root.username == u ? #9db08a44 : #18211a88;
+                    background: root.username == u ? Theme.accent.with-alpha(0.267) : Theme.surface-card.with-alpha(0.533);
                     border-width: 1px;
-                    border-color: root.username == u ? #9db08a : #9db08a22;
+                    border-color: root.username == u ? Theme.accent : Theme.accent.with-alpha(0.133);
                     animate background, border-color { duration: 150ms; }
 
                     HorizontalLayout {
@@ -479,7 +495,7 @@ export component LoginWindow inherits Window {
                         alignment: center;
                         Text {
                             text: u;
-                            color: root.username == u ? #e4e9dd : #9db08aaa;
+                            color: root.username == u ? Theme.text : Theme.accent.with-alpha(0.667);
                             font-size: 12px;
                             font-family: "Inconsolata";
                             vertical-alignment: center;
@@ -504,9 +520,9 @@ export component LoginWindow inherits Window {
                     width: 98px;
                     height: 98px;
                     border-radius: 49px;
-                    background: @linear-gradient(135deg, #9db08a44 0%, #9db08a11 100%);
+                    background: @linear-gradient(135deg, Theme.accent.with-alpha(0.267) 0%, Theme.accent.with-alpha(0.067) 100%);
                     border-width: 1px;
-                    border-color: avatar-ta.has-hover ? #9db08aaa : #9db08a44;
+                    border-color: avatar-ta.has-hover ? Theme.accent.with-alpha(0.667) : Theme.accent.with-alpha(0.267);
                     animate border-color, background { duration: 250ms; }
 
                     Rectangle {
@@ -516,9 +532,9 @@ export component LoginWindow inherits Window {
                         height: 90px;
                         border-radius: 45px;
                         clip: true;
-                        background: #18211a;
+                        background: Theme.surface-card;
                         border-width: 2px;
-                        border-color: #9db08a;
+                        border-color: Theme.accent;
 
                         if root.has-avatar : Image {
                             source: root.avatar;
@@ -532,7 +548,7 @@ export component LoginWindow inherits Window {
                             horizontal-alignment: center;
                             vertical-alignment: center;
                             text: root.user-initial;
-                            color: #9db08a;
+                            color: Theme.accent;
                             font-size: 38px;
                             font-family: "Syne";
                         }
@@ -549,14 +565,14 @@ export component LoginWindow inherits Window {
 
             Text {
                 text: root.username == "" ? "who goes there" : root.username;
-                color: #e4e9dd;
+                color: Theme.text;
                 font-size: 19px;
                 font-family: "Syne";
                 horizontal-alignment: center;
             }
             if root.user-known : Text {
                 text: "not you? tap the picture";
-                color: #9db08a66;
+                color: Theme.accent.with-alpha(0.400);
                 font-size: 11px;
                 font-family: "Inconsolata";
                 horizontal-alignment: center;
@@ -597,9 +613,9 @@ export component LoginWindow inherits Window {
                 Rectangle {
                     height: 32px;
                     border-radius: 16px;
-                    background: sess-pill-ta.has-hover ? #1c271f : #141d16;
+                    background: sess-pill-ta.has-hover ? Theme.surface-focused : Theme.surface;
                     border-width: 1px;
-                    border-color: sess-pill-ta.has-hover ? #9db08a66 : #9db08a33;
+                    border-color: sess-pill-ta.has-hover ? Theme.accent.with-alpha(0.400) : Theme.accent.with-alpha(0.200);
                     animate background, border-color { duration: 150ms; }
                     sess-pill-ta := TouchArea { }
 
@@ -618,7 +634,7 @@ export component LoginWindow inherits Window {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                                 text: "<";
-                                color: prev-ta.has-hover ? #e4e9dd : #b7c9a3;
+                                color: prev-ta.has-hover ? Theme.text : Theme.secondary;
                                 font-size: 16px;
                                 font-family: "Inconsolata";
                             }
@@ -634,7 +650,7 @@ export component LoginWindow inherits Window {
 
                         Text {
                             text: "session: " + root.sessions[root.session-index];
-                            color: #e4e9dd;
+                            color: Theme.text;
                             font-size: 13px;
                             font-family: "Inconsolata";
                             vertical-alignment: center;
@@ -650,7 +666,7 @@ export component LoginWindow inherits Window {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                                 text: ">";
-                                color: next-ta.has-hover ? #e4e9dd : #b7c9a3;
+                                color: next-ta.has-hover ? Theme.text : Theme.secondary;
                                 font-size: 16px;
                                 font-family: "Inconsolata";
                             }
@@ -672,13 +688,13 @@ export component LoginWindow inherits Window {
                 height: 44px;
                 border-radius: 12px;
                 background: lta.has-hover && !root.busy && root.cooldown-secs <= 0
-                    ? @linear-gradient(135deg, #b7c9a3 0%, #9db08a 100%)
-                    : @linear-gradient(135deg, #9db08a 0%, #7d9369 100%);
+                    ? @linear-gradient(135deg, Theme.secondary 0%, Theme.accent 100%)
+                    : @linear-gradient(135deg, Theme.accent 0%, Theme.accent-dark 100%);
                 opacity: root.busy || root.cooldown-secs > 0 ? 0.6 : 1;
                 border-width: 1px;
-                border-color: lta.has-hover ? #e4e9dd88 : #9db08a55;
+                border-color: lta.has-hover ? Theme.text.with-alpha(0.533) : Theme.accent.with-alpha(0.333);
                 drop-shadow-blur: lta.has-hover ? 12px : 4px;
-                drop-shadow-color: #9db08a44;
+                drop-shadow-color: Theme.accent.with-alpha(0.267);
                 animate background, opacity, border-color { duration: 150ms; }
 
                 Text {
@@ -688,7 +704,7 @@ export component LoginWindow inherits Window {
                     vertical-alignment: center;
                     text: root.cooldown-secs > 0 ? "try again in \{root.cooldown-secs}s"
                         : root.busy ? (root.status-msg == "" ? "authenticating..." : root.status-msg) : "login";
-                    color: #0b100c;
+                    color: Theme.background;
                     font-size: 16px;
                     font-family: "Syne";
                 }
@@ -733,21 +749,21 @@ export component LoginWindow inherits Window {
 
             Text {
                 text: root.clock-time;
-                color: #e4e9dd;
+                color: Theme.text;
                 font-size: 92px;
                 font-family: "Syne";
                 horizontal-alignment: center;
             }
             Text {
                 text: root.clock-date;
-                color: #9db08a;
+                color: Theme.accent;
                 font-size: 20px;
                 font-family: "Inconsolata";
                 horizontal-alignment: center;
             }
             Text {
                 text: "click or press any key to log in";
-                color: #9db08a66;
+                color: Theme.accent.with-alpha(0.400);
                 font-size: 13px;
                 font-family: "Inconsolata";
                 horizontal-alignment: center;
@@ -808,9 +824,9 @@ export component LoginWindow inherits Window {
         x: (parent.width - self.width) / 2;
         y: parent.height - self.height - 16px;
         border-radius: 18px;
-        background: #121a14f2;
+        background: Theme.surface-deep.with-alpha(0.949);
         border-width: 1px;
-        border-color: #9db08a44;
+        border-color: Theme.accent.with-alpha(0.267);
         drop-shadow-blur: 24px;
         drop-shadow-color: #000000aa;
 
@@ -834,7 +850,7 @@ export component LoginWindow inherits Window {
                 VkKey {
                     label: "SHIFT";
                     key-width: 70px;
-                    border-color: root.vk-shift ? #b7c9a3 : #9db08a2a;
+                    border-color: root.vk-shift ? Theme.secondary : Theme.accent.with-alpha(0.165);
                     pressed => { root.vk-shift = !root.vk-shift; }
                 }
                 VkKey {
@@ -850,7 +866,7 @@ export component LoginWindow inherits Window {
                 VkKey {
                     label: "ENTER";
                     key-width: 80px;
-                    border-color: #b7c9a366;
+                    border-color: Theme.secondary.with-alpha(0.400);
                     pressed => {
                         if (root.active-field == 0) {
                             root.show-password();
@@ -867,7 +883,7 @@ export component LoginWindow inherits Window {
     if root.confirm-action != 0 : Rectangle {
         width: 100%;
         height: 100%;
-        background: #0b100cbb;
+        background: Theme.background.with-alpha(0.733);
 
         // backdrop click cancels
         TouchArea {
@@ -881,9 +897,9 @@ export component LoginWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             border-radius: 18px;
-            background: #121a14;
+            background: Theme.surface-deep;
             border-width: 1px;
-            border-color: #9db08a55;
+            border-color: Theme.accent.with-alpha(0.333);
             drop-shadow-blur: 28px;
             drop-shadow-color: #000000cc;
 
@@ -895,7 +911,7 @@ export component LoginWindow inherits Window {
 
                 Text {
                     text: root.confirm-action == 1 ? "power off?" : "reboot?";
-                    color: #e4e9dd;
+                    color: Theme.text;
                     font-size: 19px;
                     font-family: "Syne";
                     horizontal-alignment: center;
@@ -907,16 +923,16 @@ export component LoginWindow inherits Window {
                     Rectangle {
                         height: 42px;
                         border-radius: 12px;
-                        background: cancel-ta.has-hover ? #18211a : transparent;
+                        background: cancel-ta.has-hover ? Theme.surface-card : transparent;
                         border-width: 1px;
-                        border-color: #9db08a44;
+                        border-color: Theme.accent.with-alpha(0.267);
                         Text {
                             width: 100%;
                             height: 100%;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                             text: "cancel";
-                            color: #9db08a;
+                            color: Theme.accent;
                             font-size: 14px;
                             font-family: "Inconsolata";
                         }
@@ -928,14 +944,14 @@ export component LoginWindow inherits Window {
                     Rectangle {
                         height: 42px;
                         border-radius: 12px;
-                        background: yes-ta.has-hover ? #9db08a : #9db08acc;
+                        background: yes-ta.has-hover ? Theme.accent : Theme.accent.with-alpha(0.800);
                         Text {
                             width: 100%;
                             height: 100%;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                             text: root.confirm-action == 1 ? "power off" : "reboot";
-                            color: #0b100c;
+                            color: Theme.background;
                             font-size: 14px;
                             font-family: "Syne";
                         }
@@ -961,9 +977,9 @@ export component LoginWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             border-radius: 20px;
-            background: #121a14;
+            background: Theme.surface-deep;
             border-width: 1px;
-            border-color: #9db08a55;
+            border-color: Theme.accent.with-alpha(0.333);
             drop-shadow-blur: 32px;
             drop-shadow-color: #000000dd;
 
@@ -975,7 +991,7 @@ export component LoginWindow inherits Window {
 
                 Text {
                     text: "switch Virtual Terminal (TTY)";
-                    color: #e4e9dd;
+                    color: Theme.text;
                     font-size: 18px;
                     font-family: "Syne";
                     horizontal-alignment: center;
@@ -983,7 +999,7 @@ export component LoginWindow inherits Window {
 
                 Text {
                     text: "Select a console VT to switch to:";
-                    color: #9db08aaa;
+                    color: Theme.accent.with-alpha(0.667);
                     font-size: 13px;
                     font-family: "Inconsolata";
                     horizontal-alignment: center;
@@ -998,26 +1014,26 @@ export component LoginWindow inherits Window {
                             height: 52px;
                             border-radius: 12px;
                             background: tty-num == root.current-tty
-                                ? #9db08a33
-                                : (t1-ta.has-hover ? #18211a : #0b100c);
+                                ? Theme.accent.with-alpha(0.200)
+                                : (t1-ta.has-hover ? Theme.surface-card : Theme.background);
                             border-width: 1px;
                             border-color: tty-num == root.current-tty
-                                ? #9db08a
-                                : (t1-ta.has-hover ? #9db08a88 : #9db08a22);
+                                ? Theme.accent
+                                : (t1-ta.has-hover ? Theme.accent.with-alpha(0.533) : Theme.accent.with-alpha(0.133));
                             animate background, border-color { duration: 120ms; }
 
                             VerticalLayout {
                                 alignment: center;
                                 Text {
                                     text: "TTY " + tty-num;
-                                    color: #e4e9dd;
+                                    color: Theme.text;
                                     font-size: 14px;
                                     font-family: "Inconsolata";
                                     horizontal-alignment: center;
                                 }
                                 Text {
                                     text: tty-num == root.current-tty ? "greeter" : "switch";
-                                    color: tty-num == root.current-tty ? #9db08a : #9db08a66;
+                                    color: tty-num == root.current-tty ? Theme.accent : Theme.accent.with-alpha(0.400);
                                     font-size: 11px;
                                     font-family: "Inconsolata";
                                     horizontal-alignment: center;
@@ -1039,26 +1055,26 @@ export component LoginWindow inherits Window {
                             height: 52px;
                             border-radius: 12px;
                             background: tty-num == root.current-tty
-                                ? #9db08a33
-                                : (t2-ta.has-hover ? #18211a : #0b100c);
+                                ? Theme.accent.with-alpha(0.200)
+                                : (t2-ta.has-hover ? Theme.surface-card : Theme.background);
                             border-width: 1px;
                             border-color: tty-num == root.current-tty
-                                ? #9db08a
-                                : (t2-ta.has-hover ? #9db08a88 : #9db08a22);
+                                ? Theme.accent
+                                : (t2-ta.has-hover ? Theme.accent.with-alpha(0.533) : Theme.accent.with-alpha(0.133));
                             animate background, border-color { duration: 120ms; }
 
                             VerticalLayout {
                                 alignment: center;
                                 Text {
                                     text: "TTY " + tty-num;
-                                    color: #e4e9dd;
+                                    color: Theme.text;
                                     font-size: 14px;
                                     font-family: "Inconsolata";
                                     horizontal-alignment: center;
                                 }
                                 Text {
                                     text: tty-num == root.current-tty ? "greeter" : "switch";
-                                    color: tty-num == root.current-tty ? #9db08a : #9db08a66;
+                                    color: tty-num == root.current-tty ? Theme.accent : Theme.accent.with-alpha(0.400);
                                     font-size: 11px;
                                     font-family: "Inconsolata";
                                     horizontal-alignment: center;
@@ -1078,16 +1094,16 @@ export component LoginWindow inherits Window {
                 Rectangle {
                     height: 40px;
                     border-radius: 10px;
-                    background: close-tty-ta.has-hover ? #18211a : transparent;
+                    background: close-tty-ta.has-hover ? Theme.surface-card : transparent;
                     border-width: 1px;
-                    border-color: #9db08a44;
+                    border-color: Theme.accent.with-alpha(0.267);
                     Text {
                         width: 100%;
                         height: 100%;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                         text: "close";
-                        color: #9db08a;
+                        color: Theme.accent;
                         font-size: 13px;
                         font-family: "Inconsolata";
                     }

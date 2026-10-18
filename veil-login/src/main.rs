@@ -12,6 +12,7 @@
 mod session;
 mod spawn;
 mod state;
+mod theme;
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -156,7 +157,9 @@ fn open_greeter_session(vt: i32) -> Option<(GreeterHolder, String)> {
             };
             unsafe { libc::close(info[0]) };
             let id = if n > 0 {
-                String::from_utf8_lossy(&buf[..n as usize]).trim().to_string()
+                String::from_utf8_lossy(&buf[..n as usize])
+                    .trim()
+                    .to_string()
             } else {
                 String::new()
             };
@@ -200,7 +203,13 @@ fn greeter_holder_child(vt: i32, info_wr: i32, keep_rd: i32) -> ! {
     if id.is_empty() {
         fail("pam_systemd did not create a logind session (no XDG_SESSION_ID)");
     }
-    unsafe { libc::write(info_wr, format!("{id}\n").as_ptr() as *const _, id.len() + 1) };
+    unsafe {
+        libc::write(
+            info_wr,
+            format!("{id}\n").as_ptr() as *const _,
+            id.len() + 1,
+        )
+    };
     unsafe { libc::close(info_wr) };
     let mut b = [0u8; 1];
     loop {
@@ -349,6 +358,11 @@ fn main() {
         ui.set_hostname(hn.trim().into());
     }
     if let Some(buf) = state::wallpaper_path().and_then(|p| decode_image(&p, &WALLPAPER_CAPS)) {
+        // Derive the whole UI palette from the wallpaper (sampled, ~4k pixels).
+        // No wallpaper, or one that fails to decode, keeps the sage defaults
+        // baked into the Slint `Theme` global.
+        let palette = theme::extract_palette(buf.as_slice(), buf.width(), buf.height());
+        theme::apply(&ui, &palette);
         ui.set_wallpaper(slint::Image::from_rgba8(buf));
         ui.set_has_wallpaper(true);
     }
@@ -689,7 +703,7 @@ fn run_session_helper(argv: &[String]) {
         "[velogin:session] clean helper up, launching {username} into {:?}",
         entry.name
     );
-    match spawn::launch(&username, &password, &entry) {
+    match spawn::launch(&username, password, &entry) {
         Ok(()) => eprintln!("[velogin:session] session ended, exiting (systemd respawns greeter)"),
         Err(e) => {
             eprintln!("[velogin:session] launch failed: {e}");
@@ -849,7 +863,11 @@ fn decode_image(path: &std::path::Path, caps: &ImageCaps) -> Option<Pixels> {
         .read_to_end(&mut bytes)
         .ok()?;
     if bytes.len() as u64 > caps.max_bytes {
-        eprintln!("[velogin] {} is over {} bytes; ignoring", path.display(), caps.max_bytes);
+        eprintln!(
+            "[velogin] {} is over {} bytes; ignoring",
+            path.display(),
+            caps.max_bytes
+        );
         return None;
     }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -1029,10 +1047,23 @@ mod tests {
     #[test]
     fn decode_rejects_oversize_dimensions_bytes_and_garbage() {
         let wide = write_png("wide", 3000, 4);
-        assert!(decode_image(&wide, &AVATAR_CAPS).is_none(), "3000px > 2048 cap");
-        assert!(decode_image(&wide, &WALLPAPER_CAPS).is_some(), "fine for a wallpaper");
-        let tiny_cap = ImageCaps { max_bytes: 10, max_dim: 2048, max_alloc: 1 << 20 };
-        assert!(decode_image(&wide, &tiny_cap).is_none(), "over the byte cap");
+        assert!(
+            decode_image(&wide, &AVATAR_CAPS).is_none(),
+            "3000px > 2048 cap"
+        );
+        assert!(
+            decode_image(&wide, &WALLPAPER_CAPS).is_some(),
+            "fine for a wallpaper"
+        );
+        let tiny_cap = ImageCaps {
+            max_bytes: 10,
+            max_dim: 2048,
+            max_alloc: 1 << 20,
+        };
+        assert!(
+            decode_image(&wide, &tiny_cap).is_none(),
+            "over the byte cap"
+        );
         std::fs::remove_file(wide).unwrap();
 
         let junk = std::env::temp_dir().join(format!("velogin-img-junk-{}", std::process::id()));
