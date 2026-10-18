@@ -19,9 +19,17 @@ drm                   = "0.15"
 libseat               = "0.2"
 
 [profile.release]
-opt-level     = "z"
+# opt-level "z" optimizes for SIZE and turns off most loop vectorization and
+# inlining. This is a compositor whose hot path is per-pixel loops (blit, shm
+# conversion, halfblock/quadrant encode), so it runs at "3". The size-first
+# build (embedded / Veil-Lite) is `--profile release-small`.
+opt-level     = 3
 lto           = "fat"
 codegen-units = 1
 panic = "abort"
 strip         = true
+
+[profile.release-small]
+inherits  = "release"
+opt-level = "z"
 

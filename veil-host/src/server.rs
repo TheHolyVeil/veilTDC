@@ -736,6 +736,10 @@ impl XdgShellHandler for State {
         // We DON'T force Fullscreen — weston-terminal, thunar and friends gate
         // input/decoration on !Fullscreen. The tiled size is sent by relayout.
         let wl = surface.wl_surface().clone();
+        // Tell the client which output it's on. Without wl_surface.enter a
+        // client has no "current display": Chromium-family browsers then can't
+        // resolve the display for fullscreen / scale and back out of it.
+        self.output.enter(&wl);
         let serial = self.next_serial();
         let kb = self.keyboard.clone();
         kb.set_focus(self, Some(wl), serial);
@@ -803,6 +807,7 @@ impl XdgShellHandler for State {
         let wl = surface.wl_surface().clone();
         // The window's own monitor, not the one under the pointer (S10).
         let idx = window_monitor(self, &wl).unwrap_or_else(|| active_monitor_idx(self));
+        tracing::info!(monitor = idx, active = active_monitor_idx(self), "xdg fullscreen_request");
         let ws = self.monitors[idx].active_workspace;
         if let Some(i) = self
             .toplevels
@@ -821,6 +826,7 @@ impl XdgShellHandler for State {
         // Client-initiated, not keyboard-triggered — look up which monitor
         // actually has this window fullscreen and retile THAT monitor.
         let wl = surface.wl_surface().clone();
+        tracing::info!("xdg unfullscreen_request (client asked)");
         if let Some(idx) = self
             .monitors
             .iter()
@@ -2783,6 +2789,9 @@ fn composite_one_monitor(
 /// (all monitors composite on the same tick cadence — see `Monitor`'s doc),
 /// not per-monitor; the actual drawing work is delegated to
 /// `composite_one_monitor`, called once per entry in `state.monitors`.
+/// Composite attempts skipped by S1 backpressure since the last tick-trace line.
+static BP_SKIPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn composite_and_send(state: &mut State) {
     if !state.dirty {
         return;
@@ -2807,10 +2816,11 @@ fn composite_and_send(state: &mut State) {
             .as_ref()
             .is_some_and(|a| Arc::strong_count(a) > 1)
     }) {
+        BP_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     state.dirty = false;
-    tracing::info!(
+    tracing::debug!(
         "compositing frame (buffers={})",
         state.surface_buffers.len()
     );
@@ -2852,12 +2862,56 @@ fn composite_and_send(state: &mut State) {
                 .filter_map(|f| f.wl_surface()),
         )
         .collect();
+    let now = monotonic_now();
+    let seq = state.frame_serial;
     for s in &surfaces {
         send_frame_callbacks(s, time);
+        send_presentation_feedback(s, &state.output, now, seq);
         for (popup, _) in PopupManager::popups_for_surface(s) {
             send_frame_callbacks(popup.wl_surface(), time);
+            send_presentation_feedback(popup.wl_surface(), &state.output, now, seq);
         }
     }
+}
+
+fn monotonic_now() -> std::time::Duration {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// Answer `wp_presentation` feedback requests with `presented`. They used to
+/// be dropped, which smithay turns into `discarded` — "this frame was never
+/// shown". Chromium-family browsers use that feedback to judge whether their
+/// frames are reaching the screen, and give up on fullscreen after ~1.5 s of
+/// discards. Timestamped at composite time (the frame is in the buffer we hand
+/// to the output this tick), on CLOCK_MONOTONIC to match the advertised clock.
+fn send_presentation_feedback(
+    surface: &WlSurface,
+    output: &Output,
+    now: std::time::Duration,
+    seq: u64,
+) {
+    use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+    use smithay::wayland::presentation::{PresentationFeedbackCachedState, Refresh};
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |_surf, states, &()| {
+            let mut guard = states.cached_state.get::<PresentationFeedbackCachedState>();
+            for cb in std::mem::take(&mut guard.current().callbacks) {
+                cb.presented(
+                    output,
+                    now,
+                    Refresh::Fixed(std::time::Duration::from_micros(16_667)),
+                    seq,
+                    Kind::empty(),
+                );
+            }
+        },
+        |_, _, &()| true,
+    );
 }
 
 /// `<mod_key>+/` help overlay: dumps the parsed `keybinds` config as an
@@ -4442,6 +4496,8 @@ pub fn run(
         eprintln!("[veil-tick] VEIL_TICK_TRACE on — phase timing every 120th tick (~1s)");
     }
     let mut tick_n: u32 = 0;
+    let (mut acc_total, mut acc_total_max, mut acc_comp, mut acc_comp_max) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let (mut acc_comp_n, mut acc_serial) = (0u32, 0u64);
     handle
         .insert_source(tick, move |_, _, data| {
             let t_start = tick_trace.then(std::time::Instant::now);
@@ -4481,11 +4537,9 @@ pub fn run(
             }
 
             // Drain input cmds.
-            let t_pre_input = tick_trace.then(std::time::Instant::now);
             while let Ok(cmd) = input_rx.try_recv() {
                 apply_input(&mut data.state, cmd);
             }
-            let t_post_input = tick_trace.then(std::time::Instant::now);
 
             // Copy-out: hosted client set clipboard → push to host compositor.
             // Deferred one tick because Smithay updates seat_data after new_selection returns.
@@ -4569,7 +4623,6 @@ pub fn run(
             // Composite all dirty surfaces into one RGBA frame and ship it.
             // Frame callbacks are fired inside composite_and_send after the frame is sent.
             let t_pre_composite = tick_trace.then(std::time::Instant::now);
-            let was_dirty = data.state.dirty;
             composite_and_send(&mut data.state);
             let t_post_composite = tick_trace.then(std::time::Instant::now);
 
@@ -4579,27 +4632,42 @@ pub fn run(
 
             if tick_trace {
                 tick_n = tick_n.wrapping_add(1);
-                if tick_n.is_multiple_of(120) {
-                    if let (Some(s), Some(pi), Some(pai), Some(pc), Some(poc), Some(e)) = (
-                        t_start,
-                        t_pre_input,
-                        t_post_input,
-                        t_pre_composite,
-                        t_post_composite,
-                        t_end,
-                    ) {
-                        eprintln!(
-                            "[veil-tick] total={:.2}ms  prelude={:.2}ms input={:.2}ms \
-                         pre_composite_misc={:.2}ms composite={:.2}ms(dirty={}) flush={:.2}ms",
-                            (e - s).as_secs_f64() * 1000.0,
-                            (pi - s).as_secs_f64() * 1000.0,
-                            (pai - pi).as_secs_f64() * 1000.0,
-                            (pc - pai).as_secs_f64() * 1000.0,
-                            (poc - pc).as_secs_f64() * 1000.0,
-                            was_dirty,
-                            (e - poc).as_secs_f64() * 1000.0,
-                        );
+                if let (Some(s), Some(pc), Some(poc), Some(e)) =
+                    (t_start, t_pre_composite, t_post_composite, t_end)
+                {
+                    // Aggregate over the whole ~1 s window. The old output
+                    // printed ONE tick in 120, which at idle is nearly always
+                    // a 0.00ms no-op and says nothing about load.
+                    let total = (e - s).as_secs_f64() * 1000.0;
+                    let comp = (poc - pc).as_secs_f64() * 1000.0;
+                    acc_total += total;
+                    acc_total_max = acc_total_max.max(total);
+                    if comp > 0.0 {
+                        acc_comp += comp;
+                        acc_comp_n += 1;
+                        acc_comp_max = acc_comp_max.max(comp);
                     }
+                }
+                if tick_n.is_multiple_of(120) {
+                    let serial = data.state.frame_serial;
+                    let bp = BP_SKIPS.swap(0, Ordering::Relaxed);
+                    eprintln!(
+                        "[veil-tick] 120 ticks: frames_sent={} backpressure_skips={} \
+                         composite avg={:.2}ms max={:.2}ms (n={}) tick avg={:.2}ms max={:.2}ms",
+                        serial.wrapping_sub(acc_serial),
+                        bp,
+                        if acc_comp_n > 0 { acc_comp / acc_comp_n as f64 } else { 0.0 },
+                        acc_comp_max,
+                        acc_comp_n,
+                        acc_total / 120.0,
+                        acc_total_max,
+                    );
+                    acc_serial = serial;
+                    acc_total = 0.0;
+                    acc_total_max = 0.0;
+                    acc_comp = 0.0;
+                    acc_comp_max = 0.0;
+                    acc_comp_n = 0;
                 }
             }
 

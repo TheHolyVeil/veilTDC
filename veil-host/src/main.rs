@@ -70,7 +70,6 @@ fn print_help() {
     println!("  -w, --width <px>          Override compositor width  (default: cols × 8)");
     println!("  -h, --height <px>         Override compositor height (default: rows × 16)");
     println!("  -s, --socket <name>       Wayland socket name (default: wayland-veil-0)");
-    println!("      --stats               Show fps / frame-size bar on the bottom row");
     println!();
     println!("GLOBAL FLAGS");
     println!("  -v, --version             Print version and exit");
@@ -79,8 +78,7 @@ fn print_help() {
     println!("EXAMPLES");
     println!("  veil-host run thunar");
     println!("  veil-host run -a dolphin          # add to a running instance (any VT)");
-    println!("  veil-host run -d -m halfblock firefox");
-    println!("  veil-host run --stats nautilus");
+    println!("  veil-host run -d firefox");
     println!(
         "  veil-host run -O -s wayland-veil-2 weston-terminal   # second, unregistered instance"
     );
@@ -358,6 +356,12 @@ fn main() -> std::io::Result<()> {
     // ── frame loop ────────────────────────────────────────────────────────────
     let mut fps_frame_count = 0u32;
     let mut fps_last = std::time::Instant::now();
+    // Per-second main-loop timing, printed as `[veil-loop]` under VEIL_TICK_TRACE:
+    // where this thread spends its time (seat pump / waiting / render_frame).
+    let loop_trace = std::env::var("VEIL_TICK_TRACE").is_ok();
+    let (mut loop_seat, mut loop_wait, mut loop_render) =
+        (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let (mut loop_iters, mut loop_frames) = (0u32, 0u32);
 
     // Track last-known terminal size so we can notify the output backend on change.
     let mut last_term_cols = init_cols;
@@ -406,7 +410,10 @@ fn main() -> std::io::Result<()> {
         // seat's disable event is never acked (the switch hangs and the evdev
         // grabs are never released). The idle recv_timeout below bounds how
         // long this can wait: ~100 ms.
+        let t_iter = std::time::Instant::now();
         let _ = output.service_seat();
+        loop_seat += t_iter.elapsed();
+        loop_iters += 1;
 
         let mut got_any = false;
 
@@ -416,6 +423,7 @@ fn main() -> std::io::Result<()> {
             store_frame(&mut latest, f);
         }
 
+        let t_wait = std::time::Instant::now();
         if !got_any {
             let timeout = if output.has_flip_pending() {
                 Duration::from_millis(4)
@@ -443,6 +451,7 @@ fn main() -> std::io::Result<()> {
         if output.has_flip_pending() {
             let _ = output.poll_events(Duration::from_millis(0));
         }
+        loop_wait += t_wait.elapsed();
 
         if !got_any && !output.has_flip_pending() {
             continue;
@@ -464,7 +473,10 @@ fn main() -> std::io::Result<()> {
         let mut rendered_any = false;
         for (id, slot) in latest.iter_mut().enumerate() {
             if let Some(frame) = slot.take() {
+                let t_r = std::time::Instant::now();
                 output.render_frame(id, &frame.rgba, frame.width, frame.height, frame.damage)?;
+                loop_render += t_r.elapsed();
+                loop_frames += 1;
                 rendered_any = true;
                 if id == 0 {
                     logged_w = frame.width;
@@ -484,6 +496,16 @@ fn main() -> std::io::Result<()> {
                 "[veil-host] fps: {:.0}  compositor: {}x{}px",
                 fps, logged_w, logged_h
             );
+            if loop_trace {
+                eprintln!(
+                    "[veil-loop] iters={loop_iters} frames={loop_frames} seat={:.1}ms wait={:.1}ms render={:.1}ms (per second)",
+                    loop_seat.as_secs_f64() * 1000.0,
+                    loop_wait.as_secs_f64() * 1000.0,
+                    loop_render.as_secs_f64() * 1000.0,
+                );
+            }
+            (loop_seat, loop_wait, loop_render) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            (loop_iters, loop_frames) = (0, 0);
             fps_frame_count = 0;
             fps_last = std::time::Instant::now();
         }
@@ -670,7 +692,7 @@ fn cmd_probe() -> std::io::Result<()> {
     println!(
         "gpu_render      : {}",
         if vcfg.gpu_render {
-            "on (default)"
+            "on"
         } else {
             "off"
         }

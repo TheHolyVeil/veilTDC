@@ -797,31 +797,51 @@ fn blit_rgba_to_xrgb(
     let copy_h = dh.min(sh) as usize;
     let src_pitch = (sw as usize) * 4;
 
+    // The dumb buffer is write-combined (uncached) memory, where per-byte
+    // stores are expensive (this loop measured ~9 ms for a 1080p frame).
+    // Swizzle each row in ordinary cached RAM (vectorises fine), then push it
+    // to the buffer with ONE sequential copy per row. The tail past `copy_w`
+    // is never written, so it stays zero (the letterbox).
+    let mut row = vec![0u8; (dw as usize) * 4];
+
     for y in y0..y1.min(dh as usize) {
         let drow = &mut dst[y * pitch..y * pitch + (dw as usize) * 4];
         if y >= copy_h {
             drow.fill(0);
             continue;
         }
-        let srow = &src[y * src_pitch..y * src_pitch + (sw as usize) * 4];
-        for x in 0..copy_w {
-            let s = x * 4;
-            let d = x * 4;
-            drow[d] = srow[s + 2]; // B
-            drow[d + 1] = srow[s + 1]; // G
-            drow[d + 2] = srow[s]; // R
-            drow[d + 3] = 0; // X
+        let srow = &src[y * src_pitch..y * src_pitch + copy_w * 4];
+        for (d, s) in row.as_chunks_mut::<4>().0.iter_mut().zip(srow.as_chunks::<4>().0) {
+            d[0] = s[2]; // B
+            d[1] = s[1]; // G
+            d[2] = s[0]; // R
+            d[3] = 0; // X
         }
-        // Letterbox to the right of the copied region.
-        if copy_w < dw as usize {
-            drow[copy_w * 4..].fill(0);
-        }
+        drow.copy_from_slice(&row);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sort_cards;
+    use super::{blit_rgba_to_xrgb, sort_cards};
+
+    #[test]
+    fn blit_swizzles_letterboxes_and_honours_the_row_range() {
+        // 2x2 source, 3x3 destination (pitch 16), damage rows 1..2 only.
+        let src: Vec<u8> = (0..4)
+            .flat_map(|i| [10 + i as u8, 20 + i as u8, 30 + i as u8, 255])
+            .collect(); // RGBA
+        let mut dst = vec![0xAAu8; 16 * 3];
+        blit_rgba_to_xrgb(&mut dst, 16, 3, 3, &src, 2, 2, 1, 2);
+        assert!(dst[..16].iter().all(|&b| b == 0xAA), "row 0 untouched");
+        assert!(dst[32..].iter().all(|&b| b == 0xAA), "row 2 untouched");
+        // row 1 = source row 1 -> pixels (12,22,32) and (13,23,33), then black letterbox
+        assert_eq!(&dst[16..28], [32, 22, 12, 0, 33, 23, 13, 0, 0, 0, 0, 0]);
+        // full range: rows past the source height are cleared to black
+        blit_rgba_to_xrgb(&mut dst, 16, 3, 3, &src, 2, 2, 0, 3);
+        assert_eq!(&dst[..12], [30, 20, 10, 0, 31, 21, 11, 0, 0, 0, 0, 0]);
+        assert!(dst[32..44].iter().all(|&b| b == 0));
+    }
 
     #[test]
     fn cards_sort_numerically_and_ignore_other_nodes() {
