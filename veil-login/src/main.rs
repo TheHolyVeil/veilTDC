@@ -357,7 +357,17 @@ fn main() {
     if let Ok(hn) = std::fs::read_to_string("/etc/hostname") {
         ui.set_hostname(hn.trim().into());
     }
-    if let Some(buf) = state::wallpaper_path().and_then(|p| decode_image(&p, &WALLPAPER_CAPS)) {
+    // Random pick from every image in /etc/velogin, never the same as last
+    // login if there's a choice. Anything that fails to decode is skipped.
+    let wallpaper = state::wallpaper_order(
+        state::wallpaper_candidates(),
+        state::last_wallpaper().as_deref(),
+        state::random_u64(),
+    )
+    .into_iter()
+    .find_map(|p| decode_image(&p, &WALLPAPER_CAPS).map(|b| (p, b)));
+    if let Some((path, buf)) = wallpaper {
+        state::save_last_wallpaper(&path);
         // Derive the whole UI palette from the wallpaper (sampled, ~4k pixels).
         // No wallpaper, or one that fails to decode, keeps the sage defaults
         // baked into the Slint `Theme` global.
