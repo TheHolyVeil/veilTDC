@@ -1,0 +1,21 @@
+#!/bin/sh
+# Veil desktop session. Started by the login manager (velogin) from
+# veil.desktop; runs veil-host directly on the VT's DRM/KMS display.
+#
+# If this exits right away, read ~/.local/state/veil/veil-host.log: veil-host
+# writes its own stderr there when launched from a login (libseat/DRM errors
+# included), and keeps the previous run as veil-host.log.1.
+
+# A greeter or parent compositor may have left these; they'd make veil-host
+# think it is nested and draw into a terminal instead of the display.
+unset DISPLAY WAYLAND_DISPLAY
+
+export XDG_CURRENT_DESKTOP=Veil
+export XDG_SESSION_DESKTOP=veil
+export XDG_SESSION_TYPE=wayland
+
+# A real session wants real graphics: use the display directly and never fall
+# back to drawing text on the console.
+export VEIL_OUTPUT=drm
+
+exec veil-host start

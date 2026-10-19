@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Veil
+Comment=Veil desktop (DRM/KMS compositor, bar, launcher)
+Exec=veil-session
+TryExec=veil-session
+Type=Application
+DesktopNames=Veil
