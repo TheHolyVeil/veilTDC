@@ -69,7 +69,14 @@ impl VtGuard {
     pub fn acquire() -> io::Result<Self> {
         let raw = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if raw < 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENXIO) {
+                return Err(io::Error::other(
+                    "no controlling terminal: the login manager must make the VT \
+                     this session's controlling tty (setsid + TIOCSCTTY)",
+                ));
+            }
+            return Err(e);
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
 

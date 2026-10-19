@@ -499,8 +499,22 @@ pub fn launch(
                     let fd = libc::open(tty.as_ptr(), libc::O_RDWR);
                     dbg(dbg_fd, "[child] tty open done\n");
                     if fd >= 0 {
-                        libc::ioctl(fd, libc::TIOCSCTTY as _, 0);
-                        dbg(dbg_fd, "[child] TIOCSCTTY done\n");
+                        // Steal the VT as the session's controlling terminal.
+                        // velogin itself owns it (systemd TTYPath=), so a plain
+                        // TIOCSCTTY(0) fails with EPERM, leaving the session with
+                        // no controlling tty at all; the compositor's
+                        // open("/dev/tty") + KDSETMODE then dies with ENXIO and
+                        // the greeter comes straight back. arg 1 takes it over
+                        // (we are still root here, before the priv drop below).
+                        let rc = libc::ioctl(fd, libc::TIOCSCTTY as _, 1);
+                        dbg(
+                            dbg_fd,
+                            if rc == 0 {
+                                "[child] TIOCSCTTY done\n"
+                            } else {
+                                "[child] TIOCSCTTY FAILED\n"
+                            },
+                        );
                         libc::dup2(fd, 0);
                         libc::dup2(fd, 1);
                         libc::dup2(fd, 2);
