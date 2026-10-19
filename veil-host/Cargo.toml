@@ -24,6 +24,8 @@ evdev              = { workspace = true }
 drm                = { workspace = true }
 libseat            = { workspace = true }
 libc               = { workspace = true }
+# Wallpaper decode: PNG + JPEG only, same minimal surface as veil-login.
+image              = { workspace = true, features = ["png", "jpeg"] }
 wayland-protocols  = { version = "0.32", features = ["server"] }
 wayland-server     = "0.31"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

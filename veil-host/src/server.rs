@@ -254,6 +254,9 @@ pub struct Monitor {
     pub layout_rects: Vec<Rect>,
     pub bar_hitboxes: Vec<(Rect, String)>,
     pub composite_buf: Vec<u8>,
+    /// Pre-scaled wallpaper layer (RGBA, exactly `output_w * output_h * 4`),
+    /// copied over the buffer instead of the solid background fill.
+    pub wallpaper: Option<Vec<u8>>,
     pub damage: Option<Rect>,
     pub last_composite: Option<Instant>,
     /// The Arc we handed to frame_tx last time for THIS monitor. See the
@@ -284,6 +287,7 @@ impl Monitor {
             layout_rects: Vec::new(),
             bar_hitboxes: Vec::new(),
             composite_buf: Vec::with_capacity((width as usize) * (height as usize) * 4),
+            wallpaper: None,
             damage: None,
             last_composite: None,
             prev_frame: None,
@@ -419,6 +423,10 @@ pub struct State {
     pub config_mtime: Option<std::time::SystemTime>,
     pub last_config_check: Instant,
     pub composite_interval: Duration,
+    /// `fps` as configured (0 = follow the display); kept so the interval can
+    /// be recomputed when the real refresh becomes known or config reloads.
+    pub fps_cfg: u32,
+    pub wallpaper: crate::wallpaper::WallpaperEngine,
     /// On-Screen Display (OSD) popup notification overlay.
     pub osd: Option<OsdNotification>,
 }
@@ -1834,7 +1842,10 @@ pub fn reload_config(state: &mut State) {
     ];
     state.theme = new_cfg.theme;
     state.bar = new_cfg.bar;
-    state.composite_interval = Duration::from_millis(1000 / new_cfg.fps.max(1) as u64);
+    state.fps_cfg = new_cfg.fps;
+    set_wallpaper_config(state, new_cfg.wallpaper.clone());
+    let refresh_mhz = state.output.current_mode().map_or(60_000, |m| m.refresh as u32);
+    state.composite_interval = composite_interval_for(new_cfg.fps, refresh_mhz);
 
     if let Some(p) = &path {
         let name = p
@@ -2551,8 +2562,16 @@ fn composite_one_monitor(
     // Background fill: one pass over the buffer as 4-byte RGBA pixels. Safe
     // (no `align_to_mut`; `Vec<u8>` only guarantees 1-byte alignment) and it
     // compiles to the same vectorised store loop in release builds.
-    let bg = state.background;
-    m.composite_buf.as_chunks_mut::<4>().0.fill(bg);
+    // With a wallpaper layer of the right size this is a straight memcpy of
+    // the pre-scaled image; otherwise (none, or mid-resize until the loader
+    // thread catches up) fall back to the solid colour.
+    match &m.wallpaper {
+        Some(wp) if wp.len() == needed => m.composite_buf.copy_from_slice(wp),
+        _ => {
+            let bg = state.background;
+            m.composite_buf.as_chunks_mut::<4>().0.fill(bg);
+        }
+    }
 
     let ws = m.active_workspace;
     let back = &mut m.composite_buf;
@@ -2880,6 +2899,67 @@ fn monotonic_now() -> std::time::Duration {
     std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
+/// Point the wallpaper engine at a (possibly new) config and start a load.
+fn set_wallpaper_config(state: &mut State, cfg: Option<veil_config::WallpaperConfig>) {
+    if state.wallpaper.configure(cfg) {
+        request_wallpaper(state);
+    }
+}
+
+/// (Re)load the wallpaper for the monitors' current sizes. With no wallpaper
+/// configured this drops any layers so the solid background shows again.
+fn request_wallpaper(state: &mut State) {
+    if state.wallpaper.is_active() {
+        let sizes = state.monitors.iter().map(|m| (m.output_w, m.output_h)).collect();
+        let bg = state.background;
+        state.wallpaper.request(sizes, bg);
+    } else {
+        for m in &mut state.monitors {
+            m.wallpaper = None;
+        }
+        mark_dirty_full(state);
+    }
+}
+
+/// Install freshly loaded layers on every monitor of matching size.
+fn apply_wallpaper_layers(state: &mut State, layers: Vec<crate::wallpaper::Layer>) {
+    for m in &mut state.monitors {
+        m.wallpaper = layers
+            .iter()
+            .find(|l| l.size == (m.output_w, m.output_h))
+            .map(|l| l.rgba.clone());
+    }
+    mark_dirty_full(state);
+}
+
+/// Per-tick: pick up a finished load and drive rotation.
+fn wallpaper_tick(state: &mut State) {
+    let monitors = &state.monitors;
+    let layers = state.wallpaper.tick(
+        Instant::now(),
+        || monitors.iter().map(|m| (m.output_w, m.output_h)).collect(),
+        state.background,
+    );
+    if let Some(layers) = layers {
+        apply_wallpaper_layers(state, layers);
+    }
+}
+
+/// How often to composite: the `fps` config value, or the display's own
+/// refresh when `fps == 0`. Deliberately 10% under the nominal period: the
+/// tick timer fires at half that period and the check is `elapsed < interval`,
+/// so an exact period would lose a tick to timer jitter and fall to half rate.
+/// Compositing a hair faster than the display is free: the output loop only
+/// flips once per VBLANK and coalesces the rest.
+fn composite_interval_for(fps: u32, refresh_mhz: u32) -> Duration {
+    let mhz = if fps == 0 {
+        refresh_mhz.max(1000) as u64
+    } else {
+        fps as u64 * 1000
+    };
+    Duration::from_micros(1_000_000_000 / mhz * 9 / 10)
+}
+
 /// Answer `wp_presentation` feedback requests with `presented`. They used to
 /// be dropped, which smithay turns into `discarded` — "this frame was never
 /// shown". Chromium-family browsers use that feedback to judge whether their
@@ -2894,6 +2974,10 @@ fn send_presentation_feedback(
 ) {
     use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
     use smithay::wayland::presentation::{PresentationFeedbackCachedState, Refresh};
+    // Real refresh period from the mode the output advertises (mHz -> us).
+    let period_us = output
+        .current_mode()
+        .map_or(16_667, |m| 1_000_000_000 / m.refresh.max(1000) as u64);
     with_surface_tree_downward(
         surface,
         (),
@@ -2904,7 +2988,7 @@ fn send_presentation_feedback(
                 cb.presented(
                     output,
                     now,
-                    Refresh::Fixed(std::time::Duration::from_micros(16_667)),
+                    Refresh::Fixed(std::time::Duration::from_micros(period_us)),
                     seq,
                     Kind::empty(),
                 );
@@ -3059,9 +3143,14 @@ fn draw_help_overlay(
     let mod_label = keybinds.mod_key.label().to_ascii_uppercase();
     let mut lines: Vec<String> = vec!["KEYBINDS".to_string(), String::new()];
     for (key, action) in &keybinds.binds {
+        // Return is stored as '\r', which the bitmap font can't draw.
+        let key_label = if *key == '\r' {
+            "ENTER".to_string()
+        } else {
+            key.to_ascii_uppercase().to_string()
+        };
         lines.push(format!(
-            "{mod_label}+{}  {}",
-            key.to_ascii_uppercase(),
+            "{mod_label}+{key_label}  {}",
             action.label().to_ascii_uppercase()
         ));
     }
@@ -3737,16 +3826,17 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             m.rect.h = height;
             let mode = OutputMode {
                 size: (width as i32, height as i32).into(),
-                refresh: 60_000,
+                refresh: state.output.current_mode().map_or(60_000, |m| m.refresh),
             };
             state
                 .output
                 .change_current_state(Some(mode), None, None, None);
+            request_wallpaper(state);
             // Retile everyone into the new output extent.
             relayout(state);
         }
 
-        InputCmd::SetMonitors { sizes } => {
+        InputCmd::SetMonitors { sizes, refresh_mhz } => {
             if sizes.is_empty() {
                 tracing::warn!("SetMonitors: empty sizes list, ignoring");
                 return;
@@ -3792,11 +3882,19 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             let m0 = &state.monitors[0];
             let mode = OutputMode {
                 size: (m0.output_w as i32, m0.output_h as i32).into(),
-                refresh: 60_000,
+                refresh: refresh_mhz as i32,
             };
             state
                 .output
                 .change_current_state(Some(mode), None, None, None);
+            state.composite_interval = composite_interval_for(state.fps_cfg, refresh_mhz);
+            // First time through this also loads the configured wallpaper;
+            // later (hotplug / mode change) it just re-scales for new sizes.
+            let wp_cfg = veil_config::config_path()
+                .and_then(|p| veil_config::try_load(&p).ok())
+                .and_then(|c| c.wallpaper);
+            state.wallpaper.configure(wp_cfg);
+            request_wallpaper(state);
 
             // Newly added monitors have nothing tiled yet, so there's
             // nothing for relayout() to do on them — but they DO need their
@@ -4172,7 +4270,7 @@ pub fn run(
     theme: veil_config::Theme,
     bar: veil_config::BarConfig,
 ) -> io::Result<()> {
-    let composite_interval = Duration::from_millis(1000 / fps.max(1) as u64);
+    let composite_interval = composite_interval_for(fps, 60_000);
     let display: Display<State> =
         Display::new().map_err(|e| io::Error::other(format!("display: {e}")))?;
     let dh = display.handle();
@@ -4379,6 +4477,8 @@ pub fn run(
         config_mtime,
         last_config_check: Instant::now(),
         composite_interval,
+        fps_cfg: fps,
+        wallpaper: crate::wallpaper::WallpaperEngine::new(),
         osd: None,
     };
 
@@ -4622,6 +4722,7 @@ pub fn run(
 
             // Composite all dirty surfaces into one RGBA frame and ship it.
             // Frame callbacks are fired inside composite_and_send after the frame is sent.
+            wallpaper_tick(&mut data.state);
             let t_pre_composite = tick_trace.then(std::time::Instant::now);
             composite_and_send(&mut data.state);
             let t_post_composite = tick_trace.then(std::time::Instant::now);
@@ -4675,7 +4776,14 @@ pub fn run(
                 loop_signal_t.stop();
                 TimeoutAction::Drop
             } else {
-                TimeoutAction::ToDuration(Duration::from_millis(8))
+                // Half the composite period, so one tick of jitter can't drop a
+                // frame: 8.3 ms at 60 Hz (was a fixed 8 ms, i.e. a ~125 fps
+                // ceiling), ~2.8 ms at 180 Hz. Re-read each tick so a config
+                // reload or the real refresh arriving takes effect.
+                TimeoutAction::ToDuration(
+                    (data.state.composite_interval / 2)
+                        .clamp(Duration::from_millis(2), Duration::from_millis(8)),
+                )
             }
         })
         .map_err(|e| io::Error::other(format!("insert tick: {e}")))?;

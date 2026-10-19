@@ -37,7 +37,12 @@ pub enum InputCmd {
     /// MULTI_MONITOR_SCOPE.md). `sizes.len() == 1` for terminal mode or a
     /// single DRM display; unremarkable in that case, same effect as the
     /// old single-output `Resize`-based retarget it replaces.
-    SetMonitors { sizes: Vec<(u32, u32)> },
+    SetMonitors {
+        sizes: Vec<(u32, u32)>,
+        /// Monitor 0's real refresh rate in millihertz (what the shared
+        /// `wl_output` advertises and what `fps = 0` follows).
+        refresh_mhz: u32,
+    },
 
     /// Display an On-Screen Display (OSD) popup overlay.
     Osd {

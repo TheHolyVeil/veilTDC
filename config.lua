@@ -2,7 +2,8 @@
 -- Place at ./config.lua or ~/.config/veil/config.lua
 
 quality = "auto" -- auto | kitty | pixel | pixel256 | pixel16 | ascii | ascii_edge
-fps = 60 -- compositor frame rate cap
+fps = 0 -- compositor frame rate cap; 0 = match the display
+refresh = "max" -- DRM mode at the native size: preferred | max | <Hz, e.g. 144>
 cage_timeout_secs = 8 -- timeout for caged output
 input = true -- enable input forwarding
 gpu_render = true -- use GPU for frame encoding
@@ -129,3 +130,9 @@ keybinds = {
 -- everyday chord). Works in both terminal and DRM/bare-TTY mode; Ctrl+C
 -- relies on the tty's line discipline generating SIGINT, which bare-TTY
 -- evdev-grab mode may not deliver the same way.
+
+-- Static wallpaper (optional). A path may be a file or a directory of images.
+-- wallpaper = "~/Pictures/wall.png"
+-- wallpaper = { engine = "static", paths = { "~/Pictures/walls" },
+--               interval = 600,      -- seconds between images; 0 = pick once
+--               shuffle = true, fit = "fill" }  -- fill | fit | stretch

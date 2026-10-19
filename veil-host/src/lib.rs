@@ -23,6 +23,7 @@ pub mod seat;
 pub mod server;
 pub mod sink;
 pub mod vt;
+pub mod wallpaper;
 
 pub use input::InputCmd;
 pub use input_backend::{InputBackend, InputCtx, InputGeometry};

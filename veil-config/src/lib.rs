@@ -1,5 +1,5 @@
 use mlua::Lua;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Which GPU the frame encoder asks for (`gpu_power` in config.lua).
 /// `High` is the default: fastest adapter, never a surprise slowdown on
@@ -146,6 +146,29 @@ impl OutputPref {
             "drm" | "kms" => Self::Drm,
             "terminal" | "term" => Self::Terminal,
             _ => Self::Auto,
+        }
+    }
+}
+
+/// Which display mode the DRM backend drives (`refresh` in Lua). The
+/// resolution is always the connector's preferred mode's; this only picks the
+/// refresh rate among modes of that size. `Preferred` is the EDID's first
+/// mode, which many high-refresh panels advertise at 60 Hz.
+/// `refresh = "max"` | `"preferred"` | `144` (a number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshPref {
+    Preferred,
+    Max,
+    Hz(u32),
+}
+
+impl RefreshPref {
+    fn parse_str(s: &str) -> Self {
+        let s = s.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "max" | "highest" => Self::Max,
+            "" | "preferred" | "auto" => Self::Preferred,
+            n => n.parse::<u32>().map_or(Self::Preferred, Self::Hz),
         }
     }
 }
@@ -316,11 +339,23 @@ impl Default for Keybinds {
     }
 }
 
+/// Config key name to the char the input path matches. `enter`/`return` map
+/// to `'\r'` (what the keyboard reports for Return); anything else is the
+/// first character, lowercased.
+fn bind_key(s: &str) -> Option<char> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "enter" | "return" => Some('\r'),
+        k => k.chars().next(),
+    }
+}
+
 fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
     let default = Keybinds::default();
-    let Ok(t) = gl.get::<mlua::Table>("keybinds") else {
-        return default;
-    };
+    // No `keybinds` table: fall back to the globals table itself, so a bare
+    // top-level `apps = {..}` still works (it was silently ignored before).
+    let t = gl
+        .get::<mlua::Table>("keybinds")
+        .unwrap_or_else(|_| gl.clone());
 
     let mod_key = t
         .get::<String>("mod_key")
@@ -381,15 +416,30 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
             .cloned(),
     );
 
-    // App keybinds: keybinds.apps = { b = "helium", t = "kitty" } or global apps table
+    // App keybinds, from `keybinds.apps` or a top-level `apps`. Two forms:
+    //   ordered:  apps = { { "enter", "kitty" }, { key = "b", exec = "helium-browser" } }
+    //   map:      apps = { b = "helium-browser" }   (applied in key order)
+    // Each Launch bind also becomes a bar tile, in this order, so the ordered
+    // form is what gives a stable bar layout (Lua map iteration order isn't).
     let app_table = t
         .get::<mlua::Table>("apps")
         .or_else(|_| gl.get::<mlua::Table>("apps"));
 
     if let Ok(apps) = app_table {
-        for pair in apps.pairs::<String, String>().flatten() {
-            let (key_str, cmd) = pair;
-            if let Some(ch) = key_str.chars().next().map(|c| c.to_ascii_lowercase()) {
+        let mut entries: Vec<(String, String)> = Vec::new();
+        for v in apps.sequence_values::<mlua::Table>().flatten() {
+            let key = v.get::<String>("key").or_else(|_| v.get::<String>(1));
+            let exec = v.get::<String>("exec").or_else(|_| v.get::<String>(2));
+            if let (Ok(k), Ok(e)) = (key, exec) {
+                entries.push((k, e));
+            }
+        }
+        let mut map: Vec<(String, String)> = apps.pairs::<String, String>().flatten().collect();
+        map.sort();
+        entries.extend(map);
+
+        for (key_str, cmd) in entries {
+            if let Some(ch) = bind_key(&key_str) {
                 if !cmd.trim().is_empty() {
                     if let Some(existing) = binds.iter_mut().find(|(k, _)| *k == ch) {
                         existing.1 = Action::Launch(cmd);
@@ -657,6 +707,93 @@ impl Default for BarConfig {
     }
 }
 
+/// How a wallpaper is fitted to the output (`fit` in Lua).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WallpaperFit {
+    /// Cover the output, cropping the overflow from the centre (default).
+    Fill,
+    /// Whole image visible, letterboxed on the background colour.
+    Fit,
+    /// Stretch to the output, ignoring aspect ratio.
+    Stretch,
+}
+
+impl WallpaperFit {
+    fn parse_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fit" | "contain" => Self::Fit,
+            "stretch" => Self::Stretch,
+            _ => Self::Fill,
+        }
+    }
+}
+
+/// Static-image wallpaper (`wallpaper` in Lua). A path may be a file or a
+/// directory (its images are used, non-recursive).
+///
+/// ```lua
+/// wallpaper = "~/Pictures/a.png"
+/// wallpaper = { engine = "static", paths = { "~/a.png", "~/walls" },
+///               interval = 600,   -- seconds between images; 0 = pick once
+///               shuffle = true, fit = "fill" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WallpaperConfig {
+    pub paths: Vec<PathBuf>,
+    pub interval_secs: u64,
+    pub shuffle: bool,
+    pub fit: WallpaperFit,
+}
+
+fn expand_home(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(s)
+}
+
+fn parse_wallpaper(gl: &mlua::Table) -> Option<WallpaperConfig> {
+    let v = gl.get::<mlua::Value>("wallpaper").ok()?;
+    let (paths, interval_secs, shuffle, fit) = match v {
+        mlua::Value::String(s) => (
+            vec![expand_home(&s.to_string_lossy())],
+            0,
+            false,
+            WallpaperFit::Fill,
+        ),
+        mlua::Value::Table(t) => {
+            if let Ok(engine) = t.get::<String>("engine") {
+                if !engine.eq_ignore_ascii_case("static") {
+                    eprintln!("[config] wallpaper.engine = {engine:?} is not supported (only \"static\")");
+                    return None;
+                }
+            }
+            // `paths = {..}`, a single `path = ".."`, or the bare sequence.
+            let mut raw: Vec<String> = t.get::<Vec<String>>("paths").unwrap_or_default();
+            if let Ok(p) = t.get::<String>("path") {
+                raw.push(p);
+            }
+            raw.extend(t.sequence_values::<String>().filter_map(Result::ok));
+            (
+                raw.iter().map(|p| expand_home(p)).collect(),
+                t.get::<u64>("interval").unwrap_or(0),
+                t.get::<bool>("shuffle").unwrap_or(false),
+                t.get::<String>("fit")
+                    .map_or(WallpaperFit::Fill, |f| WallpaperFit::parse_str(&f)),
+            )
+        }
+        _ => return None,
+    };
+    (!paths.is_empty()).then_some(WallpaperConfig {
+        paths,
+        interval_secs,
+        shuffle,
+        fit,
+    })
+}
+
 fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
     let Ok(bt) = gl.get::<mlua::Table>("bar") else {
         return default.clone();
@@ -672,7 +809,10 @@ fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
 #[derive(Debug, Clone)]
 pub struct VeilConfig {
     pub quality: Quality,
+    /// Compositor frame-rate cap. `0` = match the display's refresh rate.
     pub fps: u32,
+    /// DRM display-mode refresh selection (`refresh` in Lua).
+    pub refresh: RefreshPref,
     pub cage_timeout_secs: u32,
     pub input: bool,
     /// Whether to use GPU compute shaders for frame encoding (halfblock/luma).
@@ -697,6 +837,8 @@ pub struct VeilConfig {
     pub theme_name: ThemeName,
     /// `bar = { ... }` config — see `BarConfig`.
     pub bar: BarConfig,
+    /// Static wallpaper, if configured.
+    pub wallpaper: Option<WallpaperConfig>,
 }
 
 impl Default for VeilConfig {
@@ -704,6 +846,7 @@ impl Default for VeilConfig {
         Self {
             quality: Quality::Auto,
             fps: 60,
+            refresh: RefreshPref::Preferred,
             cage_timeout_secs: 8,
             input: true,
             gpu_render: true,
@@ -714,6 +857,7 @@ impl Default for VeilConfig {
             theme: Theme::for_name(ThemeName::Default),
             theme_name: ThemeName::Default,
             bar: BarConfig::default(),
+            wallpaper: None,
         }
     }
 }
@@ -807,6 +951,10 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
             .map(|s| Quality::parse_str(&s))
             .unwrap_or(d.quality),
         fps: gl.get::<u32>("fps").unwrap_or(d.fps),
+        refresh: gl
+            .get::<String>("refresh")
+            .map(|s| RefreshPref::parse_str(&s))
+            .unwrap_or(d.refresh),
         cage_timeout_secs: gl
             .get::<u32>("cage_timeout_secs")
             .unwrap_or(d.cage_timeout_secs),
@@ -829,6 +977,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
         theme,
         theme_name,
         bar: parse_bar(&gl, &d.bar),
+        wallpaper: parse_wallpaper(&gl),
     })
 }
 
@@ -942,5 +1091,58 @@ mod tests {
         let kb = parse_keybinds(&lua.globals());
         assert_eq!(kb.mod_key, ModKey::Alt);
         assert_eq!(kb.action_for('x'), Some(Action::ReloadConfig));
+    }
+}
+
+#[cfg(test)]
+mod app_bind_tests {
+    use super::*;
+
+    fn load_str(name: &str, lua: &str) -> VeilConfig {
+        let p = std::env::temp_dir().join(format!("veil-cfg-{name}-{}.lua", std::process::id()));
+        std::fs::write(&p, lua).unwrap();
+        let cfg = try_load(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        cfg
+    }
+
+    fn launches(cfg: &VeilConfig) -> Vec<(char, String)> {
+        cfg.keybinds
+            .binds
+            .iter()
+            .filter_map(|(k, a)| match a {
+                Action::Launch(c) => Some((*k, c.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ordered_apps_keep_declared_order_and_enter_maps_to_cr() {
+        let cfg = load_str(
+            "ordered",
+            r#"apps = { { "enter", "kitty" }, { key = "b", exec = "helium-browser" }, { "e", "dolphin" } }"#,
+        );
+        assert_eq!(
+            launches(&cfg),
+            vec![
+                ('\r', "kitty".into()),
+                ('b', "helium-browser".into()),
+                ('e', "dolphin".into())
+            ]
+        );
+        assert_eq!(
+            cfg.keybinds.action_for('\r'),
+            Some(Action::Launch("kitty".into()))
+        );
+    }
+
+    #[test]
+    fn map_form_still_works_in_key_order() {
+        let cfg = load_str("map", r#"apps = { t = "foot", b = "firefox" }"#);
+        assert_eq!(
+            launches(&cfg),
+            vec![('b', "firefox".into()), ('t', "foot".into())]
+        );
     }
 }

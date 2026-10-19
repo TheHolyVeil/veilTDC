@@ -90,7 +90,8 @@ fn print_help() {
     println!("CONFIG");
     println!("  Place config.lua at ./config.lua or ~/.config/veil/config.lua");
     println!("    quality = \"auto\"   -- auto | kitty | pixel | pixel256 | pixel16 | ascii | ascii_edge");
-    println!("    fps     = 60       -- compositor frame rate cap");
+    println!("    fps     = 60       -- compositor frame rate cap (0 = match the display)");
+    println!("    refresh = \"max\"   -- DRM mode: preferred | max | <Hz>");
 }
 
 fn main() -> std::io::Result<()> {
@@ -124,6 +125,13 @@ fn main() -> std::io::Result<()> {
         }
     }
     let is_start = subcmd == "start";
+
+    // Started from a login manager / bare VT: nobody can read stderr off the
+    // text console once we take over the display (or crash back to the
+    // greeter in half a second), so keep a log file instead.
+    if is_start && veil_host::output::is_bare_tty() && unsafe { libc::isatty(2) } == 1 {
+        redirect_stderr_to_session_log();
+    }
 
     // ── `run` / `start` subcommand ───────────────────────────────────────────
     let mut cfg = HostConfig::default();
@@ -325,6 +333,7 @@ fn main() -> std::io::Result<()> {
     let opts = veil_host::output::TerminalOpts {
         gpu: vcfg.gpu_render.then_some(vcfg.gpu_power),
         quality: vcfg.resolved_quality(),
+        refresh: vcfg.refresh,
     };
     let mut output = veil_host::output::detect(vcfg.output, opts)?;
     let n_monitors = output.monitor_count();
@@ -350,7 +359,10 @@ fn main() -> std::io::Result<()> {
     geom.comp_h.store(total_h, Ordering::Relaxed);
     let _ = host
         .input_sender()
-        .send(veil_host::InputCmd::SetMonitors { sizes });
+        .send(veil_host::InputCmd::SetMonitors {
+            sizes,
+            refresh_mhz: output.refresh_mhz(0),
+        });
     eprintln!("[veil-host] retargeting compositor: {n_monitors} monitor(s), virtual space {total_w}x{total_h}");
 
     // ── frame loop ────────────────────────────────────────────────────────────
@@ -362,6 +374,9 @@ fn main() -> std::io::Result<()> {
     let (mut loop_seat, mut loop_wait, mut loop_render) =
         (Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let (mut loop_iters, mut loop_frames) = (0u32, 0u32);
+    // Last rendered size of monitor 0, kept across iterations: the 1 s stats
+    // print can land on an iteration that rendered nothing.
+    let (mut logged_w, mut logged_h) = (0u32, 0u32);
 
     // Track last-known terminal size so we can notify the output backend on change.
     let mut last_term_cols = init_cols;
@@ -415,46 +430,11 @@ fn main() -> std::io::Result<()> {
         loop_seat += t_iter.elapsed();
         loop_iters += 1;
 
-        let mut got_any = false;
-
-        // Drain any immediately available frames from the channel
+        // Pull in everything the compositor has produced so far. Anything newer
+        // than a frame we're still holding back coalesces into it (damage
+        // unioned in `store_frame`).
         while let Ok(f) = host.frames().try_recv() {
-            got_any = true;
             store_frame(&mut latest, f);
-        }
-
-        let t_wait = std::time::Instant::now();
-        if !got_any {
-            let timeout = if output.has_flip_pending() {
-                Duration::from_millis(4)
-            } else {
-                Duration::from_millis(100)
-            };
-
-            match host.frames().recv_timeout(timeout) {
-                Ok(f) => {
-                    got_any = true;
-                    store_frame(&mut latest, f);
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = output.poll_events(Duration::from_millis(0));
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-
-            while let Ok(f) = host.frames().try_recv() {
-                got_any = true;
-                store_frame(&mut latest, f);
-            }
-        }
-
-        if output.has_flip_pending() {
-            let _ = output.poll_events(Duration::from_millis(0));
-        }
-        loop_wait += t_wait.elapsed();
-
-        if !got_any && !output.has_flip_pending() {
-            continue;
         }
 
         // Propagate terminal resize to the output backend so it can update
@@ -468,10 +448,16 @@ fn main() -> std::io::Result<()> {
         }
 
         // Render every monitor that has a new frame waiting.
-        let mut logged_w = 0;
-        let mut logged_h = 0;
         let mut rendered_any = false;
         for (id, slot) in latest.iter_mut().enumerate() {
+            // This monitor's previous flip hasn't retired, so a new frame
+            // can't be scanned out yet. Keep it in `latest` (newer frames
+            // coalesce into it) instead of blitting it just to be skipped —
+            // that was the `skipped_pending` pile-up. It's rendered right
+            // after the VBLANK event wakes us below.
+            if slot.is_some() && output.monitor_flip_pending(id) {
+                continue;
+            }
             if let Some(frame) = slot.take() {
                 let t_r = std::time::Instant::now();
                 output.render_frame(id, &frame.rgba, frame.width, frame.height, frame.damage)?;
@@ -484,6 +470,39 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
+
+        // Wait. After the loop above, every monitor is either flipping or has
+        // nothing to show, so there's nothing useful to do until something
+        // external happens.
+        let t_wait = std::time::Instant::now();
+        let all_pending =
+            n_monitors > 0 && (0..n_monitors).all(|i| output.monitor_flip_pending(i));
+        if all_pending {
+            // Nothing can be presented until VBLANK retires a flip, so block
+            // on the DRM fd itself: wakes the instant the page-flip event
+            // lands (no 4 ms polling slop). Frames keep queuing in the channel
+            // meanwhile and coalesce on the next iteration. 20 ms cap keeps
+            // seat/VT service and shutdown responsive.
+            let _ = output.poll_events(Duration::from_millis(20));
+        } else {
+            // Idle, or only some monitors in flight: wait on the frame channel
+            // (the compositor isn't an fd we can poll), but keep the slice
+            // short while a flip is outstanding so its event is noticed fast.
+            let timeout = if output.has_flip_pending() {
+                Duration::from_millis(4)
+            } else {
+                Duration::from_millis(100)
+            };
+            match host.frames().recv_timeout(timeout) {
+                Ok(f) => store_frame(&mut latest, f),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if output.has_flip_pending() {
+                let _ = output.poll_events(Duration::from_millis(0));
+            }
+        }
+        loop_wait += t_wait.elapsed();
 
         // FPS stats logging every second — monitor 0's dimensions.
         if rendered_any {
@@ -809,6 +828,48 @@ fn init_debug_log() -> std::io::Result<()> {
     std::mem::forget(f);
     eprintln!("\n[veil-host] ── debug log opened ── ({})", path.display());
     Ok(())
+}
+
+/// Point stderr at `$XDG_STATE_HOME/veil/veil-host.log` (default
+/// `~/.local/state/veil/`), keeping the previous run as `.log.1`, and turn on
+/// libseat's own diagnostics unless `VEIL_LOG` says otherwise. The seat/DRM
+/// handshake is where a login-manager launch dies, and its reason is only
+/// ever reported through that log.
+fn redirect_stderr_to_session_log() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let Some(base) = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })
+    else {
+        return;
+    };
+    let dir = base.join("veil");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("veil-host.log");
+    let _ = std::fs::rename(&path, dir.join("veil-host.log.1"));
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+    else {
+        return;
+    };
+    eprintln!("[veil-host] session log: {}", path.display());
+    if std::env::var_os("VEIL_LOG").is_none() {
+        std::env::set_var("VEIL_LOG", "warn,libseat=debug");
+    }
+    // `file` closes its own fd on drop; fd 2 stays pointing at the log.
+    unsafe {
+        libc::dup2(file.as_raw_fd(), 2);
+    }
 }
 
 fn init_tracing(debug: bool) {

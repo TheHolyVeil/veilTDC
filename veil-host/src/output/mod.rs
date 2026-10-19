@@ -60,8 +60,22 @@ pub trait OutputBackend {
     /// Default: no-op (DrmOutput ignores terminal resize events).
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
 
+    /// Refresh rate of `monitor` in millihertz (60 Hz = 60_000). Terminal
+    /// output has no real refresh, so it reports 60 Hz.
+    fn refresh_mhz(&self, _monitor: usize) -> u32 {
+        60_000
+    }
+
     /// Whether any output device has a page flip in progress.
     fn has_flip_pending(&self) -> bool {
+        false
+    }
+
+    /// Whether `monitor` specifically has a page flip in flight. The frame
+    /// loop uses this to hold a finished frame back (coalescing newer damage
+    /// into it) instead of blitting it into a buffer it can't flip yet, and to
+    /// decide when it may block on the DRM fd. Default: never pending.
+    fn monitor_flip_pending(&self, _monitor: usize) -> bool {
         false
     }
 
@@ -100,7 +114,7 @@ enum Force {
 /// attempt on what still looks like a bare TTY. It's a persistent "trust
 /// bare-TTY sessions to have real GPU hardware" setting, not a sledgehammer:
 /// running `veil-host run` under Niri with `output = "drm"` in config still
-fn is_bare_tty() -> bool {
+pub fn is_bare_tty() -> bool {
     if std::env::var("TERM").map(|t| t == "linux").unwrap_or(false) {
         return true;
     }
@@ -137,6 +151,8 @@ pub struct TerminalOpts {
     pub gpu: Option<veil_config::GpuPower>,
     /// Resolved `quality` (never `Auto`/`Sixel`).
     pub quality: veil_config::Quality,
+    /// DRM display-mode refresh selection; ignored by the terminal backend.
+    pub refresh: veil_config::RefreshPref,
 }
 
 /// Auto-detect best output backend for current environment.
@@ -147,6 +163,7 @@ pub fn detect(
     pref: veil_config::OutputPref,
     opts: TerminalOpts,
 ) -> io::Result<Box<dyn OutputBackend>> {
+    let refresh = opts.refresh;
     let force = match std::env::var("VEIL_OUTPUT").ok().as_deref() {
         Some("drm") | Some("kms") => Some(Force::Drm),
         Some("terminal") | Some("term") => Some(Force::Terminal),
@@ -160,7 +177,7 @@ pub fn detect(
 
     if force == Some(Force::Drm) {
         eprintln!("[veil-host] VEIL_OUTPUT=drm → forcing DRM/KMS");
-        return Ok(Box::new(DrmOutput::new()?));
+        return Ok(Box::new(DrmOutput::new(refresh)?));
     }
 
     let bare_tty = is_bare_tty();
@@ -170,7 +187,7 @@ pub fn detect(
     // even if stale WAYLAND_DISPLAY / DISPLAY / SSH_TTY env vars exist from a prior session.
     if bare_tty && has_dri && pref != veil_config::OutputPref::Terminal {
         eprintln!("[veil-host] bare TTY + GPU detected → attempting DRM/KMS");
-        match DrmOutput::new() {
+        match DrmOutput::new(refresh) {
             Ok(drm) => {
                 eprintln!("[veil-host] DRM/KMS initialized on bare metal framebuffer");
                 return Ok(Box::new(drm));
@@ -194,7 +211,7 @@ pub fn detect(
 
     if pref == veil_config::OutputPref::Drm {
         eprintln!("[veil-host] config.lua output=drm → forcing DRM/KMS (bare TTY assumed)");
-        return Ok(Box::new(DrmOutput::new()?));
+        return Ok(Box::new(DrmOutput::new(refresh)?));
     }
 
     // If SSH session (and not on a bare TTY console), use terminal output
@@ -204,7 +221,7 @@ pub fn detect(
     }
 
     // Fallback: try DRM/KMS
-    match DrmOutput::new() {
+    match DrmOutput::new(refresh) {
         Ok(drm) => {
             eprintln!("[veil-host] DRM/KMS available, using bare-metal framebuffer output");
             Ok(Box::new(drm))

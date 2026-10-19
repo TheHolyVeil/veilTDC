@@ -5003,6 +5003,7 @@ dependencies = [
  "crossterm",
  "drm 0.15.0",
  "evdev",
+ "image",
  "libc",
  "libseat",
  "mimalloc",

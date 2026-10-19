@@ -84,6 +84,49 @@ struct Monitor {
     was_active: bool,
 }
 
+/// Exact refresh of a mode in millihertz. `vrefresh()` is rounded to whole Hz
+/// (119.88 and 120.00 both read 120), so derive it from the timings.
+fn mode_mhz(m: &drm::control::Mode) -> u32 {
+    let (_, _, htotal) = m.hsync();
+    let (_, _, vtotal) = m.vsync();
+    let denom = htotal as u64 * vtotal as u64;
+    if denom == 0 {
+        return m.vrefresh() * 1000;
+    }
+    (m.clock() as u64 * 1_000_000 / denom) as u32
+}
+
+/// Choose the mode to drive. Resolution is always the first (preferred)
+/// mode's; `refresh` only picks among modes of that size. A requested rate
+/// the panel doesn't offer falls back to the preferred mode with a warning
+/// rather than failing the whole backend.
+fn pick_mode(modes: &[drm::control::Mode], refresh: veil_config::RefreshPref) -> Option<drm::control::Mode> {
+    use veil_config::RefreshPref;
+    let first = *modes.first()?;
+    let same_size = || modes.iter().filter(|m| m.size() == first.size());
+    let chosen = match refresh {
+        RefreshPref::Preferred => first,
+        RefreshPref::Max => same_size().max_by_key(|m| mode_mhz(m)).copied()?,
+        RefreshPref::Hz(n) => {
+            match same_size()
+                .filter(|m| m.vrefresh() == n)
+                .max_by_key(|m| mode_mhz(m))
+            {
+                Some(m) => *m,
+                None => {
+                    eprintln!(
+                        "[veil-host] DRM: no {}x{}@{n}Hz mode, using the preferred mode",
+                        first.size().0,
+                        first.size().1
+                    );
+                    first
+                }
+            }
+        }
+    };
+    Some(chosen)
+}
+
 /// Enumerate `/dev/dri/card*` primary nodes, numerically sorted.
 pub(crate) fn list_cards() -> Vec<String> {
     let names = std::fs::read_dir("/dev/dri")
@@ -160,7 +203,7 @@ impl DrmOutput {
     /// on a secondary card aren't silently dropped. Fails (→ caller falls
     /// back to terminal) if not on an active VT or no card has any
     /// connected, usable display.
-    pub fn new() -> io::Result<Self> {
+    pub fn new(refresh: veil_config::RefreshPref) -> io::Result<Self> {
         let mut seat = Seat::open()?;
 
         // Suspend fbcon BEFORE touching any CRTC. Mode-setting while the VT is
@@ -182,7 +225,7 @@ impl DrmOutput {
         let mut last_err: Option<io::Error> = None;
 
         for path in &card_paths {
-            match Self::try_card_all(&mut seat, path) {
+            match Self::try_card_all(&mut seat, path, refresh) {
                 Ok((card, mut card_monitors)) => {
                     let card_idx = cards.len();
                     eprintln!(
@@ -191,10 +234,10 @@ impl DrmOutput {
                     );
                     for m in &card_monitors {
                         eprintln!(
-                            "[veil-host] DRM:   {}x{}@{}Hz",
+                            "[veil-host] DRM:   {}x{}@{:.2}Hz",
                             m.width,
                             m.height,
-                            m.mode.vrefresh()
+                            mode_mhz(&m.mode) as f64 / 1000.0
                         );
                     }
                     for m in &mut card_monitors {
@@ -241,7 +284,11 @@ impl DrmOutput {
     /// just the first. Returns the opened card plus one [`Monitor`] per
     /// connector that mode-set successfully (`card_idx` left as `0`; the
     /// caller fixes it up once it knows this card's real index).
-    fn try_card_all(seat: &mut Seat, path: &str) -> io::Result<(Card, Vec<Monitor>)> {
+    fn try_card_all(
+        seat: &mut Seat,
+        path: &str,
+        refresh: veil_config::RefreshPref,
+    ) -> io::Result<(Card, Vec<Monitor>)> {
         let dev = seat.open_device(path)?;
         let card = Card { dev };
 
@@ -274,7 +321,7 @@ impl DrmOutput {
         let mut errs = Vec::new();
 
         for con in &connected {
-            let &mode = match con.modes().first() {
+            let mode = match pick_mode(con.modes(), refresh) {
                 Some(m) => m,
                 None => {
                     errs.push(format!("{:?}: no modes", con.handle()));
@@ -383,6 +430,13 @@ impl DrmOutput {
     /// swallowed monitor 1's completion and monitor 1 stayed pending forever.
     fn drain_flips(&mut self, idx: usize) -> io::Result<bool> {
         let card_idx = self.monitors[idx].card_idx;
+        self.drain_card(card_idx)
+    }
+
+    /// Drain one card's event queue and present anything that was waiting on
+    /// it. Split out of `drain_flips` so `poll_events` can drain exactly the
+    /// cards whose fd signalled, once each, rather than once per monitor.
+    fn drain_card(&mut self, card_idx: usize) -> io::Result<bool> {
         let mut got_event = false;
 
         match self.cards[card_idx].receive_events() {
@@ -615,6 +669,16 @@ impl OutputBackend for DrmOutput {
         self.monitors.iter().any(|m| m.flip_pending)
     }
 
+    fn refresh_mhz(&self, monitor: usize) -> u32 {
+        self.monitors
+            .get(monitor)
+            .map_or(60_000, |m| mode_mhz(&m.mode))
+    }
+
+    fn monitor_flip_pending(&self, monitor: usize) -> bool {
+        self.monitors.get(monitor).is_some_and(|m| m.flip_pending)
+    }
+
     fn service_seat(&mut self) -> io::Result<()> {
         self.pump_seat();
         for idx in 0..self.monitors.len() {
@@ -628,6 +692,18 @@ impl OutputBackend for DrmOutput {
             return Ok(false);
         }
 
+        // VT switched away: DRM master is revoked and the card fd is dead
+        // weight — blocking on it would either never wake or wake instantly
+        // forever (POLLHUP) and spin the caller. Sleep a short slice instead;
+        // the frame loop runs `service_seat` every iteration, which is what
+        // actually brings us back.
+        if !self.seat.is_active() {
+            if !timeout.is_zero() {
+                std::thread::sleep(timeout.min(std::time::Duration::from_millis(10)));
+            }
+            return Ok(false);
+        }
+
         let mut pollfds: Vec<libc::pollfd> = self
             .cards
             .iter()
@@ -638,7 +714,8 @@ impl OutputBackend for DrmOutput {
             })
             .collect();
 
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // Round UP: truncating 0.5ms to 0 turns a short wait into a busy spin.
+        let timeout_ms = timeout.as_micros().div_ceil(1000).min(i32::MAX as u128) as libc::c_int;
         let ret = unsafe {
             libc::poll(
                 pollfds.as_mut_ptr(),
@@ -659,11 +736,30 @@ impl OutputBackend for DrmOutput {
             return Ok(false);
         }
 
+        // Drain only the cards that signalled, once each. (Was: drain_flips
+        // per *monitor*, i.e. N redundant receive_events() on a shared card.)
         let mut processed = false;
-        for i in 0..self.monitors.len() {
-            if self.drain_flips(i)? {
-                processed = true;
+        let mut readable = false;
+        for (card_idx, pfd) in pollfds.iter().enumerate() {
+            if pfd.revents & libc::POLLIN == 0 {
+                continue;
             }
+            readable = true;
+            match self.drain_card(card_idx) {
+                Ok(true) => processed = true,
+                Ok(false) => {}
+                Err(e) => {
+                    // A persistently failing fd would make the next poll()
+                    // return instantly; back off so the caller can't spin.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    return Err(e);
+                }
+            }
+        }
+
+        if !readable {
+            // Only POLLERR/POLLHUP/POLLNVAL fired — same spin hazard.
+            std::thread::sleep(timeout.min(std::time::Duration::from_millis(5)));
         }
 
         Ok(processed)
