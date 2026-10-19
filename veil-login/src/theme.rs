@@ -44,6 +44,96 @@ pub const DEFAULT_PALETTE: Palette = Palette {
     text_dim: (Rgb(0x9d, 0xb0, 0x8a), 0x66),
 };
 
+/// Circular distance between two of the 16 hue bins.
+fn bin_dist(a: usize, b: usize) -> usize {
+    let d = a.abs_diff(b);
+    d.min(16 - d)
+}
+
+/// Bins within this many steps (x22.5 degrees) of the dominant one count as
+/// the same colour family.
+const CAST_RADIUS: usize = 2;
+/// A family holding at least this share of all colour weight is a colour
+/// *cast* (a Nord-style blue grade, a sepia tint), not a subject.
+const CAST_SHARE: f32 = 0.75;
+/// Hue bins (x22.5 degrees: 157.5..270, teal through blue to indigo) treated
+/// as the "cold grade" that gets subtracted. Deliberately only the cool end: a
+/// plain orange or green wallpaper should still give an orange or green UI,
+/// it's the blue-tinted ones that make every login screen identical.
+const COLD_BINS: std::ops::RangeInclusive<usize> = 7..=11;
+/// Under a cast, an outside hue must hold at least this share to be picked.
+const MINORITY_SHARE: f32 = 0.03;
+/// With nothing outside the cast to pick, the accent is the cast's own colour
+/// with its hue turned by this much (180 = the opposite side of the wheel).
+const CAST_ROTATION_DEG: f32 = 180.0;
+
+/// Where the accent comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// The average colour of this hue bin, as is.
+    Bin(usize),
+    /// The average colour of this hue bin with its hue rotated.
+    Rotated(usize),
+}
+
+/// Choose the accent's source. Normally the heaviest hue bin. But a wallpaper
+/// graded into one hue (every Nord wallpaper is blue) makes the heaviest bin
+/// say nothing, and the whole UI turns that colour. So when one colour family
+/// holds `CAST_SHARE` of the colour, subtract it:
+///   1. take the strongest hue outside the family, if it has a real presence;
+///   2. otherwise rotate the cast's own hue away from itself.
+fn pick_bin(w: &[f32; 16], total: f32) -> Pick {
+    let heaviest = |it: &mut dyn Iterator<Item = usize>| {
+        it.max_by(|&a, &b| w[a].partial_cmp(&w[b]).unwrap_or(std::cmp::Ordering::Equal))
+    };
+    let dom = heaviest(&mut (0..16)).unwrap_or(0);
+    if !COLD_BINS.contains(&dom) {
+        return Pick::Bin(dom);
+    }
+    let family: f32 = (0..16)
+        .filter(|&i| bin_dist(i, dom) <= CAST_RADIUS)
+        .map(|i| w[i])
+        .sum();
+    if family < CAST_SHARE * total {
+        return Pick::Bin(dom);
+    }
+    match heaviest(&mut (0..16).filter(|&i| bin_dist(i, dom) > CAST_RADIUS)) {
+        Some(alt) if w[alt] >= MINORITY_SHARE * total => Pick::Bin(alt),
+        _ => Pick::Rotated(dom),
+    }
+}
+
+/// Rotate an RGB colour's hue by `deg`, keeping saturation and value.
+fn rotate_hue((r, g, b): (f32, f32, f32), deg: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    if d <= f32::EPSILON {
+        return (r, g, b); // grey: no hue to rotate
+    }
+    let h = if (max - r).abs() < f32::EPSILON {
+        60.0 * (((g - b) / d) % 6.0)
+    } else if (max - g).abs() < f32::EPSILON {
+        60.0 * (((b - r) / d) + 2.0)
+    } else {
+        60.0 * (((r - g) / d) + 4.0)
+    };
+    let h = (h + deg).rem_euclid(360.0);
+    let (s, v) = (d / max, max);
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r1, g1, b1) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (r1 + m, g1 + m, b1 + m)
+}
+
 /// Extract a harmonized UI palette from `slint::Rgba8Pixel` slice.
 pub fn extract_palette(pixels: &[slint::Rgba8Pixel], width: u32, height: u32) -> Palette {
     if pixels.is_empty() || width == 0 || height == 0 {
@@ -123,18 +213,16 @@ pub fn extract_palette(pixels: &[slint::Rgba8Pixel], width: u32, height: u32) ->
     // logo: colour has to carry a real share of the samples (~4% worth of
     // fully vibrant pixels) before it beats the neutral fallback.
     let accent = if total_colorful_weight > 0.04 * sampled as f32 {
-        // Find best bin
-        let best_bin = bin_weights
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-
-        let w = bin_weights[best_bin].max(0.0001);
-        let r = (bin_r[best_bin] / w).clamp(0.0, 255.0);
-        let g = (bin_g[best_bin] / w).clamp(0.0, 255.0);
-        let b = (bin_b[best_bin] / w).clamp(0.0, 255.0);
+        let (bin, rot) = match pick_bin(&bin_weights, total_colorful_weight) {
+            Pick::Bin(i) => (i, 0.0),
+            Pick::Rotated(i) => (i, CAST_ROTATION_DEG),
+        };
+        let w = bin_weights[bin].max(0.0001);
+        let (r, g, b) = rotate_hue(
+            (bin_r[bin] / w, bin_g[bin] / w, bin_b[bin] / w),
+            rot,
+        );
+        let (r, g, b) = (r.clamp(0.0, 255.0), g.clamp(0.0, 255.0), b.clamp(0.0, 255.0));
 
         // Ensure proper contrast: ensure luma is between 120 and 210 for good readability
         let luma = 0.299 * r + 0.587 * g + 0.114 * b;
@@ -152,10 +240,11 @@ pub fn extract_palette(pixels: &[slint::Rgba8Pixel], width: u32, height: u32) ->
             (b * scale).clamp(20.0, 255.0) as u8,
         )
     } else if neutral_count > 0 {
-        // High neutral image: use a cool light silver/slate accent
+        // High neutral image: a plain grey accent. (This used to lean cool,
+        // which made every grey wallpaper's UI faintly blue.)
         let avg_luma = ((neutral_r + neutral_g + neutral_b) / (neutral_count as u64 * 3)) as u8;
         let val = avg_luma.clamp(140, 210);
-        Rgb(val.saturating_sub(10), val, val.saturating_add(5))
+        Rgb(val, val, val)
     } else {
         DEFAULT_PALETTE.accent
     };
@@ -283,6 +372,64 @@ mod tests {
 
     fn solid(r: u8, g: u8, b: u8, n: usize) -> Vec<slint::Rgba8Pixel> {
         vec![slint::Rgba8Pixel { r, g, b, a: 255 }; n]
+    }
+
+    fn mixed(parts: &[((u8, u8, u8), usize)]) -> Vec<slint::Rgba8Pixel> {
+        parts
+            .iter()
+            .flat_map(|&((r, g, b), n)| solid(r, g, b, n))
+            .collect()
+    }
+
+    const NORD_BLUE: (u8, u8, u8) = (94, 129, 172);
+    const NORD_ORANGE: (u8, u8, u8) = (208, 135, 112);
+
+    #[test]
+    fn blue_graded_wallpaper_takes_its_accent_from_the_minority_hue() {
+        let px = mixed(&[(NORD_BLUE, 90), (NORD_ORANGE, 5), ((90, 90, 90), 5)]);
+        let pal = extract_palette(&px, 100, 1);
+        assert!(
+            pal.accent.0 as i32 > pal.accent.2 as i32 + 30,
+            "accent should be warm, got {:?}",
+            pal.accent
+        );
+    }
+
+    #[test]
+    fn single_hue_wallpaper_rotates_away_from_its_own_hue() {
+        // Nothing but Nord blue: no minority to pick, so the accent is the
+        // blue turned to the far side of the wheel (warm), not blue.
+        let px = mixed(&[(NORD_BLUE, 100)]);
+        let pal = extract_palette(&px, 100, 1);
+        assert!(
+            pal.accent.0 as i32 > pal.accent.2 as i32 + 30,
+            "expected warm, got {:?}",
+            pal.accent
+        );
+    }
+
+    #[test]
+    fn multi_coloured_wallpaper_still_follows_its_dominant_hue() {
+        // Blue only 55%: not a cast, so no minority override.
+        let px = mixed(&[(NORD_BLUE, 55), (NORD_ORANGE, 45)]);
+        let pal = extract_palette(&px, 100, 1);
+        assert!(pal.accent.2 > pal.accent.0, "blue should win: {:?}", pal.accent);
+    }
+
+    #[test]
+    fn noise_under_a_cast_does_not_change_the_accent() {
+        // 1 orange pixel in 100 is noise: same result as pure blue.
+        let pure = extract_palette(&mixed(&[(NORD_BLUE, 100)]), 100, 1);
+        let noisy = extract_palette(&mixed(&[(NORD_BLUE, 99), (NORD_ORANGE, 1)]), 100, 1);
+        assert_eq!(pure.accent, noisy.accent);
+    }
+
+    #[test]
+    fn rotate_hue_180_swaps_blue_and_orange_sides() {
+        let (r, g, b) = rotate_hue((94.0, 129.0, 172.0), 180.0);
+        assert!(r > g && g > b, "blue -> orange: {r} {g} {b}");
+        let (r, g, b) = rotate_hue((90.0, 90.0, 90.0), 180.0);
+        assert_eq!((r, g, b), (90.0, 90.0, 90.0), "grey is untouched");
     }
 
     #[test]
