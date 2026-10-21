@@ -1,7 +1,7 @@
 //! Session detection: what can we log the user into?
 //!
-//! Dynamic detection: Veil session, shell, and .desktop files in standard
-//! wayland/x11 session directories.
+//! Dynamic detection: .desktop files in the standard wayland/x11 session
+//! directories, plus a login shell.
 
 use std::path::Path;
 
@@ -13,36 +13,11 @@ pub struct SessionEntry {
     pub exec: String,
 }
 
-/// Dynamically locate the veil-host executable or allow override via VELOGIN_DEFAULT_EXEC.
-pub fn default_veil_exec() -> String {
-    if let Ok(env_exec) = std::env::var("VELOGIN_DEFAULT_EXEC") {
-        if !env_exec.trim().is_empty() {
-            return env_exec;
-        }
-    }
-    // Check if veil-host exists in the same directory as this binary
-    if let Ok(self_exe) = std::env::current_exe() {
-        if let Some(dir) = self_exe.parent() {
-            let candidate = dir.join("veil-host");
-            if candidate.is_file() {
-                return format!("{} start", shell_quote(&candidate.to_string_lossy()));
-            }
-        }
-    }
-    "veil-host start".to_string()
-}
-
+/// Every session velogin offers: the `.desktop` files in the standard
+/// wayland/x11 session directories (Veil ships its own, see `dist/veil.desktop`),
+/// sorted by name, then a plain login shell. Nothing is hardcoded.
 pub fn detect() -> Vec<SessionEntry> {
-    let mut sessions = vec![
-        SessionEntry {
-            name: "Veil".into(),
-            exec: default_veil_exec(),
-        },
-        SessionEntry {
-            name: "Shell".into(),
-            exec: String::new(),
-        },
-    ];
+    let mut sessions: Vec<SessionEntry> = Vec::new();
 
     for dir in ["/usr/share/wayland-sessions", "/usr/share/xsessions"] {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -61,6 +36,12 @@ pub fn detect() -> Vec<SessionEntry> {
         }
     }
 
+    // read_dir order is arbitrary; keep the picker stable between logins.
+    sessions.sort_by_key(|s| s.name.to_lowercase());
+    sessions.push(SessionEntry {
+        name: "Shell".into(),
+        exec: String::new(),
+    });
     sessions
 }
 
@@ -121,21 +102,6 @@ fn ini_get(content: &str, section: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Quote `s` for a POSIX shell. Bare when it only has safe characters, else
-/// single-quoted with embedded quotes escaped. The exec line is run as
-/// `<shell> -c "exec <exec>"`, so an unquoted path with a space or `;` in it
-/// (e.g. a binary installed under an odd directory) would split or inject.
-fn shell_quote(s: &str) -> String {
-    let safe = !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@%".contains(&b));
-    if safe {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,17 +142,5 @@ mod tests {
         assert_eq!((s.name.as_str(), s.exec.as_str()), ("Good", "good-wm"));
         assert!(from_desktop_file(&bad).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shell_quote_leaves_safe_paths_and_quotes_the_rest() {
-        assert_eq!(shell_quote("/usr/bin/veil-host"), "/usr/bin/veil-host");
-        assert_eq!(
-            shell_quote("/opt/my dir/veil-host"),
-            "'/opt/my dir/veil-host'"
-        );
-        assert_eq!(shell_quote("/x;rm -rf ~"), "'/x;rm -rf ~'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
-        assert_eq!(shell_quote(""), "''");
     }
 }

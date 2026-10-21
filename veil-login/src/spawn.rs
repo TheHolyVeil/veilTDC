@@ -400,7 +400,7 @@ pub fn launch(
         set_default("XDG_RUNTIME_DIR", runtime_dir);
     }
 
-    // Hardcoded sessions (Veil = `veil-host start`) resolve through PATH, and
+    // Session Exec= lines (e.g. `veil-session`) resolve through PATH, and
     // per-user installs live in ~/.local/bin — make sure it's reachable even
     // before the shell's own profile has run.
     let local_bin = format!("{}/.local/bin", home.to_string_lossy());

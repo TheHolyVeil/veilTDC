@@ -1846,6 +1846,10 @@ pub fn reload_config(state: &mut State) {
     set_wallpaper_config(state, new_cfg.wallpaper.clone());
     let refresh_mhz = state.output.current_mode().map_or(60_000, |m| m.refresh as u32);
     state.composite_interval = composite_interval_for(new_cfg.fps, refresh_mhz);
+    eprintln!(
+        "[veil-host] reload: composite_interval={:?} fps_cfg={} refresh_mhz={}",
+        state.composite_interval, new_cfg.fps, refresh_mhz
+    );
 
     if let Some(p) = &path {
         let name = p
@@ -3888,6 +3892,10 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                 .output
                 .change_current_state(Some(mode), None, None, None);
             state.composite_interval = composite_interval_for(state.fps_cfg, refresh_mhz);
+            eprintln!(
+                "[veil-host] composite_interval={:?} fps_cfg={} refresh_mhz={}",
+                state.composite_interval, state.fps_cfg, refresh_mhz
+            );
             // First time through this also loads the configured wallpaper;
             // later (hotplug / mode change) it just re-scales for new sizes.
             let wp_cfg = veil_config::config_path()
