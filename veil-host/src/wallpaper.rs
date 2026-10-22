@@ -52,6 +52,25 @@ impl WallpaperEngine {
         !self.files.is_empty()
     }
 
+    /// The expanded file list (files from configured paths/dirs).
+    pub fn files(&self) -> &[PathBuf] {
+        &self.files
+    }
+
+    /// The index of the currently displayed (or next-to-load) file.
+    pub fn current_idx(&self) -> usize {
+        self.idx
+    }
+
+    /// Override the current file index without touching the rotation timer,
+    /// so the shuffle/interval keeps running from wherever it already was.
+    /// Call `request()` afterward to kick off a load.
+    pub fn jump_to(&mut self, idx: usize) {
+        if !self.files.is_empty() {
+            self.idx = idx % self.files.len();
+        }
+    }
+
     /// Apply a (re)loaded config. Returns true if it changed, i.e. the caller
     /// should `request` a fresh load (or clear the layers if now inactive).
     pub fn configure(&mut self, cfg: Option<WallpaperConfig>) -> bool {

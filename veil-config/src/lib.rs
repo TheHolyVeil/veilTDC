@@ -222,6 +222,8 @@ pub enum Action {
     ToggleFullscreen,
     /// Hot-reload config file on demand.
     ReloadConfig,
+    /// Open (or close) the wallpaper chooser overlay.
+    WallpaperChooser,
     /// Switch the active workspace (1-indexed 1..=9, matches the Super+1..9
     /// keys visually — converted to a 0-indexed array slot in veil-host).
     SwitchWorkspace(u8),
@@ -252,6 +254,7 @@ impl Action {
             Self::ToggleLayout => "toggle layout mode".to_string(),
             Self::ToggleFullscreen => "toggle fullscreen".to_string(),
             Self::ReloadConfig => "reload config".to_string(),
+            Self::WallpaperChooser => "wallpaper chooser".to_string(),
             Self::SwitchWorkspace(n) => format!("switch to workspace {n}"),
             Self::MoveToWorkspace(n) => format!("move to workspace {n}"),
             Self::VolumeUp => "volume up".to_string(),
@@ -315,6 +318,7 @@ impl Default for Keybinds {
                 ('w', Action::ToggleLayout),
                 ('f', Action::ToggleFullscreen),
                 ('c', Action::ReloadConfig),
+                ('y', Action::WallpaperChooser),
             ]
             // Super+1..9 workspace switch — appended rather than inlined
             // above so the numeric range stays visually obvious and doesn't
@@ -363,7 +367,7 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         .unwrap_or(default.mod_key);
 
     // (Lua field name, Action) — order here is the help-menu display order.
-    const FIELDS: [(&str, Action); 17] = [
+    const FIELDS: [(&str, Action); 18] = [
         ("focus_left", Action::FocusLeft),
         ("focus_right", Action::FocusRight),
         ("focus_up", Action::FocusUp),
@@ -376,6 +380,7 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         ("toggle_layout", Action::ToggleLayout),
         ("fullscreen", Action::ToggleFullscreen),
         ("reload_config", Action::ReloadConfig),
+        ("wallpaper_chooser", Action::WallpaperChooser),
         ("volume_up", Action::VolumeUp),
         ("volume_down", Action::VolumeDown),
         ("volume_mute", Action::VolumeMute),

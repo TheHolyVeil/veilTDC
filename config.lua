@@ -98,6 +98,7 @@ keybinds = {
 	resize_shrink = "-",
 	toggle_layout = "w", --Switch between Dwindle and scroll window management, scroll has no window cap.
 	reload_config = ";", -- Hot-reload config on demand (Alt+;)
+	wallpaper_chooser = "y", -- Wallpaper chooser (Alt+Y): preview grid, click or Enter to set
 	volume_up = "[", -- Alt+[
 	volume_down = "]", -- Alt+]
 	-- volume_mute = "m",

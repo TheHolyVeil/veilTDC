@@ -242,6 +242,7 @@ fn main() -> std::io::Result<()> {
     cfg.background = vcfg.background;
     cfg.theme = vcfg.theme;
     cfg.bar = vcfg.bar.clone();
+    cfg.fps = vcfg.fps; // 0 = match the display (resolved in SetMonitors)
 
     // Register our socket for cleanup on ANY exit (clean shutdown, HOME,
     // Ctrl-C, or a crash) and install the panic/fatal-signal hooks that

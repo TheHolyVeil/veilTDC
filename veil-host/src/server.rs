@@ -110,6 +110,7 @@ use crate::detile::GpuImporter;
 use crate::launcher::Launcher;
 use crate::layout::{Layout, Rect};
 use crate::powermenu::{PowerAction, PowerMenu};
+use crate::wallpaper_chooser::WallpaperChooser;
 use crate::{input::InputCmd, sink::Frame};
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -379,6 +380,11 @@ pub struct State {
     /// `<mod_key>+P` power menu — `Some` while the modal is open. Same
     /// intercept-all-input shape as `launcher`, see `crate::powermenu`.
     pub power_menu: Option<PowerMenu>,
+    /// `<mod_key>+Y` (configurable via `keybinds.wallpaper_chooser`) wallpaper
+    /// chooser — `Some` while the modal is open. Shows a thumbnail grid of
+    /// every file the wallpaper engine knows about. Enter jumps to the selected
+    /// image without resetting the shuffle rotation timer.
+    pub wallpaper_chooser: Option<WallpaperChooser>,
     /// Own Wayland socket name, so launcher-spawned clients can connect back
     /// into us (`WAYLAND_DISPLAY=<this>`).
     pub socket_name: String,
@@ -2012,6 +2018,22 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
             }
         }
         ReloadConfig => reload_config(state),
+        WallpaperChooser => {
+            if state.wallpaper_chooser.is_some() {
+                // Toggle off.
+                state.wallpaper_chooser = None;
+            } else {
+                // With nothing configured (or nothing parsed) this still opens:
+                // the chooser shows "NO WALLPAPERS FOUND".
+                let files = state.wallpaper.files().to_vec();
+                let current = state.wallpaper.current_idx();
+                state.wallpaper_chooser =
+                    Some(crate::wallpaper_chooser::WallpaperChooser::new(files, current));
+            }
+            mark_dirty_full(state);
+            // Skip the relayout/refocus at the end — this doesn't touch windows.
+            return;
+        }
         SwitchWorkspace(n) => {
             let target = n.saturating_sub(1).min(veil_config::WORKSPACE_COUNT - 1);
             if target != state.monitors[idx].active_workspace {
@@ -2286,6 +2308,105 @@ fn execute_power_menu_selection(state: &mut State) {
     }
 }
 
+/// Per-keystroke handling while the wallpaper chooser is open.
+/// Arrow keys navigate the grid; Enter jumps to the selection; Escape or the
+/// `wallpaper_chooser` keybind closes without changing anything.
+fn handle_wallpaper_chooser_key(
+    state: &mut State,
+    mods: &ModifiersState,
+    keysym: KeysymHandle<'_>,
+) {
+    use smithay::input::keyboard::keysyms;
+
+    // Read the symbol first: `keysym_char` takes the handle by value.
+    let sym = keysym.modified_sym().raw();
+
+    // Allow the configured wallpaper_chooser action (defaults to <mod>+Y) to
+    // close the overlay — same chord that opened it.
+    let mod_held = match state.keybinds.mod_key {
+        veil_config::ModKey::Super => mods.logo,
+        veil_config::ModKey::Ctrl => mods.ctrl,
+        veil_config::ModKey::Alt => mods.alt,
+        veil_config::ModKey::Shift => mods.shift,
+    };
+    if mod_held {
+        if let Some(ch) = keysym_char(keysym) {
+            // Find whichever char is bound to WallpaperChooser and close on it.
+            let bound_char = state
+                .keybinds
+                .binds
+                .iter()
+                .find(|(_, a)| *a == veil_config::Action::WallpaperChooser)
+                .map(|(c, _)| *c);
+            if bound_char == Some(ch) {
+                state.wallpaper_chooser = None;
+                mark_dirty_full(state);
+                return;
+            }
+        }
+    }
+
+    match sym {
+        keysyms::KEY_Escape => {
+            state.wallpaper_chooser = None;
+        }
+        keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
+            // Only the engine index moves; the rotation timer keeps its
+            // schedule, so shuffle carries on from the picked image.
+            if let Some(idx) = state
+                .wallpaper_chooser
+                .take()
+                .and_then(|wc| wc.selected_file_idx())
+            {
+                state.wallpaper.jump_to(idx);
+                request_wallpaper(state);
+            }
+        }
+        keysyms::KEY_Left => {
+            if let Some(wc) = state.wallpaper_chooser.as_mut() {
+                wc.move_left();
+            }
+        }
+        keysyms::KEY_Right => {
+            if let Some(wc) = state.wallpaper_chooser.as_mut() {
+                wc.move_right();
+            }
+        }
+        keysyms::KEY_Up => {
+            if let Some(wc) = state.wallpaper_chooser.as_mut() {
+                wc.move_up();
+            }
+        }
+        keysyms::KEY_Down => {
+            if let Some(wc) = state.wallpaper_chooser.as_mut() {
+                wc.move_down();
+            }
+        }
+        keysyms::KEY_Page_Up => {
+            if let Some(wc) = state.wallpaper_chooser.as_mut() {
+                wc.page_up();
+            }
+        }
+        keysyms::KEY_Page_Down => {
+            if let Some(wc) = state.wallpaper_chooser.as_mut() {
+                wc.page_down();
+            }
+        }
+        keysyms::KEY_Home => {
+            if let Some(wc) = state.wallpaper_chooser.as_mut() {
+                wc.home();
+            }
+        }
+        keysyms::KEY_End => {
+            if let Some(wc) = state.wallpaper_chooser.as_mut() {
+                wc.end();
+            }
+        }
+        _ => {}
+    }
+    mark_dirty_full(state);
+}
+
 /// Fixed bar height in pixels: one line of the built-in 5x7 font at scale 1
 /// (7px glyph) plus 5px padding — see draw_bar(). Not configurable; the
 /// three-column layout it implies (16/8/rest chars) is sized against this
@@ -2532,6 +2653,7 @@ fn composite_one_monitor(
     show_help: bool,
     launcher_present: bool,
     power_menu_present: bool,
+    wallpaper_chooser_present: bool,
 ) {
     let now = Instant::now();
     // One `&mut Monitor` borrow, reused for every monitor-scoped field
@@ -2763,6 +2885,13 @@ fn composite_one_monitor(
             draw_power_menu_overlay(&pm, mod_key, &theme, back, w, h);
         }
     }
+    if wallpaper_chooser_present && idx == active_idx {
+        if let Some(wc) = state.wallpaper_chooser.as_mut() {
+            let g = crate::wallpaper_chooser::geometry(w, h);
+            wc.set_view(g.cols, g.rows);
+            wc.draw(&theme, back, w, h);
+        }
+    }
     if let Some(ref osd) = state.osd {
         if Instant::now() > osd.expires_at {
             state.osd = None;
@@ -2851,6 +2980,7 @@ fn composite_and_send(state: &mut State) {
     let show_help = state.show_help;
     let launcher_present = state.launcher.is_some();
     let power_menu_present = state.power_menu.is_some();
+    let wallpaper_chooser_present = state.wallpaper_chooser.is_some();
     let active_idx = active_monitor_idx(state);
 
     for idx in 0..state.monitors.len() {
@@ -2861,6 +2991,7 @@ fn composite_and_send(state: &mut State) {
             show_help,
             launcher_present,
             power_menu_present,
+            wallpaper_chooser_present,
         );
     }
 
@@ -2938,6 +3069,13 @@ fn apply_wallpaper_layers(state: &mut State, layers: Vec<crate::wallpaper::Layer
 
 /// Per-tick: pick up a finished load and drive rotation.
 fn wallpaper_tick(state: &mut State) {
+    if state
+        .wallpaper_chooser
+        .as_mut()
+        .is_some_and(|wc| wc.poll_thumbs())
+    {
+        mark_dirty_full(state);
+    }
     let monitors = &state.monitors;
     let layers = state.wallpaper.tick(
         Instant::now(),
@@ -3522,6 +3660,13 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                         return FilterResult::Intercept(());
                     }
 
+                    if st.wallpaper_chooser.is_some() {
+                        if pressed {
+                            handle_wallpaper_chooser_key(st, mods, keysym);
+                        }
+                        return FilterResult::Intercept(());
+                    }
+
                     if !pressed {
                         return FilterResult::Forward;
                     }
@@ -3737,6 +3882,35 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             };
             const BTN_LEFT: u32 = 0x110;
 
+            // Wallpaper chooser is modal: a left click on a tile picks it,
+            // a click off the panel closes it, and no button event (press or
+            // release) reaches the windows behind it.
+            if state.wallpaper_chooser.is_some() {
+                if pressed && button == BTN_LEFT {
+                    let m = &state.monitors[idx];
+                    let (px, py) = (m.pointer_pos.0 as i32, m.pointer_pos.1 as i32);
+                    let hit = state
+                        .wallpaper_chooser
+                        .as_ref()
+                        .map(|wc| wc.hit_test(px, py, m.output_w, m.output_h));
+                    match hit {
+                        Some(crate::wallpaper_chooser::Hit::Wallpaper(file_idx)) => {
+                            state.wallpaper_chooser = None;
+                            // Same as Enter: only the index moves, the
+                            // rotation timer keeps its schedule.
+                            state.wallpaper.jump_to(file_idx);
+                            request_wallpaper(state);
+                        }
+                        Some(crate::wallpaper_chooser::Hit::Outside) => {
+                            state.wallpaper_chooser = None;
+                        }
+                        _ => {}
+                    }
+                    mark_dirty_full(state);
+                }
+                return;
+            }
+
             // H9: dismiss grabbing popups on an outside press. Before the bar
             // check below, since a bar click returns early.
             if pressed {
@@ -3914,6 +4088,16 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
         }
 
         InputCmd::Scroll { v120 } => {
+            if let Some(wc) = state.wallpaper_chooser.as_mut() {
+                // Same direction convention as the launcher below.
+                if v120 < 0 {
+                    wc.move_down();
+                } else if v120 > 0 {
+                    wc.move_up();
+                }
+                mark_dirty_full(state);
+                return;
+            }
             if let Some(l) = state.launcher.as_mut() {
                 let matches_len = l.matches().len();
                 if matches_len > 0 {
@@ -4462,6 +4646,7 @@ pub fn run(
             None
         },
         power_menu: None,
+        wallpaper_chooser: None,
         socket_name: socket_name.to_string(),
         popups: PopupManager::default(),
         popup_grabs: Vec::new(),
