@@ -391,18 +391,19 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
     let mut binds: Vec<(char, Action)> = FIELDS
         .iter()
         .filter_map(|(field, action)| {
-            let key = t
-                .get::<String>(*field)
-                .ok()
-                .and_then(|s| s.chars().next())
-                .map(|c| c.to_ascii_lowercase())
-                .or_else(|| {
-                    default
-                        .binds
-                        .iter()
-                        .find(|(_, a)| a == action)
-                        .map(|(c, _)| *c)
-                })?;
+            let key = match t.get::<mlua::Value>(*field) {
+                // `field = false` or `field = ""` unbinds the action.
+                Ok(mlua::Value::Boolean(false)) => return None,
+                Ok(mlua::Value::String(s)) => {
+                    s.to_string_lossy().chars().next()?.to_ascii_lowercase()
+                }
+                // Absent (or not a string): the default key, if it has one.
+                _ => default
+                    .binds
+                    .iter()
+                    .find(|(_, a)| a == action)
+                    .map(|(c, _)| *c)?,
+            };
             Some((key, action.clone()))
         })
         .collect();
@@ -1120,6 +1121,27 @@ mod app_bind_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn false_or_empty_string_unbinds_an_action() {
+        let cfg = load_str(
+            "unbind",
+            r#"keybinds = { wallpaper_chooser = false, reload_config = "", close = "x" }"#,
+        );
+        let kb = &cfg.keybinds;
+        // Unbound: no key maps to them any more.
+        assert!(!kb.binds.iter().any(|(_, a)| *a == Action::WallpaperChooser));
+        assert!(!kb.binds.iter().any(|(_, a)| *a == Action::ReloadConfig));
+        // A normal override still works, and untouched actions keep defaults.
+        assert_eq!(kb.action_for('x'), Some(Action::Close));
+        assert_eq!(kb.action_for('l'), Some(Action::FocusRight));
+    }
+
+    #[test]
+    fn absent_field_keeps_its_default() {
+        let cfg = load_str("absent", r#"keybinds = { close = "x" }"#);
+        assert_eq!(cfg.keybinds.action_for('y'), Some(Action::WallpaperChooser));
     }
 
     #[test]

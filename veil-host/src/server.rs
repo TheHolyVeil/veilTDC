@@ -385,6 +385,14 @@ pub struct State {
     /// every file the wallpaper engine knows about. Enter jumps to the selected
     /// image without resetting the shuffle rotation timer.
     pub wallpaper_chooser: Option<WallpaperChooser>,
+    /// Volume/brightness helpers run on their own thread (see `media.rs`).
+    pub media: crate::media::MediaWorker,
+    /// N6: evdev keycodes whose *press* we intercepted. The matching release
+    /// is intercepted too, so a client never sees a release with no press.
+    pub suppressed_keys: std::collections::HashSet<u32>,
+    /// N7: set when we consumed a left-button press (bar tile, modal); the
+    /// next left release is dropped for the same reason.
+    pub swallow_left_release: bool,
     /// Own Wayland socket name, so launcher-spawned clients can connect back
     /// into us (`WAYLAND_DISPLAY=<this>`).
     pub socket_name: String,
@@ -1583,11 +1591,23 @@ fn keysym_char(keysym: KeysymHandle<'_>) -> Option<char> {
     char::from_u32(cp).map(|c| c.to_ascii_lowercase())
 }
 
+/// The display number of the XWayland we started, or `XWAYLAND_UNSET`.
+static XWAYLAND_DISPLAY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(XWAYLAND_UNSET);
+const XWAYLAND_UNSET: u32 = u32::MAX;
+
 /// Unconditionally seed native Wayland flags so browsers (Helium, Chrome),
 /// Electron apps, Firefox, Qt, GTK, and SDL apps run natively under Wayland
 /// without requiring special command-line flags.
 pub fn apply_wayland_env(cmd: &mut Command, socket_name: &str) {
     cmd.env("WAYLAND_DISPLAY", socket_name);
+    // N12: X11 clients get our XWayland through the child's own environment.
+    // Mutating the process environment (`set_var`) from the event loop raced
+    // with other threads that read it.
+    let xd = XWAYLAND_DISPLAY.load(std::sync::atomic::Ordering::Relaxed);
+    if xd != XWAYLAND_UNSET {
+        cmd.env("DISPLAY", format!(":{xd}"));
+    }
     cmd.env("XDG_SESSION_TYPE", "wayland");
     cmd.env("XDG_CURRENT_DESKTOP", "veil");
     cmd.env("XDG_SESSION_DESKTOP", "veil");
@@ -1615,128 +1635,6 @@ fn spawn_command(socket_name: &str, exec: &str) {
         }
         Err(e) => tracing::error!("spawn {exec:?} failed: {e}"),
     }
-}
-
-fn adjust_volume(up: bool) -> (String, Option<u8>) {
-    let arg = if up { "5%+" } else { "5%-" };
-    if let Ok(out) = Command::new("wpctl")
-        .args(["set-volume", "@DEFAULT_AUDIO_SINK@", arg])
-        .output()
-    {
-        if out.status.success() {
-            if let Ok(get_out) = Command::new("wpctl")
-                .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-                .output()
-            {
-                let s = String::from_utf8_lossy(&get_out.stdout);
-                if s.contains("[MUTED]") {
-                    return ("MUTED".to_string(), Some(0));
-                }
-                if let Some(val_str) = s.split_whitespace().nth(1) {
-                    if let Ok(val) = val_str.parse::<f32>() {
-                        let pct = (val * 100.0).round() as u8;
-                        return (format!("{pct}%"), Some(pct));
-                    }
-                }
-            }
-        }
-    }
-
-    let amixer_arg = if up { "5%+" } else { "5%-" };
-    if let Ok(out) = Command::new("amixer")
-        .args(["sset", "Master", amixer_arg])
-        .output()
-    {
-        let s = String::from_utf8_lossy(&out.stdout);
-        if let Some(start) = s.find('[') {
-            if let Some(end) = s[start..].find('%') {
-                if let Ok(pct) = s[start + 1..start + end].parse::<u8>() {
-                    return (format!("{pct}%"), Some(pct));
-                }
-            }
-        }
-    }
-
-    let pactl_arg = if up { "+5%" } else { "-5%" };
-    if Command::new("pactl")
-        .args(["set-sink-volume", "@DEFAULT_SINK@", pactl_arg])
-        .output()
-        .is_ok()
-    {
-        return ("ADJUSTED".to_string(), None);
-    }
-
-    (if up { "+5%" } else { "-5%" }.to_string(), None)
-}
-
-fn toggle_volume_mute() -> (String, Option<u8>) {
-    if Command::new("wpctl")
-        .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
-        .output()
-        .is_ok()
-    {
-        if let Ok(get_out) = Command::new("wpctl")
-            .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-            .output()
-        {
-            let s = String::from_utf8_lossy(&get_out.stdout);
-            if s.contains("[MUTED]") {
-                return ("MUTED".to_string(), Some(0));
-            } else if let Some(val_str) = s.split_whitespace().nth(1) {
-                if let Ok(val) = val_str.parse::<f32>() {
-                    let pct = (val * 100.0).round() as u8;
-                    return (format!("UNMUTED ({pct}%)"), Some(pct));
-                }
-            }
-        }
-    }
-
-    if let Ok(out) = Command::new("amixer")
-        .args(["sset", "Master", "toggle"])
-        .output()
-    {
-        let s = String::from_utf8_lossy(&out.stdout);
-        if s.contains("[off]") {
-            return ("MUTED".to_string(), Some(0));
-        } else {
-            return ("UNMUTED".to_string(), None);
-        }
-    }
-
-    ("TOGGLE MUTE".to_string(), None)
-}
-
-fn adjust_brightness(up: bool) -> (String, Option<u8>) {
-    let arg = if up { "+5%" } else { "5%-" };
-    if let Ok(out) = Command::new("brightnessctl").args(["set", arg]).output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if let Some(start) = s.find('(') {
-                if let Some(end) = s[start..].find('%') {
-                    if let Ok(pct) = s[start + 1..start + end].parse::<u8>() {
-                        return (format!("{pct}%"), Some(pct));
-                    }
-                }
-            }
-        }
-    }
-
-    let light_flag = if up { "-A" } else { "-U" };
-    if Command::new("light")
-        .args([light_flag, "5"])
-        .output()
-        .is_ok()
-    {
-        if let Ok(get_out) = Command::new("light").output() {
-            let s = String::from_utf8_lossy(&get_out.stdout);
-            if let Ok(val) = s.trim().parse::<f32>() {
-                let pct = val.round() as u8;
-                return (format!("{pct}%"), Some(pct));
-            }
-        }
-    }
-
-    (if up { "+5%" } else { "-5%" }.to_string(), None)
 }
 
 fn draw_osd_overlay(osd: &OsdNotification, back: &mut [u8], w: u32, h: u32) {
@@ -1852,10 +1750,6 @@ pub fn reload_config(state: &mut State) {
     set_wallpaper_config(state, new_cfg.wallpaper.clone());
     let refresh_mhz = state.output.current_mode().map_or(60_000, |m| m.refresh as u32);
     state.composite_interval = composite_interval_for(new_cfg.fps, refresh_mhz);
-    eprintln!(
-        "[veil-host] reload: composite_interval={:?} fps_cfg={} refresh_mhz={}",
-        state.composite_interval, new_cfg.fps, refresh_mhz
-    );
 
     if let Some(p) = &path {
         let name = p
@@ -2095,24 +1989,34 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
             // keybind already exists for that (SwitchWorkspace above).
         }
         VolumeUp => {
-            let (body, pct) = adjust_volume(true);
-            state.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+            // Off-thread; the result arrives via `media_tick`. Nothing here
+            // changes layout or focus, so skip the relayout below.
+            state.media.send(crate::media::MediaCmd::VolumeUp);
+            return;
         }
         VolumeDown => {
-            let (body, pct) = adjust_volume(false);
-            state.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+            // Off-thread; the result arrives via `media_tick`. Nothing here
+            // changes layout or focus, so skip the relayout below.
+            state.media.send(crate::media::MediaCmd::VolumeDown);
+            return;
         }
         VolumeMute => {
-            let (body, pct) = toggle_volume_mute();
-            state.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+            // Off-thread; the result arrives via `media_tick`. Nothing here
+            // changes layout or focus, so skip the relayout below.
+            state.media.send(crate::media::MediaCmd::VolumeMute);
+            return;
         }
         BrightnessUp => {
-            let (body, pct) = adjust_brightness(true);
-            state.show_osd("BRIGHTNESS", body, pct, Duration::from_secs(2));
+            // Off-thread; the result arrives via `media_tick`. Nothing here
+            // changes layout or focus, so skip the relayout below.
+            state.media.send(crate::media::MediaCmd::BrightnessUp);
+            return;
         }
         BrightnessDown => {
-            let (body, pct) = adjust_brightness(false);
-            state.show_osd("BRIGHTNESS", body, pct, Duration::from_secs(2));
+            // Off-thread; the result arrives via `media_tick`. Nothing here
+            // changes layout or focus, so skip the relayout below.
+            state.media.send(crate::media::MediaCmd::BrightnessDown);
+            return;
         }
         Launch(cmd) => spawn_command(&state.socket_name, &cmd),
     }
@@ -2818,7 +2722,14 @@ fn composite_one_monitor(
     // `theme` is `Copy` (plain color bytes) so pulling it out ahead of the
     // `back` borrow costs nothing.
     let theme = state.theme;
-    if state.bar.enabled && m.fullscreen.is_none() {
+    // N15: only a fullscreen window that is on this monitor's *active*
+    // workspace hides the bar (same test as the fullscreen draw block above).
+    let fullscreen_visible = m.fullscreen.as_ref().is_some_and(|fs| {
+        state.toplevels.iter().any(|t| {
+            t.alive() && t.monitor == idx && t.workspace == ws && t.wl_surface().as_ref() == Some(fs)
+        })
+    });
+    if state.bar.enabled && !fullscreen_visible {
         // Occupancy is THIS monitor's own — a window on another monitor's
         // workspace 3 has no bearing on what this monitor's bar shows for
         // its own workspace 3. Matches the dumb-separation model: each
@@ -3068,6 +2979,13 @@ fn apply_wallpaper_layers(state: &mut State, layers: Vec<crate::wallpaper::Layer
 }
 
 /// Per-tick: pick up a finished load and drive rotation.
+/// Show any finished volume/brightness result. Cheap: one channel poll.
+fn media_tick(state: &mut State) {
+    while let Some(u) = state.media.try_recv() {
+        state.show_osd(u.title, u.body, u.progress, Duration::from_secs(2));
+    }
+}
+
 fn wallpaper_tick(state: &mut State) {
     if state
         .wallpaper_chooser
@@ -3634,13 +3552,19 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             };
             // xkbcommon Keycode is an X11 keycode = evdev + 8.
             let kb = state.keyboard.clone();
-            kb.input::<(), _>(
+            // N6: release of a press we intercepted. It still has to go
+            // through xkb (so modifier state stays right), but not to clients.
+            let suppress_release = !pressed && state.suppressed_keys.remove(&keycode);
+            let swallowed = kb.input::<(), _>(
                 state,
                 (keycode + 8).into(),
                 ks,
                 serial,
                 time,
                 |st, mods: &ModifiersState, keysym: KeysymHandle<'_>| {
+                    if suppress_release {
+                        return FilterResult::Intercept(());
+                    }
                     // Launcher modal: swallow ALL key input while it's open
                     // (typed query text, arrow-key selection, Enter/Escape),
                     // so the hosted client (if any) never sees it and text
@@ -3675,28 +3599,23 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                     let sym = keysym.modified_sym().raw();
                     match sym {
                         keysyms::KEY_XF86AudioRaiseVolume => {
-                            let (body, pct) = adjust_volume(true);
-                            st.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+                            st.media.send(crate::media::MediaCmd::VolumeUp);
                             return FilterResult::Intercept(());
                         }
                         keysyms::KEY_XF86AudioLowerVolume => {
-                            let (body, pct) = adjust_volume(false);
-                            st.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+                            st.media.send(crate::media::MediaCmd::VolumeDown);
                             return FilterResult::Intercept(());
                         }
                         keysyms::KEY_XF86AudioMute => {
-                            let (body, pct) = toggle_volume_mute();
-                            st.show_osd("VOLUME", body, pct, Duration::from_secs(2));
+                            st.media.send(crate::media::MediaCmd::VolumeMute);
                             return FilterResult::Intercept(());
                         }
                         keysyms::KEY_XF86MonBrightnessUp => {
-                            let (body, pct) = adjust_brightness(true);
-                            st.show_osd("BRIGHTNESS", body, pct, Duration::from_secs(2));
+                            st.media.send(crate::media::MediaCmd::BrightnessUp);
                             return FilterResult::Intercept(());
                         }
                         keysyms::KEY_XF86MonBrightnessDown => {
-                            let (body, pct) = adjust_brightness(false);
-                            st.show_osd("BRIGHTNESS", body, pct, Duration::from_secs(2));
+                            st.media.send(crate::media::MediaCmd::BrightnessDown);
                             return FilterResult::Intercept(());
                         }
                         _ => {}
@@ -3766,6 +3685,15 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                     FilterResult::Forward
                 },
             );
+            if pressed {
+                if swallowed.is_some() {
+                    state.suppressed_keys.insert(keycode);
+                } else {
+                    // Forwarded press: forget any stale entry so its release
+                    // is forwarded too (no stuck key in the client).
+                    state.suppressed_keys.remove(&keycode);
+                }
+            }
         }
 
         InputCmd::PointerMotionAbs {
@@ -3882,11 +3810,33 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             };
             const BTN_LEFT: u32 = 0x110;
 
+            // N7: the release of a left press we consumed (bar tile or modal)
+            // never reaches a client.
+            if !pressed && button == BTN_LEFT && state.swallow_left_release {
+                state.swallow_left_release = false;
+                return;
+            }
+            // A fresh left press that we do not consume must not inherit a
+            // stale flag (its release would be dropped, sticking the button).
+            if pressed && button == BTN_LEFT {
+                state.swallow_left_release = false;
+            }
+
+            // Launcher and power menu are keyboard modals: while one is open,
+            // clicks must not reach windows or the bar behind it.
+            if state.launcher.is_some() || state.power_menu.is_some() {
+                if pressed && button == BTN_LEFT {
+                    state.swallow_left_release = true;
+                }
+                return;
+            }
+
             // Wallpaper chooser is modal: a left click on a tile picks it,
             // a click off the panel closes it, and no button event (press or
             // release) reaches the windows behind it.
             if state.wallpaper_chooser.is_some() {
                 if pressed && button == BTN_LEFT {
+                    state.swallow_left_release = true;
                     let m = &state.monitors[idx];
                     let (px, py) = (m.pointer_pos.0 as i32, m.pointer_pos.1 as i32);
                     let hit = state
@@ -3939,6 +3889,7 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
 
             if let Some(exec) = bar_hit {
                 spawn_command(&state.socket_name, &exec);
+                state.swallow_left_release = true;
                 return;
             }
 
@@ -4066,10 +4017,6 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                 .output
                 .change_current_state(Some(mode), None, None, None);
             state.composite_interval = composite_interval_for(state.fps_cfg, refresh_mhz);
-            eprintln!(
-                "[veil-host] composite_interval={:?} fps_cfg={} refresh_mhz={}",
-                state.composite_interval, state.fps_cfg, refresh_mhz
-            );
             // First time through this also loads the configured wallpaper;
             // later (hotplug / mode change) it just re-scales for new sizes.
             let wp_cfg = veil_config::config_path()
@@ -4166,12 +4113,23 @@ fn remove_x11_window(state: &mut State, window: &X11Surface) {
         }
     }
 
-    let before = state.toplevels.len();
-    state
+    let mut lost: Vec<usize> = state
         .toplevels
-        .retain(|w| !matches!(&w.surface, WindowSurface::X11(x) if x == window));
-    if state.toplevels.len() != before {
-        relayout(state);
+        .iter()
+        .filter(|w| matches!(&w.surface, WindowSurface::X11(x) if x == window))
+        .map(|w| w.monitor)
+        .collect();
+    if !lost.is_empty() {
+        state
+            .toplevels
+            .retain(|w| !matches!(&w.surface, WindowSurface::X11(x) if x == window));
+        lost.sort_unstable();
+        lost.dedup();
+        for idx in lost {
+            if idx < state.monitors.len() {
+                relayout_monitor(state, idx);
+            }
+        }
         refocus_keyboard(state);
     }
 
@@ -4647,6 +4605,9 @@ pub fn run(
         },
         power_menu: None,
         wallpaper_chooser: None,
+        media: crate::media::MediaWorker::spawn(),
+        suppressed_keys: std::collections::HashSet::new(),
+        swallow_left_release: false,
         socket_name: socket_name.to_string(),
         popups: PopupManager::default(),
         popup_grabs: Vec::new(),
@@ -4751,7 +4712,7 @@ pub fn run(
                     } => {
                         tracing::info!("XWayland ready on DISPLAY=:{display_number}");
                         *xd.lock().unwrap() = Some(display_number);
-                        std::env::set_var("DISPLAY", format!(":{display_number}"));
+                        XWAYLAND_DISPLAY.store(display_number, std::sync::atomic::Ordering::Relaxed);
                         match x_client.take() {
                             Some(client) => {
                                 match X11Wm::start_wm(wm_handle.clone(), x11_socket, client) {
@@ -4796,10 +4757,24 @@ pub fn run(
             let t_start = tick_trace.then(std::time::Instant::now);
             // Prune toplevels that the client has destroyed. If any closed, retile
             // the survivors and move keyboard focus onto one of them.
-            let before = data.state.toplevels.len();
-            data.state.toplevels.retain(|t| t.alive());
-            if data.state.toplevels.len() != before {
-                relayout(&mut data.state);
+            let mut lost: Vec<usize> = data
+                .state
+                .toplevels
+                .iter()
+                .filter(|t| !t.alive())
+                .map(|t| t.monitor)
+                .collect();
+            if !lost.is_empty() {
+                data.state.toplevels.retain(|t| t.alive());
+                // S11: retile each monitor that lost a window, not only the
+                // active one, so a close elsewhere leaves no gap.
+                lost.sort_unstable();
+                lost.dedup();
+                for idx in lost {
+                    if idx < data.state.monitors.len() {
+                        relayout_monitor(&mut data.state, idx);
+                    }
+                }
                 refocus_keyboard(&mut data.state);
             }
             // If the fullscreen window was among those just pruned, don't leave
@@ -4916,6 +4891,7 @@ pub fn run(
             // Composite all dirty surfaces into one RGBA frame and ship it.
             // Frame callbacks are fired inside composite_and_send after the frame is sent.
             wallpaper_tick(&mut data.state);
+            media_tick(&mut data.state);
             let t_pre_composite = tick_trace.then(std::time::Instant::now);
             composite_and_send(&mut data.state);
             let t_post_composite = tick_trace.then(std::time::Instant::now);
@@ -5031,6 +5007,29 @@ pub fn run(
     crate::vt::emergency_restore();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn xwayland_display_goes_to_children_not_our_environment() {
+        let before = std::env::var_os("DISPLAY");
+        XWAYLAND_DISPLAY.store(7, Ordering::Relaxed);
+        let mut cmd = Command::new("true");
+        apply_wayland_env(&mut cmd, "wayland-9");
+        XWAYLAND_DISPLAY.store(XWAYLAND_UNSET, Ordering::Relaxed);
+        let env = |k: &str| {
+            cmd.get_envs()
+                .find(|(key, _)| *key == k)
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(env("DISPLAY").as_deref(), Some(":7"));
+        assert_eq!(env("WAYLAND_DISPLAY").as_deref(), Some("wayland-9"));
+        assert_eq!(std::env::var_os("DISPLAY"), before, "process env untouched");
+    }
 }
 
 #[cfg(test)]

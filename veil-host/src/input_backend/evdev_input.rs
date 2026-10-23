@@ -8,12 +8,54 @@
 
 use super::{InputBackend, InputCtx};
 use crate::input::InputCmd;
-use evdev::{Device, EventSummary, KeyCode, RelativeAxisCode};
+use super::touchpad::{self, Touchpad};
+use evdev::{AbsoluteAxisCode, Device, EventSummary, KeyCode, PropType, RelativeAxisCode, SynchronizationCode};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::Ordering;
 
 pub struct EvdevInput {
     devices: Vec<Device>,
+    /// Parallel to `devices`: `Some` for a touchpad (absolute finger
+    /// positions, no REL_X/REL_Y), `None` for keyboards and mice.
+    touchpads: Vec<Option<Touchpad>>,
+}
+
+/// A touchpad reports finger position (ABS_X/ABS_Y) and BTN_TOOL_FINGER, and
+/// is not a direct-input touchscreen. Returns its resolution (units per mm).
+fn touchpad_resolution(dev: &Device) -> Option<(f32, f32)> {
+    let abs = dev.supported_absolute_axes()?;
+    if !(abs.contains(AbsoluteAxisCode::ABS_X) && abs.contains(AbsoluteAxisCode::ABS_Y)) {
+        return None;
+    }
+    if dev.properties().contains(PropType::DIRECT) {
+        return None; // touchscreen
+    }
+    if !dev.supported_keys().is_some_and(|k| k.contains(KeyCode::BTN_TOOL_FINGER)) {
+        return None;
+    }
+    let mut res = (0.0f32, 0.0f32);
+    let mut range = (0.0f32, 0.0f32);
+    if let Ok(infos) = dev.get_absinfo() {
+        for (axis, info) in infos {
+            let r = info.resolution() as f32;
+            let span = (info.maximum() - info.minimum()) as f32;
+            if axis == AbsoluteAxisCode::ABS_X {
+                res.0 = r;
+                range.0 = span;
+            } else if axis == AbsoluteAxisCode::ABS_Y {
+                res.1 = r;
+                range.1 = span;
+            }
+        }
+    }
+    // Some firmware reports no resolution; assume a 100 x 65 mm pad.
+    if res.0 <= 0.0 {
+        res.0 = (range.0 / 100.0).max(1.0);
+    }
+    if res.1 <= 0.0 {
+        res.1 = (range.1 / 65.0).max(1.0);
+    }
+    Some(res)
 }
 
 impl EvdevInput {
@@ -21,6 +63,7 @@ impl EvdevInput {
     /// motion. Returns an error if none are usable (no permission / none found).
     pub fn open() -> std::io::Result<Self> {
         let mut devices = Vec::new();
+        let mut touchpads = Vec::new();
         for (path, mut dev) in evdev::enumerate() {
             // Keep keyboards and pointing devices; skip everything else.
             let has_keys = dev.supported_keys().is_some();
@@ -35,6 +78,13 @@ impl EvdevInput {
                         if let Err(e) = dev.grab() {
                             eprintln!("[veil-host] evdev: {path:?} grab failed (shared): {e}");
                         }
+                        let tp = touchpad_resolution(&dev);
+                        if let Some((rx, ry)) = tp {
+                            eprintln!(
+                                "[veil-host] evdev: {path:?} is a touchpad ({rx:.1} x {ry:.1} units/mm)"
+                            );
+                        }
+                        touchpads.push(tp.map(|(rx, ry)| Touchpad::new(rx, ry)));
                         devices.push(dev);
                     }
                     Err(e) => eprintln!("[veil-host] evdev: {path:?} nonblocking failed: {e}"),
@@ -48,7 +98,7 @@ impl EvdevInput {
             ));
         }
         eprintln!("[veil-host] evdev: opened {} device(s)", devices.len());
-        Ok(Self { devices })
+        Ok(Self { devices, touchpads })
     }
 }
 
@@ -65,6 +115,7 @@ impl InputBackend for EvdevInput {
             geom,
         } = ctx;
         let mut devices = self.devices;
+        let mut touchpads = self.touchpads;
         eprintln!(
             "[veil-host] input thread started (evdev, {} device(s), event-driven)",
             devices.len()
@@ -108,6 +159,9 @@ impl InputBackend for EvdevInput {
                 );
                 for dev in &mut devices {
                     let _ = dev.ungrab();
+                }
+                for tp in touchpads.iter_mut().flatten() {
+                    tp.reset();
                 }
                 was_active = false;
             } else if active && !was_active {
@@ -193,7 +247,37 @@ impl InputBackend for EvdevInput {
                     }
                 };
                 let mut moved = false;
+                let mut tp_out: Vec<touchpad::Out> = Vec::new();
+                let now = std::time::Instant::now();
                 for ev in events {
+                    // Touchpad-specific events (finger position, BTN_TOUCH,
+                    // BTN_TOOL_*, SYN_REPORT) feed the touchpad state machine.
+                    // The physical click (BTN_LEFT..) falls through below.
+                    if let Some(tp) = touchpads[i].as_mut() {
+                        let ours = match ev.destructure() {
+                            EventSummary::Key(_, key, value) if value != 2 => {
+                                tp.key(key.code(), value == 1, now)
+                            }
+                            EventSummary::AbsoluteAxis(_, axis, value) => {
+                                // Non-position axes (MT slots, pressure) are
+                                // ignored here but never mistaken for keys.
+                                tp.abs(axis.0, value);
+                                true
+                            }
+                            EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
+                                if active {
+                                    tp.sync(&mut tp_out);
+                                }
+                                true
+                            }
+                            // Misc (scan time etc.): nothing to do.
+                            EventSummary::Misc(..) => true,
+                            _ => false,
+                        };
+                        if ours {
+                            continue;
+                        }
+                    }
                     if active
                         && handle_event(
                             &tx,
@@ -211,10 +295,35 @@ impl InputBackend for EvdevInput {
                         moved = true;
                     }
                 }
-                if active && moved {
+                if active {
                     let comp_w = geom.comp_w.load(Ordering::Relaxed) as i32;
                     let comp_h = geom.comp_h.load(Ordering::Relaxed) as i32;
-                    send_motion(&tx, cx, cy, comp_w, comp_h);
+                    for o in tp_out {
+                        match o {
+                            touchpad::Out::Motion(dx, dy) => {
+                                cx = (cx + dx).clamp(0, comp_w.max(1) - 1);
+                                cy = (cy + dy).clamp(0, comp_h.max(1) - 1);
+                                moved = true;
+                            }
+                            touchpad::Out::Scroll(v120) => {
+                                let _ = tx.send(InputCmd::Scroll { v120 });
+                            }
+                            touchpad::Out::Tap => {
+                                // Position first so the click lands where
+                                // the pointer is.
+                                send_motion(&tx, cx, cy, comp_w, comp_h);
+                                for pressed in [true, false] {
+                                    let _ = tx.send(InputCmd::PointerButton {
+                                        button: 0x110,
+                                        pressed,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if moved {
+                        send_motion(&tx, cx, cy, comp_w, comp_h);
+                    }
                 }
             }
         }

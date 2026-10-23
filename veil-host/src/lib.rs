@@ -17,6 +17,7 @@ pub mod input_backend;
 pub mod launcher;
 pub mod layout;
 pub mod lockfile;
+pub mod media;
 pub mod output;
 pub mod powermenu;
 pub mod seat;
