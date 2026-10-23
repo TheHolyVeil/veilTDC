@@ -3,6 +3,7 @@
 
 quality = "auto" -- auto | kitty | pixel | pixel256 | pixel16 | ascii | ascii_edge
 fps = 0 -- compositor frame rate cap; 0 = match the display
+clipboard_sync = true -- share the host clipboard with Veil apps (both ways); false = fully isolated
 refresh = "max" -- DRM mode at the native size: preferred | max | <Hz, e.g. 144>
 cage_timeout_secs = 8 -- timeout for caged output
 input = true -- enable input forwarding

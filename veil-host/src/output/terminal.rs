@@ -64,7 +64,7 @@ impl TerminalOutput {
     /// path in veil-render is used instead. `Some(power)` is `gpu_power`.
     /// `opts.quality`: the resolved config.lua `quality`.
     pub fn new(opts: TerminalOpts) -> io::Result<Self> {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let (cols, rows) = super::terminal_cells();
         let stdout = std::io::stdout();
 
         // Enable raw mode and alternate screen

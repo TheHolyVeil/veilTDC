@@ -101,19 +101,50 @@ enum Force {
     Terminal,
 }
 
-/// Auto-detect best output backend for current environment.
-///
-/// `VEIL_OUTPUT=drm` forces DRM/KMS unconditionally — even nested under a
-/// real compositor — and errors loudly if it can't init, instead of
-/// silently falling back; `VEIL_OUTPUT=terminal` forces terminal the same
-/// way. Both are an explicit one-off override and win over everything else.
-///
-/// `pref` is config.lua's `output` field. Unlike the env var, `pref ==
-/// OutputPref::Drm` does NOT override the nested-compositor check below —
-/// it only replaces the SSH-session check with an unconditional DRM/KMS
-/// attempt on what still looks like a bare TTY. It's a persistent "trust
-/// bare-TTY sessions to have real GPU hardware" setting, not a sledgehammer:
-/// running `veil-host run` under Niri with `output = "drm"` in config still
+/// Terminal size in cells with fallbacks (R8): the winsize ioctl via
+/// crossterm, then `$COLUMNS`/`$LINES`, then 80x24. A zero winsize (some
+/// serial consoles and multiplexers report 0x0) is treated as unknown rather
+/// than passed on as a zero-sized compositor.
+pub fn terminal_cells() -> (u16, u16) {
+    resolve_cells(
+        crossterm::terminal::size().ok(),
+        std::env::var("COLUMNS").ok().as_deref(),
+        std::env::var("LINES").ok().as_deref(),
+    )
+}
+
+fn resolve_cells(ioctl: Option<(u16, u16)>, columns: Option<&str>, lines: Option<&str>) -> (u16, u16) {
+    if let Some((c, r)) = ioctl.filter(|&(c, r)| c > 0 && r > 0) {
+        return (c, r);
+    }
+    let env = |v: Option<&str>, default: u16| {
+        v.and_then(|s| s.trim().parse::<u16>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(default)
+    };
+    (env(columns, 80), env(lines, 24))
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::resolve_cells;
+
+    #[test]
+    fn a_good_ioctl_wins() {
+        assert_eq!(resolve_cells(Some((120, 40)), Some("10"), Some("10")), (120, 40));
+    }
+
+    #[test]
+    fn zero_or_failed_ioctl_falls_back_to_env_then_default() {
+        assert_eq!(resolve_cells(Some((0, 0)), Some("100"), Some("30")), (100, 30));
+        assert_eq!(resolve_cells(None, Some("132"), None), (132, 24));
+        assert_eq!(resolve_cells(None, None, None), (80, 24));
+        assert_eq!(resolve_cells(Some((80, 0)), Some("junk"), Some("0")), (80, 24));
+    }
+}
+
+/// True when stdin is a Linux virtual console (`TERM=linux` or `/dev/tty<N>`),
+/// i.e. a bare TTY that could own a DRM master. Serial lines do not count.
 pub fn is_bare_tty() -> bool {
     if std::env::var("TERM").map(|t| t == "linux").unwrap_or(false) {
         return true;
@@ -156,6 +187,18 @@ pub struct TerminalOpts {
 }
 
 /// Auto-detect best output backend for current environment.
+///
+/// `VEIL_OUTPUT=drm` forces DRM/KMS unconditionally — even nested under a
+/// real compositor — and errors loudly if it can't init, instead of
+/// silently falling back; `VEIL_OUTPUT=terminal` forces terminal the same
+/// way. Both are an explicit one-off override and win over everything else.
+///
+/// `pref` is config.lua's `output` field. Unlike the env var, `pref ==
+/// OutputPref::Drm` does NOT override the nested-compositor check below —
+/// it only replaces the SSH-session check with an unconditional DRM/KMS
+/// attempt on what still looks like a bare TTY. It's a persistent "trust
+/// bare-TTY sessions to have real GPU hardware" setting, not a sledgehammer:
+/// running `veil-host run` under Niri with `output = "drm"` in config still uses the terminal backend.
 ///
 /// `opts` is forwarded straight to `TerminalOutput::new`: it has no effect on
 /// `DrmOutput`, which doesn't use the GPU encoder or the terminal quality ladder.

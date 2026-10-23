@@ -243,6 +243,7 @@ fn main() -> std::io::Result<()> {
     cfg.theme = vcfg.theme;
     cfg.bar = vcfg.bar.clone();
     cfg.fps = vcfg.fps; // 0 = match the display (resolved in SetMonitors)
+    cfg.clipboard_sync = vcfg.clipboard_sync;
 
     // Register our socket for cleanup on ANY exit (clean shutdown, HOME,
     // Ctrl-C, or a crash) and install the panic/fatal-signal hooks that
@@ -279,7 +280,7 @@ fn main() -> std::io::Result<()> {
 
     // Size compositor to match actual terminal pixel area unless user gave explicit dims.
     // Assume 8×16 px per cell — the most common monospace glyph box.
-    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (term_cols, term_rows) = veil_host::output::terminal_cells();
     if !explicit_size {
         if let Some((pw, ph)) = term_pixel_size() {
             cfg.width = pw;
@@ -298,7 +299,7 @@ fn main() -> std::io::Result<()> {
     let comp_w = cfg.width;
     let comp_h = cfg.height;
     // Shared geometry for pointer mapping — updated on resize events.
-    let (init_cols, init_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (init_cols, init_rows) = veil_host::output::terminal_cells();
     let geom = InputGeometry::new(init_cols, init_rows, comp_w, comp_h);
     let host = Host::spawn(cfg)?;
 
@@ -661,7 +662,7 @@ fn cmd_list_modes() {
 // ─── probe ────────────────────────────────────────────────────────────────────
 
 fn cmd_probe() -> std::io::Result<()> {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = veil_host::output::terminal_cells();
     let pixel_dims = term_pixel_size();
     let (comp_w, comp_h) = pixel_dims.unwrap_or((cols as u32 * 8, rows as u32 * 16));
     let pixel_source = if pixel_dims.is_some() {

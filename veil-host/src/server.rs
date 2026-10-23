@@ -67,7 +67,7 @@ use smithay::{
         idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
         keyboard_shortcuts_inhibit::{
             KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
-            KeyboardShortcutsInhibitor,
+            KeyboardShortcutsInhibitor, KeyboardShortcutsInhibitorSeat,
         },
         output::{OutputHandler, OutputManagerState},
         pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
@@ -440,6 +440,8 @@ pub struct State {
     /// `fps` as configured (0 = follow the display); kept so the interval can
     /// be recomputed when the real refresh becomes known or config reloads.
     pub fps_cfg: u32,
+    /// `clipboard_sync` from config.lua (see N9).
+    pub clipboard_sync: bool,
     pub wallpaper: crate::wallpaper::WallpaperEngine,
     /// On-Screen Display (OSD) popup notification overlay.
     pub osd: Option<OsdNotification>,
@@ -1059,7 +1061,11 @@ impl KeyboardShortcutsInhibitHandler for State {
     fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
         &mut self._kb_inhibit
     }
-    // Always grant inhibition — we have no keyboard shortcuts of our own to protect.
+    // N3: always granted, and honoured in the xkb filter: while the focused
+    // surface holds an active inhibitor, Veil's own chords (Alt+Tab, the
+    // keybinds) pass through to it, so VMs and remote-desktop clients get
+    // them. Media keys, VT switching and the kill chord still work, and
+    // Alt+Shift+Escape hands the shortcuts back (see `INHIBIT_ESCAPE`).
     fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
         inhibitor.activate();
     }
@@ -1582,6 +1588,20 @@ fn blit_subtree(
         |_, _, _| {},
         |_, _, _| true,
     );
+}
+
+/// N3: the active shortcuts inhibitor on the keyboard-focused surface, if any.
+fn focused_active_inhibitor(st: &State) -> Option<KeyboardShortcutsInhibitor> {
+    let focus = st.keyboard.current_focus()?;
+    st.seat
+        .keyboard_shortcuts_inhibitor_for_surface(&focus)
+        .filter(|i| i.is_active())
+}
+
+/// While shortcuts are inhibited, is this the escape chord (Alt+Shift+Escape)
+/// that takes them back? Pure, so it is tested.
+fn is_inhibit_escape(sym: u32, alt: bool, shift: bool) -> bool {
+    sym == smithay::input::keyboard::keysyms::KEY_Escape && alt && shift
 }
 
 /// Lowercased ASCII char for a keysym, ignoring Shift — so a configured
@@ -2765,21 +2785,14 @@ fn composite_one_monitor(
         // isn't there anymore.
         m.bar_hitboxes.clear();
     }
-    // Modals (help/launcher/power-menu/OSD) only ever open on whichever
-    // monitor was active at the moment they were triggered — see the
-    // `<mod_key>+D`/`<mod_key>+P`/`/` handlers, which all go through
-    // `mark_dirty_full` (whole-compositor) rather than a specific monitor,
-    // so today these draw on every monitor's pass. That's a real "dumb"
-    // simplification worth flagging for 2b: a modal opened while looking at
-    // monitor 0 currently also renders (inertly — Escape/Enter still only
-    // affect the modal's single shared state) on monitor 1's screen too.
-    // With one monitor (today) this is invisible; harmless but worth fixing
-    // once a second monitor is actually in the mix.
-    if show_help {
+    // S12: modals (help / launcher / power menu / chooser / OSD) belong to the
+    // monitor that is active; the others no longer get a copy.
+    let on_active = idx == active_idx;
+    if show_help && on_active {
         let keybinds = state.keybinds.clone();
         draw_help_overlay(&keybinds, &theme, back, w, h);
     }
-    if launcher_present {
+    if launcher_present && on_active {
         if let Some(ref l) = state.launcher {
             let mod_key = state.keybinds.mod_key;
             // Borrow checker: we need to call draw_launcher_overlay with `back`
@@ -2789,14 +2802,14 @@ fn composite_one_monitor(
             draw_launcher_overlay(&l, mod_key, &theme, back, w, h);
         }
     }
-    if power_menu_present {
+    if power_menu_present && on_active {
         if let Some(ref pm) = state.power_menu {
             let mod_key = state.keybinds.mod_key;
             let pm = pm.clone();
             draw_power_menu_overlay(&pm, mod_key, &theme, back, w, h);
         }
     }
-    if wallpaper_chooser_present && idx == active_idx {
+    if wallpaper_chooser_present && on_active {
         if let Some(wc) = state.wallpaper_chooser.as_mut() {
             let g = crate::wallpaper_chooser::geometry(w, h);
             wc.set_view(g.cols, g.rows);
@@ -2808,8 +2821,10 @@ fn composite_one_monitor(
             state.osd = None;
             state.dirty = true;
         } else {
-            let osd_clone = osd.clone();
-            draw_osd_overlay(&osd_clone, back, w, h);
+            if on_active {
+                let osd_clone = osd.clone();
+                draw_osd_overlay(&osd_clone, back, w, h);
+            }
             state.dirty = true;
         }
     }
@@ -3621,6 +3636,17 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                         _ => {}
                     }
 
+                    // N3: a client (VM, remote desktop) asked to keep the
+                    // compositor's shortcuts, and it holds the focus: pass
+                    // everything through, except the escape chord.
+                    if let Some(inhibitor) = focused_active_inhibitor(st) {
+                        if is_inhibit_escape(sym, mods.alt, mods.shift) {
+                            inhibitor.inactivate();
+                            return FilterResult::Intercept(());
+                        }
+                        return FilterResult::Forward;
+                    }
+
                     // Alt+Tab / Alt+Shift+Tab: cycle focus among live windows
                     // on the active workspace. Fixed to literal Alt rather
                     // than `keybinds.mod_key` — same reasoning as
@@ -4410,6 +4436,7 @@ pub fn run(
     width: u32,
     height: u32,
     fps: u32,
+    clipboard_sync: bool,
     spawn: Option<Vec<String>>,
     wayland_debug: bool,
     frame_tx: mpsc::Sender<Frame>,
@@ -4523,7 +4550,10 @@ pub fn run(
     // Clipboard: poll the host compositor for clipboard changes every second.
     // Only offers host content when the hosted client has no active selection.
     let (clipboard_tx, clipboard_rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
+    // N9: `clipboard_sync = false` never reads the host clipboard at all, so
+    // nothing the user copies outside Veil is offered to clients inside it.
+    if clipboard_sync {
+        std::thread::spawn(move || {
         use std::io::Read;
         use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat as PasteSeat};
         let mut last = String::new();
@@ -4534,16 +4564,27 @@ pub fn run(
                 PasteSeat::Unspecified,
                 MimeType::Text,
             ) {
-                let mut text = String::new();
-                if reader.read_to_string(&mut text).is_ok() && !text.is_empty() && text != last {
-                    last = text.clone();
-                    if clipboard_tx.send(text).is_err() {
-                        break;
+                // N9: bounded, so a huge or endless host selection cannot
+                // make this thread buffer without limit.
+                let mut buf = Vec::new();
+                if reader
+                    .by_ref()
+                    .take(CLIP_MAX_BYTES as u64)
+                    .read_to_end(&mut buf)
+                    .is_ok()
+                {
+                    let text = String::from_utf8_lossy(&buf).into_owned();
+                    if !text.is_empty() && text != last {
+                        last = text.clone();
+                        if clipboard_tx.send(text).is_err() {
+                            break;
+                        }
                     }
                 }
             }
         }
-    });
+        });
+    }
 
     let config_path = veil_config::config_path();
     let config_mtime = config_path
@@ -4632,6 +4673,7 @@ pub fn run(
         last_config_check: Instant::now(),
         composite_interval,
         fps_cfg: fps,
+        clipboard_sync,
         wallpaper: crate::wallpaper::WallpaperEngine::new(),
         osd: None,
     };
@@ -4814,7 +4856,13 @@ pub fn run(
             if data.state.pending_copy_out {
                 data.state.pending_copy_out = false;
                 let seat = data.state.seat.clone();
-                for &mime in &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"] {
+                // N9: with clipboard sync off nothing leaves Veil either.
+                let mimes: &[&str] = if data.state.clipboard_sync {
+                    &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"]
+                } else {
+                    &[]
+                };
+                for &mime in mimes {
                     let mut fds = [-1i32; 2];
                     let ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) == 0 };
                     if !ok {
@@ -5013,6 +5061,15 @@ pub fn run(
 mod env_tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn inhibit_escape_is_alt_shift_escape_only() {
+        use smithay::input::keyboard::keysyms::{KEY_Escape, KEY_Tab};
+        assert!(is_inhibit_escape(KEY_Escape, true, true));
+        assert!(!is_inhibit_escape(KEY_Escape, true, false));
+        assert!(!is_inhibit_escape(KEY_Escape, false, true));
+        assert!(!is_inhibit_escape(KEY_Tab, true, true));
+    }
 
     #[test]
     fn xwayland_display_goes_to_children_not_our_environment() {

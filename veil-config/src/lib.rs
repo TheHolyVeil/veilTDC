@@ -785,7 +785,7 @@ fn parse_wallpaper(gl: &mlua::Table) -> Option<WallpaperConfig> {
             (
                 raw.iter().map(|p| expand_home(p)).collect(),
                 t.get::<u64>("interval").unwrap_or(0),
-                t.get::<bool>("shuffle").unwrap_or(false),
+                get_bool(&t, "shuffle", false),
                 t.get::<String>("fit")
                     .map_or(WallpaperFit::Fill, |f| WallpaperFit::parse_str(&f)),
             )
@@ -804,7 +804,7 @@ fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
     let Ok(bt) = gl.get::<mlua::Table>("bar") else {
         return default.clone();
     };
-    let enabled = bt.get::<bool>("enabled").unwrap_or(default.enabled);
+    let enabled = get_bool(&bt, "enabled", default.enabled);
     let position = bt
         .get::<String>("position")
         .map(|s| BarPosition::from_str(&s))
@@ -812,11 +812,23 @@ fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
     BarConfig { enabled, position }
 }
 
+/// A Lua boolean field with a default. `get::<bool>` alone is a trap: mlua
+/// turns a missing (nil) field into `false`, so a `true` default was ignored.
+fn get_bool(t: &mlua::Table, key: &str, default: bool) -> bool {
+    match t.get::<mlua::Value>(key) {
+        Ok(mlua::Value::Boolean(b)) => b,
+        _ => default,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VeilConfig {
     pub quality: Quality,
     /// Compositor frame-rate cap. `0` = match the display's refresh rate.
     pub fps: u32,
+    /// Offer the host compositor's clipboard to clients inside Veil, and push
+    /// their copies back out (`clipboard_sync` in Lua). Turn off for privacy.
+    pub clipboard_sync: bool,
     /// DRM display-mode refresh selection (`refresh` in Lua).
     pub refresh: RefreshPref,
     pub cage_timeout_secs: u32,
@@ -851,7 +863,9 @@ impl Default for VeilConfig {
     fn default() -> Self {
         Self {
             quality: Quality::Auto,
-            fps: 60,
+            // 0 = match the display (so a 180 Hz panel is not capped to 60).
+            fps: 0,
+            clipboard_sync: true,
             refresh: RefreshPref::Preferred,
             cage_timeout_secs: 8,
             input: true,
@@ -957,6 +971,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
             .map(|s| Quality::parse_str(&s))
             .unwrap_or(d.quality),
         fps: gl.get::<u32>("fps").unwrap_or(d.fps),
+        clipboard_sync: get_bool(&gl, "clipboard_sync", d.clipboard_sync),
         refresh: gl
             .get::<String>("refresh")
             .map(|s| RefreshPref::parse_str(&s))
@@ -964,8 +979,8 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
         cage_timeout_secs: gl
             .get::<u32>("cage_timeout_secs")
             .unwrap_or(d.cage_timeout_secs),
-        input: gl.get::<bool>("input").unwrap_or(d.input),
-        gpu_render: gl.get::<bool>("gpu_render").unwrap_or(d.gpu_render),
+        input: get_bool(&gl, "input", d.input),
+        gpu_render: get_bool(&gl, "gpu_render", d.gpu_render),
         gpu_power: gl
             .get::<String>("gpu_power")
             .map(|s| GpuPower::parse_str(&s))
@@ -1136,6 +1151,27 @@ mod app_bind_tests {
         // A normal override still works, and untouched actions keep defaults.
         assert_eq!(kb.action_for('x'), Some(Action::Close));
         assert_eq!(kb.action_for('l'), Some(Action::FocusRight));
+    }
+
+    #[test]
+    fn clipboard_sync_defaults_on_and_can_be_turned_off() {
+        assert!(load_str("cb-default", "fps = 0").clipboard_sync);
+        assert!(!load_str("cb-off", "clipboard_sync = false").clipboard_sync);
+    }
+
+    #[test]
+    fn missing_booleans_keep_their_true_defaults() {
+        // mlua reads a nil field as `false`; absent keys must keep defaults.
+        let c = load_str("bools-absent", "fps = 0");
+        assert!(c.input && c.gpu_render && c.clipboard_sync);
+        let c = load_str("bools-off", "input = false\ngpu_render = false");
+        assert!(!c.input && !c.gpu_render);
+    }
+
+    #[test]
+    fn fps_defaults_to_match_the_display() {
+        assert_eq!(load_str("fps-default", "quality = \"auto\"").fps, 0);
+        assert_eq!(load_str("fps-set", "fps = 90").fps, 90);
     }
 
     #[test]

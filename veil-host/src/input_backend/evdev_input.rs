@@ -9,6 +9,8 @@
 use super::{InputBackend, InputCtx};
 use crate::input::InputCmd;
 use super::touchpad::{self, Touchpad};
+use super::sysrq::SysRqBridge;
+use super::touchscreen::{self, Touchscreen};
 use evdev::{AbsoluteAxisCode, Device, EventSummary, KeyCode, PropType, RelativeAxisCode, SynchronizationCode};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::Ordering;
@@ -18,6 +20,36 @@ pub struct EvdevInput {
     /// Parallel to `devices`: `Some` for a touchpad (absolute finger
     /// positions, no REL_X/REL_Y), `None` for keyboards and mice.
     touchpads: Vec<Option<Touchpad>>,
+    /// Parallel to `devices`: `Some` for a (finger) touchscreen.
+    touchscreens: Vec<Option<Touchscreen>>,
+}
+
+/// A finger touchscreen: direct-input (`INPUT_PROP_DIRECT`), absolute X/Y and
+/// BTN_TOUCH, and not a pen digitizer. Returns the `(min, max)` of each axis.
+fn touchscreen_range(dev: &Device) -> Option<((i32, i32), (i32, i32))> {
+    let abs = dev.supported_absolute_axes()?;
+    if !(abs.contains(AbsoluteAxisCode::ABS_X) && abs.contains(AbsoluteAxisCode::ABS_Y)) {
+        return None;
+    }
+    if !dev.properties().contains(PropType::DIRECT) {
+        return None;
+    }
+    let keys = dev.supported_keys()?;
+    if !keys.contains(KeyCode::BTN_TOUCH)
+        || keys.contains(KeyCode::BTN_TOOL_PEN)
+        || keys.contains(KeyCode::BTN_STYLUS)
+    {
+        return None;
+    }
+    let (mut xr, mut yr) = ((0, 0), (0, 0));
+    for (axis, info) in dev.get_absinfo().ok()? {
+        if axis == AbsoluteAxisCode::ABS_X {
+            xr = (info.minimum(), info.maximum());
+        } else if axis == AbsoluteAxisCode::ABS_Y {
+            yr = (info.minimum(), info.maximum());
+        }
+    }
+    (xr.1 > xr.0 && yr.1 > yr.0).then_some((xr, yr))
 }
 
 /// A touchpad reports finger position (ABS_X/ABS_Y) and BTN_TOOL_FINGER, and
@@ -64,6 +96,7 @@ impl EvdevInput {
     pub fn open() -> std::io::Result<Self> {
         let mut devices = Vec::new();
         let mut touchpads = Vec::new();
+        let mut touchscreens = Vec::new();
         for (path, mut dev) in evdev::enumerate() {
             // Keep keyboards and pointing devices; skip everything else.
             let has_keys = dev.supported_keys().is_some();
@@ -85,6 +118,11 @@ impl EvdevInput {
                             );
                         }
                         touchpads.push(tp.map(|(rx, ry)| Touchpad::new(rx, ry)));
+                        let ts = touchscreen_range(&dev);
+                        if ts.is_some() {
+                            eprintln!("[veil-host] evdev: {path:?} is a touchscreen");
+                        }
+                        touchscreens.push(ts.map(|(xr, yr)| Touchscreen::new(xr, yr)));
                         devices.push(dev);
                     }
                     Err(e) => eprintln!("[veil-host] evdev: {path:?} nonblocking failed: {e}"),
@@ -98,7 +136,11 @@ impl EvdevInput {
             ));
         }
         eprintln!("[veil-host] evdev: opened {} device(s)", devices.len());
-        Ok(Self { devices, touchpads })
+        Ok(Self {
+            devices,
+            touchpads,
+            touchscreens,
+        })
     }
 }
 
@@ -116,6 +158,9 @@ impl InputBackend for EvdevInput {
         } = ctx;
         let mut devices = self.devices;
         let mut touchpads = self.touchpads;
+        let mut touchscreens = self.touchscreens;
+        // K2: keep Alt+SysRq working although we grab every device.
+        let mut sysrq = SysRqBridge::new();
         eprintln!(
             "[veil-host] input thread started (evdev, {} device(s), event-driven)",
             devices.len()
@@ -160,8 +205,19 @@ impl InputBackend for EvdevInput {
                 for dev in &mut devices {
                     let _ = dev.ungrab();
                 }
+                sysrq.reset();
                 for tp in touchpads.iter_mut().flatten() {
                     tp.reset();
+                }
+                for ts in touchscreens.iter_mut().flatten() {
+                    if ts.is_down() {
+                        // Never leave the left button stuck across a VT switch.
+                        let _ = tx.send(InputCmd::PointerButton {
+                            button: 0x110,
+                            pressed: false,
+                        });
+                    }
+                    ts.reset();
                 }
                 was_active = false;
             } else if active && !was_active {
@@ -248,6 +304,7 @@ impl InputBackend for EvdevInput {
                 };
                 let mut moved = false;
                 let mut tp_out: Vec<touchpad::Out> = Vec::new();
+                let mut ts_out: Vec<touchscreen::Out> = Vec::new();
                 let now = std::time::Instant::now();
                 for ev in events {
                     // Touchpad-specific events (finger position, BTN_TOUCH,
@@ -276,6 +333,39 @@ impl InputBackend for EvdevInput {
                         };
                         if ours {
                             continue;
+                        }
+                    }
+                    // Touchscreen: finger position and BTN_TOUCH become a
+                    // pointer press / drag / release at the touched spot.
+                    if let Some(ts) = touchscreens[i].as_mut() {
+                        let ours = match ev.destructure() {
+                            EventSummary::Key(_, key, value) if value != 2 => {
+                                ts.key(key.code(), value == 1)
+                            }
+                            EventSummary::AbsoluteAxis(_, axis, value) => {
+                                ts.abs(axis.0, value);
+                                true
+                            }
+                            EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
+                                if active {
+                                    ts.sync(&mut ts_out);
+                                }
+                                true
+                            }
+                            EventSummary::Misc(..) => true,
+                            _ => false,
+                        };
+                        if ours {
+                            continue;
+                        }
+                    }
+                    // K2: Alt+SysRq+<key> is replayed to the kernel (and kept
+                    // from the compositor) by the uinput bridge.
+                    if active {
+                        if let EventSummary::Key(_, key, value) = ev.destructure() {
+                            if sysrq.handle(key.code(), value, alt_held) {
+                                continue;
+                            }
                         }
                     }
                     if active
@@ -318,6 +408,21 @@ impl InputBackend for EvdevInput {
                                         pressed,
                                     });
                                 }
+                            }
+                        }
+                    }
+                    for o in ts_out {
+                        match o {
+                            touchscreen::Out::MoveTo(fx, fy) => {
+                                cx = (fx * (comp_w.max(1) - 1) as f32).round() as i32;
+                                cy = (fy * (comp_h.max(1) - 1) as f32).round() as i32;
+                                send_motion(&tx, cx, cy, comp_w, comp_h);
+                            }
+                            touchscreen::Out::Press | touchscreen::Out::Release => {
+                                let _ = tx.send(InputCmd::PointerButton {
+                                    button: 0x110,
+                                    pressed: matches!(o, touchscreen::Out::Press),
+                                });
                             }
                         }
                     }

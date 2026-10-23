@@ -18,6 +18,8 @@ use std::sync::Arc;
 mod crossterm_input;
 mod evdev_input;
 mod touchpad;
+mod touchscreen;
+mod sysrq;
 
 pub use crossterm_input::CrosstermInput;
 pub use evdev_input::EvdevInput;

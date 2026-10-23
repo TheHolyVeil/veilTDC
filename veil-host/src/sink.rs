@@ -1,8 +1,9 @@
 //! Frame output from the host compositor.
 //!
-//! Sink-agnostic: caller decides what to do with the RGBA. veil-cli
-//! encodes to kitty graphics today; the same Frame stream feeds
-//! /dev/fb0, sixel, iterm2, DRM dumb buffers tomorrow.
+//! Sink-agnostic: the caller decides what to do with the RGBA. Today the
+//! terminal backend encodes it (Kitty graphics, glyph tiers) and the DRM
+//! backend copies it to scanout; the same `Frame` stream could feed
+//! /dev/fb0 or other sinks.
 
 use crate::layout::Rect;
 use std::sync::Arc;

@@ -1,86 +1,25 @@
-# veil (v3)
+# TheHolyVeil / Veil
+<sub>The name "veil" is due to change.</sub>
 
-**The Lightweight Terminal & Bare-TTY Wayland Desktop Environment.**
 
-> *"We provide the essentials, you get the packages you need."*
+A modular desktop opt-in ecosystem built around a simple idea:
 
-`veil` v3 is a full-featured, lightweight Wayland Desktop Environment (DE) built in Rust. Powered by Smithay and Vulkan compute shaders, `veil` can run nested inside your terminal emulator (with pixel-perfect Kitty graphics, truecolor half-blocks, or ASCII) or standalone directly on a bare TTY framebuffer via DRM/KMS.
+Veil is not meant to be a bloated “everything and the kitchen sink” desktop environment.
+It is a fast, opinionated, productivity first desktop shell designed to give users a strong default environment without forcing them into a pile of extras they do not want.
 
----
+Veil is designed to be:
+- fast
+- minimal by default
+- configurable
+- friendly to opt-in tools
+- modular
+- easy to extend
+- built around recommendations, not clutter
+- opt-in 
+- embedded
+- device-variable
 
-## 🌟 What's New in v3?
-
-`veil` has evolved beyond a simple nested window compositor—it is practically a complete **Desktop Environment (DE)** with an array of onboard tools, modal interfaces, and ecosystem utilities.
-
-### 🧰 Onboard DE Tools & Capabilities
-
-* 🖥️ **Dual Tiling Engine**:
-  * **Dwindle Tiling**: Recursive binary splitting layout (1–4 window grid with stacking fallback).
-  * **Scroll Layout**: PaperWM / Niri-style horizontal scrolling strip with fixed-width columns for infinite open windows.
-  * **Layout Hot-Swapping**: Switch layout modes on the fly (`Super+W`), rotate split axes (`Super+R`), swap window positions (`Super+S`), or toggle fullscreen (`Super+F`).
-* 🗂️ **Multi-Workspace System**:
-  * 9 independent workspaces (`Super+1..9` to switch, `Super+Shift+1..9` to move windows and follow).
-  * Workspaces are independently scoped per-monitor in multi-display setups.
-* 🚀 **Built-in App Launcher**:
-  * Integrated modal application launcher (`Super+D`).
-  * Scans system `.desktop` files (XDG compliant) with real-time fuzzy filtering.
-  * Features a raw command execution fallback (e.g., launch `firefox`, `thunar`, or custom scripts directly).
-  * Boots directly into an empty desktop ready to launch apps (`veil-host start`).
-* 📊 **Desktop Status Bar**:
-  * Built-in customizable desktop status bar (`top` or `bottom` position).
-  * Displays active workspace indicators, live clock, and dynamic app launch tiles auto-generated from your keybindings.
-* ⚡ **Modal Power Menu**:
-  * Integrated system power menu (`Super+P`) with instant **Power Off**, **Reboot**, and **Logout** actions.
-* 🎨 **12-Theme Color Engine**:
-  * Built-in color schemes for compositor chrome, launcher, bar, and overlays: `default`, `nord`, `dracula`, `catppuccin` (mocha), `gruvbox`, `everforest`, `tokyonight`, `solarized`, `rosepine`, `monokai`, `onedark`, and `deepsage` (hand-tuned dark sage).
-  * Hex background void-fill customizer (`background = "#RRGGBB"`).
-* 💡 **Live Help & OSD Overlay**:
-  * Instant keyboard shortcut reference overlay (`Super+/`).
-  * On-Screen Display (OSD) notification engine with titles, progress bars, and auto-expirations.
-* 🎮 **GPU Acceleration & Detiling**:
-  * **Vulkan Compute Pipeline (`veil-gpu`)**: Offloads half-block and luma encoding to GPU compute shaders via `wgpu`. Automatically bypasses CPU-bound software rasterizers (like `llvmpipe`).
-  * **EGL dmabuf Detiling (`detile`)**: Native EGLImage importer for tiled/compressed GPU buffers (AMD DCC / implicit modifiers) from heavy GPU apps/compositors.
-  * **mimalloc Allocator**: Zero-fragmentation global memory allocation preventing glibc `mmap` RSS bloat.
-* 🪟 **XWayland & Native Wayland Integration**:
-  * Embedded XWayland server for full X11 application support alongside Wayland.
-  * Automatic Wayland environment variable propagation (`ELECTRON_OZONE_PLATFORM_HINT`, `MOZ_ENABLE_WAYLAND`, `QT_QPA_PLATFORM`, `GDK_BACKEND`, `SDL_VIDEODRIVER`, `XDG_CURRENT_DESKTOP=veil`).
-* 📋 **Bidirectional Clipboard**:
-  * Continuous, seamless clipboard synchronization between hosted Wayland/X11 apps and the host environment.
-* 🖥️ **Bare-TTY & DRM Output**:
-  * Runs standalone on bare console TTYs (`/dev/tty1`–`6`) with native DRM/KMS and `libseat` session management.
-  * Native VT switching (`Ctrl+Alt+F1`–`F12`) with GPU state suspend/resume without swallowing keys.
-
----
-
-## 🏗️ Architecture & Ecosystem
-
-```
-veil/
-├── veil-host/      Smithay-based DE daemon & compositor (server, layout, launcher, bar, powermenu)
-├── veil-config/    Lua config engine, 12 color themes, workspace rules, keybind definitions
-├── veil-gpu/       WGPU Vulkan compute shader pipeline for fast frame encoding
-├── veil-render/    Terminal rendering engines (Kitty graphics, Halfblock, ASCII, ASCII-Edge)
-└── veil-login/     Abyss / Velogin: TTY-native graphical login manager (PAM auth, Slint UI)
-```
-
-### Supported Wayland Globals
-
-| Global | Support Level |
-|---|---|
-| `wl_compositor` + `wl_subcompositor` | ✓ Full |
-| `xdg_shell` (toplevel + popup) | ✓ Full |
-| `wl_seat` (keyboard, pointer, touch) | ✓ Full |
-| `wl_shm` | ✓ Full |
-| `wl_data_device_manager` + `primary_selection` | ✓ Full (Clipboard & Selection) |
-| `wl_output` + `xdg_output` | ✓ Full (Multi-Monitor aware) |
-| `zwp_linux_dmabuf_v1` | ✓ Full (GBM / EGL GPU import with SHM fallback) |
-| `linux-drm-syncobj-v1` | ✓ Explicit synchronization |
-| `xdg_decoration` / `xdg_activation` | ✓ Client-side decoration / instant grant |
-| `wp_viewporter` / `wp_fractional_scale` / `wp_presentation_time` | ✓ Full |
-| `tablet` / `idle_inhibit` / `cursor_shape` / `pointer_constraints` | ✓ Supported |
-| `XWayland` | ✓ Spawned automatically for X11 application support |
-
----
+This project is still in active development. The README is a current snapshot of the architecture and direction. May not have up-to-date information. Such as the config and how to edit it. Pray for yourself that the default config.lua has everything in it.
 
 ## 📦 Installation
 
@@ -133,7 +72,7 @@ sudo install -Dm755 target/release/veil-host /usr/local/bin/veil-host
 
 ---
 
-## 🚀 Usage & Commands
+##  Usage & Commands
 
 ```bash
 # Launch a GUI app inside Veil
@@ -183,7 +122,7 @@ Default modifier key is `Super` (configurable to `Alt`, `Ctrl`, or `Shift` in `c
 
 ---
 
-## ⚙️ Configuration (`config.lua`)
+## Configuration (`config.lua`)
 
 Place your configuration file at `~/.config/veil/config.lua` or `./config.lua`.
 
@@ -199,6 +138,12 @@ output = "auto"
 
 -- Enable GPU compute acceleration (wgpu Vulkan)
 gpu_render = true
+
+-- gpu power for laptops and such. Low for hybrids.
+gpu_power = "high"
+
+-- Desired refresh rate (up to what your monitor supports)
+refresh = 60
 
 -- Desktop Color Theme
 -- Options: default | nord | dracula | catppuccin | gruvbox | everforest
@@ -230,55 +175,287 @@ keybinds = {
   reload_config = "c",
   resize_grow   = "=",
   resize_shrink = "-",
+}
 
   -- Direct Application Launchers (<mod_key> + key)
   -- Apps defined here are automatically added to the status bar shortcuts!
   apps = {
-    b = "firefox",
-    t = "kitty",
-    f = "thunar",
+    { "b", "firefox" },
+    { "t", "kitty" },
   }
-}
+  
+-- Wallpaper recommend config 
+wallpaper = { engine = "static", paths = { "/home/abyss/Pictures/Wallpapers" },
+              interval = 600, shuffle = true, fit = "fill" }
+
 ```
 
 ---
 
-## 🖥️ Render Modes & Output Backends
 
-### Render Modes
 
-| Mode | Identifier | Requirements | Notes |
-|---|---|---|---|
-| **Kitty** | `kitty` | Kitty Graphics Protocol | Native pixel resolution inside supported terminals (Kitty, WezTerm). |
-| **Halfblock** | `pixel` / `halfblock` | 24-bit Truecolor | Uses `▀` Unicode characters for 2× vertical pixel density. |
-| **ASCII Edge** | `ascii_edge` | Any Terminal | Rec.601 luma calculation with edge-detection overlay. |
-| **ASCII** | `ascii` | Any Terminal | Pure ASCII luma character mapping for universal TTY compatibility. |
+### Supported Wayland Globals
 
-### Output Backends
+| Global | Support Level |
+|---|---|
+| `wl_compositor` + `wl_subcompositor` | ✓ Full |
+| `xdg_shell` (toplevel + popup) | ✓ Full |
+| `wl_seat` (keyboard, pointer, touch) | ✓ Full |
+| `wl_shm` | ✓ Full |
+| `wl_data_device_manager` + `primary_selection` | ✓ Full (Clipboard & Selection) |
+| `wl_output` + `xdg_output` | ✓ Full (Multi-Monitor aware) |
+| `zwp_linux_dmabuf_v1` | ✓ Full (GBM / EGL GPU import with SHM fallback) |
+| `linux-drm-syncobj-v1` | ✓ Explicit synchronization |
+| `xdg_decoration` / `xdg_activation` | ✓ Client-side decoration / instant grant |
+| `wp_viewporter` / `wp_fractional_scale` / `wp_presentation_time` | ✓ Full |
+| `tablet` / `idle_inhibit` / `cursor_shape` / `pointer_constraints` | ✓ Supported |
+| `XWayland` | ✓ Spawned automatically for X11 application support |
 
-1. **DRM/KMS Backend**: Direct hardware framebuffer output on bare TTYs (`/dev/dri/card*`), managed via `libseat`.
-2. **Terminal Backend**: Draws inline inside an existing terminal emulator window.
-
----
-
-## 🔑 Browser & Keyring Note
-
-When running browsers like Firefox or Chromium inside a nested session or custom TTY compositor, safe storage keys managed by PAM (`gnome-keyring` / `kwallet`) may not be automatically passed if the login session wasn't initialized through a standard display manager.
-
-Your profile data remains completely intact on disk. To log into keyrings seamlessly on bare metal, use **Abyss (`velogin`)** as your system login manager.
 
 ---
 
-## 📜 License & Philosophy
+## The bigger picture: TheHolyVeil
 
-`veil` is licensed under the **MIT License**.
+Veil is part of a larger ecosystem rather than a single standalone app.
 
-**Design Principles:**
-* **Lightweight & Fast**: Zero bloat, low footprint, high performance.
-* **Full-Featured DE**: Built-in essentials so you don't need a dozen third-party daemons to get a functional desktop.
-* **Run Anywhere**: TTY-native bare metal or nested in any terminal emulator.
-* **Modular**: Clean Rust workspace crates (`veil-host`, `veil-config`, `veil-gpu`, `veil-render`, `veil-login`).
+TheHolyVeil is the umbrella identity for a layered stack:
+
+- boot layer (limine fork)
+  - trusted, optimized, and remade boot
+  - security and control are the concerns of it
+- OS & ISO layer
+  - the operating system base
+  - minimal by default, extensible by choice
+  - reachable & extensible with an installer
+- login layer
+  - easy to use
+  - virtual keyboard friendly
+  - aestheticly pleasing & matching
+  - login manager and environment bootstrap
+- desktop / compositor layer
+  - Veil itself
+  - Full shebang
+  - Configuration decides everything
+  - Seperate graphics modes
+  - Able to run over ssh
+  - Batteries required DE
+  - "We provide the foundation, and you build the house on it"
+  - the actual user-facing desktop environment
+
+Each layer is separate, optional, and intentionally independent. That is a core part of why veil is veil.
+
+This matters because Veil is not trying to be absolute. It is trying to allow you to **use it without being in your way.**
 
 ---
 
-**veil v3** — *Your apps, your terminal, your desktop.*
+## What Veil is
+
+Veil is a lightweight Rust-based desktop environment focused on:
+
+- bare-TTY and DRM/KMS operation
+- fast workflow-oriented desktop control
+- workspace management
+- app launching
+- system status and quick actions
+- clean visual styling
+- minimal configuration burden
+- smart defaults over feature dumping
+
+It is built to feel more like an intentionally designed desktop environment than a generic “do everything” shell.
+
+---
+
+## The philosophy
+
+We believe desktop environments should be helpful, not noisy.
+
+A desktop should:
+- make work easier
+- keep you productive
+- keep the system responsive
+- give the user a strong default
+- avoid unnecessary bloat
+- support customization without forcing complexity
+- allow optional tools to be installed without becoming mandatory
+
+Veil follows that principle.
+
+This is the point of the whole direction:
+
+- not “everything included”
+- not "everything everywhere all at once"
+- not “every package installed by default”
+- not “the shell pretending to be a full operating environment”
+- not "have a bloated system have fun figuring it out and debloating it"
+- but “a solid base environment with a curated path forward”
+
+
+---
+
+## Batteries are not included
+
+Veil is intentionally designed around a more thoughtful model:
+
+- the base experience is clean and usable
+- optional tools can be added by the user
+- recommended packages and services can be provided
+- the environment remains fast and honest
+- users can opt in to whatever ecosystems they actually want
+- general things people dont even use anyway are not installed, thats unnecessary bloat.
+
+This is important.
+
+A lot of desktop environments drift into becoming bloated packages that try to be everything:
+- file manager
+- browser
+- package manager
+- documentation layer
+- launcher ecosystem
+- productivity stack
+- half-finished utilities
+- forced-to-use utilies
+
+Veil does not need to do that.
+
+The preferred model is:
+
+- the shell provides the desktop loop
+- the user chooses the tools they want
+- recommended apps and utilities are available without becoming mandatory
+- configuration remains the place where the environment becomes personal
+
+This keeps the project aligned with the idea of a friendly opt-in environment instead of forced “batteries included” bloat.
+
+---
+
+## Friendly opt-in environment
+
+Veil aims to be a friendly desktop environment for real people:
+
+- simple to configure
+- easy to understand
+- easy to extend
+- not locked into heavy assumptions
+- built around ergonomic defaults
+- not judgmental about user preference
+
+This means the project supports:
+
+- custom app launches
+- user-defined keybindings
+- custom themes
+- wallpaper configurability
+- per-user setup
+- optional system services
+- recommended but not mandatory tools
+
+The configuration layer is part of the design. It is not an afterthought.
+
+The project exposes a configuration based settings file for:
+- theme selection
+- bar configuration
+- app definitions
+- wallpaper and background settings
+- keybinding setup
+- output preferences
+- runtime behavior
+
+This matches the philosophy of the project: a desktop that is direct and configurable, not a black box.
+
+---
+
+## Current feature set
+
+The repository already includes a substantial set of desktop features and system capabilities.
+
+### Core desktop shell
+- compositor / Wayland desktop runtime
+- window tiling and workspace management
+- window focus and movement
+- resizing and split rotation
+- fullscreen handling
+- app launching from the shell
+
+### Tiling and layout
+- Dwindle-style tiling
+- Scroll-style workspace flow
+- layout switching on the fly
+- split flips and swapping
+- efficient desktop workflow
+
+### Launcher, bar, and desktop chrome
+- built-in app launcher
+- status bar with workspace indicators and app shortcuts
+- power menu
+- quick action surfaces
+- live help/overlay system
+
+### Theme and wallpaper system
+- built-in color themes
+- wallpaper loading and chooser support
+- background styling
+- configurable desktop aesthetics
+
+### Output and rendering
+- DRM/KMS output support
+- terminal mode output support
+- render quality modes
+- GPU-aware rendering paths
+- direct framebuffer support in bare TTY scenarios
+
+### Login and session flow
+- graphical TTY login support
+- PAM-style authentication flow
+- session selection and session startup
+- booting into a proper desktop environment
+
+### Integration
+- Wayland support
+- XWayland support
+- clipboard handling
+- environment integration for GUI apps
+- desktop environment shaping instead of pure window manager behavior
+
+### Configurability
+- hot-reloadable config
+- Lua config file support
+- per-user desktop customization
+- environment tuning without rebuilding the whole system
+
+---
+
+## Roadmap: 
+
+To become a true ecosystem, from the bootloader all the way to the clipboard on your screen.
+Bootloader, custom kernel, arch-based operating system, login manager, and semi-desktop environment. 
+
+- Own every stack
+- Be open minded
+- Accept suggestions & feedback in mind
+- "The people" oriented 
+- Acceptable
+
+The goal is to be more void oriented. TheHolyVeil would be TheBigVoid, velogin would be singulard, veil-host (veil) would be Infinity(DE), the limine fork would be Ascend, and then AbyssOS would be the actual operating system. 
+This aligns with our names and presents veil as a more aligned and ecosystem proven product instead of a loose object in the chaos. 
+
+## Project structure
+
+This repository is a Rust workspace with a modular layout:
+
+```text
+veilTDC/
+├── Cargo.toml
+├── config.lua
+├── install.sh
+├── pkg.sh
+├── render_real_font.py
+├── test-braille.sh
+├── README.md
+├── .cargo/
+├── .github/
+├── dist/
+├── veil-config/
+├── veil-host/
+├── veil-login/
+├── veil-render/
+└── ...
