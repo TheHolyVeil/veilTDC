@@ -82,6 +82,24 @@ struct Monitor {
     /// to detect the disable→enable edge (VT switched back to us) and
     /// re-assert this CRTC specifically.
     was_active: bool,
+    /// H5: the connector reported `Connected` at the last probe. While false
+    /// no flips are attempted (no error flood); when it turns true again the
+    /// CRTC is re-asserted so the same monitor comes back.
+    connected: bool,
+    last_probe: std::time::Instant,
+    /// Failed re-modesets, for rate-limited logging.
+    modeset_err: u32,
+}
+
+/// H5: what a connector probe means for a monitor currently `connected`.
+/// `Some(new)` when it changed; `Unknown` never changes anything (some
+/// drivers report it transiently while a link retrains).
+fn hotplug_transition(connected: bool, state: connector::State) -> Option<bool> {
+    match (connected, state) {
+        (true, connector::State::Disconnected) => Some(false),
+        (false, connector::State::Connected) => Some(true),
+        _ => None,
+    }
 }
 
 /// Exact refresh of a mode in millihertz. `vrefresh()` is rounded to whole Hz
@@ -398,6 +416,9 @@ impl DrmOutput {
                     flip_pending: false,
                     needs_flip: false,
                     was_active: true,
+                    connected: true,
+                    last_probe: std::time::Instant::now(),
+                    modeset_err: 0,
                 })
             })();
 
@@ -540,8 +561,8 @@ impl OutputBackend for DrmOutput {
         self.sync_active_state(monitor);
         let active_now = self.seat.is_active();
 
-        if !active_now || !self.monitors[monitor].was_active {
-            // Either suspended, or re-modeset still hasn't landed — don't
+        if !active_now || !self.monitors[monitor].was_active || !self.monitors[monitor].connected {
+            // Either suspended, unplugged (H5), or re-modeset still hasn't landed — don't
             // attempt to flip against a CRTC we don't trust yet.
             return Ok(());
         }
@@ -681,6 +702,7 @@ impl OutputBackend for DrmOutput {
 
     fn service_seat(&mut self) -> io::Result<()> {
         self.pump_seat();
+        self.probe_connectors();
         for idx in 0..self.monitors.len() {
             self.sync_active_state(idx);
         }
@@ -793,10 +815,47 @@ impl DrmOutput {
 
     /// Track the seat's active/inactive state for one monitor, and re-modeset
     /// it when we come back from another VT.
+    /// H5: poll each connector's cached state about once a second. Reading
+    /// it (`force_probe = false`) is a cheap ioctl; the kernel updates it on
+    /// the hotplug interrupt. An unplugged monitor stops being flipped (the
+    /// old behaviour was a flood of `page_flip failed`) and a replugged one
+    /// is re-modeset with its last buffer. A *different* monitor, or a new
+    /// one, is not picked up: that still needs a restart.
+    fn probe_connectors(&mut self) {
+        const PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+        for idx in 0..self.monitors.len() {
+            if self.monitors[idx].last_probe.elapsed() < PROBE_EVERY {
+                continue;
+            }
+            self.monitors[idx].last_probe = std::time::Instant::now();
+            let (card_idx, conn) = (self.monitors[idx].card_idx, self.monitors[idx].conn);
+            let Ok(info) = self.cards[card_idx].get_connector(conn, false) else {
+                continue;
+            };
+            let m = &mut self.monitors[idx];
+            match hotplug_transition(m.connected, info.state()) {
+                Some(false) => {
+                    m.connected = false;
+                    m.flip_pending = false;
+                    m.needs_flip = false;
+                    eprintln!("[veil-host] monitor {idx} unplugged; output paused until it returns");
+                }
+                Some(true) => {
+                    m.connected = true;
+                    m.was_active = false; // forces a re-modeset (sync_active_state)
+                    m.flip_pending = false;
+                    m.needs_flip = false;
+                    eprintln!("[veil-host] monitor {idx} reconnected; restoring its mode");
+                }
+                None => {}
+            }
+        }
+    }
+
     fn sync_active_state(&mut self, monitor: usize) {
         let active_now = self.seat.is_active();
-        if active_now && !self.monitors[monitor].was_active {
-            // Coming back from a VT switch: whatever had the display in
+        if active_now && !self.monitors[monitor].was_active && self.monitors[monitor].connected {
+            // Coming back from a VT switch (or a replug, H5): whatever had the display in
             // between left this CRTC in an unknown state, and any flip we
             // had in flight before switching away is never going to
             // complete — its fence belonged to the old CRTC config.
@@ -808,10 +867,21 @@ impl DrmOutput {
             self.monitors[monitor].flip_pending = false;
             self.monitors[monitor].needs_flip = false;
             match self.reassert_crtc(monitor) {
-                Ok(()) => self.monitors[monitor].was_active = true,
-                Err(e) => eprintln!(
-                    "[veil-host] VT resume: re-modeset failed on monitor {monitor}, retrying: {e}"
-                ),
+                Ok(()) => {
+                    self.monitors[monitor].was_active = true;
+                    self.monitors[monitor].modeset_err = 0;
+                }
+                Err(e) => {
+                    let m = &mut self.monitors[monitor];
+                    m.modeset_err = m.modeset_err.saturating_add(1);
+                    // Rate-limited: this retries on every loop iteration.
+                    if m.modeset_err.is_power_of_two() {
+                        eprintln!(
+                            "[veil-host] re-modeset failed on monitor {monitor}, retrying: {e} (failure #{})",
+                            m.modeset_err
+                        );
+                    }
+                }
             }
         } else {
             self.monitors[monitor].was_active = active_now;
@@ -947,5 +1017,25 @@ mod tests {
             sort_cards(names),
             ["/dev/dri/card0", "/dev/dri/card2", "/dev/dri/card10"]
         );
+    }
+}
+
+#[cfg(test)]
+mod hotplug_tests {
+    use super::*;
+    use drm::control::connector::State;
+
+    #[test]
+    fn unplug_and_replug_are_detected() {
+        assert_eq!(hotplug_transition(true, State::Disconnected), Some(false));
+        assert_eq!(hotplug_transition(false, State::Connected), Some(true));
+    }
+
+    #[test]
+    fn steady_and_unknown_states_change_nothing() {
+        assert_eq!(hotplug_transition(true, State::Connected), None);
+        assert_eq!(hotplug_transition(false, State::Disconnected), None);
+        assert_eq!(hotplug_transition(true, State::Unknown), None);
+        assert_eq!(hotplug_transition(false, State::Unknown), None);
     }
 }

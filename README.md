@@ -1,4 +1,4 @@
-# TheHolyVeil / Veil
+# TheHolyVeil / veilTDC
 <sub>The name "veil" is due to change.</sub>
 
 
@@ -21,7 +21,7 @@ Veil is designed to be:
 
 This project is still in active development. The README is a current snapshot of the architecture and direction. May not have up-to-date information. Such as the config and how to edit it. Pray for yourself that the default config.lua has everything in it.
 
-## 📦 Installation
+##  Installation
 
 ### 1. Veil Desktop Environment
 
@@ -99,7 +99,7 @@ veil-host list-modes
 
 ---
 
-## ⌨️ Keybindings Reference
+## Keybindings Reference
 
 Default modifier key is `Super` (configurable to `Alt`, `Ctrl`, or `Shift` in `config.lua`). Press **`Super+/`** inside Veil anytime to open the live shortcut reference overlay.
 

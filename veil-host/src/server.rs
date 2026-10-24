@@ -3020,6 +3020,23 @@ fn wallpaper_tick(state: &mut State) {
     }
 }
 
+/// N11: how long the compositor tick sleeps. While anything is happening it
+/// runs at `fast` (half the composite period, 2.5 ms at 180 Hz). After
+/// `IDLE_AFTER_TICKS` consecutive quiet ticks it backs off to `IDLE_TICK`
+/// (the old fixed 8 ms) so an idle desktop is not woken 400 times a second.
+/// The first event after idle waits at most one `IDLE_TICK`; the first busy
+/// tick drops straight back to `fast`.
+const IDLE_TICK: Duration = Duration::from_millis(8);
+const IDLE_AFTER_TICKS: u32 = 24;
+
+fn next_tick_delay(fast: Duration, idle_ticks: u32) -> Duration {
+    if idle_ticks > IDLE_AFTER_TICKS {
+        fast.max(IDLE_TICK)
+    } else {
+        fast
+    }
+}
+
 /// How often to composite: the `fps` config value, or the display's own
 /// refresh when `fps == 0`. Deliberately 10% under the nominal period: the
 /// tick timer fires at half that period and the check is `elapsed < interval`,
@@ -4792,11 +4809,14 @@ pub fn run(
         eprintln!("[veil-tick] VEIL_TICK_TRACE on — phase timing every 120th tick (~1s)");
     }
     let mut tick_n: u32 = 0;
+    let mut idle_ticks: u32 = 0; // N11
     let (mut acc_total, mut acc_total_max, mut acc_comp, mut acc_comp_max) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let (mut acc_comp_n, mut acc_serial) = (0u32, 0u64);
     handle
         .insert_source(tick, move |_, _, data| {
             let t_start = tick_trace.then(std::time::Instant::now);
+            let serial_before = data.state.frame_serial;
+            let mut busy = false;
             // Prune toplevels that the client has destroyed. If any closed, retile
             // the survivors and move keyboard focus onto one of them.
             let mut lost: Vec<usize> = data
@@ -4807,6 +4827,7 @@ pub fn run(
                 .map(|t| t.monitor)
                 .collect();
             if !lost.is_empty() {
+                busy = true;
                 data.state.toplevels.retain(|t| t.alive());
                 // S11: retile each monitor that lost a window, not only the
                 // active one, so a close elsewhere leaves no gap.
@@ -4848,6 +4869,7 @@ pub fn run(
 
             // Drain input cmds.
             while let Ok(cmd) = input_rx.try_recv() {
+                busy = true;
                 apply_input(&mut data.state, cmd);
             }
 
@@ -4943,6 +4965,13 @@ pub fn run(
             let t_pre_composite = tick_trace.then(std::time::Instant::now);
             composite_and_send(&mut data.state);
             let t_post_composite = tick_trace.then(std::time::Instant::now);
+            // N11: anything on screen changing, or still waiting to be shown,
+            // keeps the tick fast.
+            busy |= data.state.frame_serial != serial_before
+                || data.state.dirty
+                || data.state.osd.is_some()
+                || data.state.pending_copy_out;
+            idle_ticks = if busy { 0 } else { idle_ticks.saturating_add(1) };
 
             // Flush outgoing wayland messages.
             let _ = data.display.flush_clients();
@@ -4997,10 +5026,11 @@ pub fn run(
                 // frame: 8.3 ms at 60 Hz (was a fixed 8 ms, i.e. a ~125 fps
                 // ceiling), ~2.8 ms at 180 Hz. Re-read each tick so a config
                 // reload or the real refresh arriving takes effect.
-                TimeoutAction::ToDuration(
+                TimeoutAction::ToDuration(next_tick_delay(
                     (data.state.composite_interval / 2)
                         .clamp(Duration::from_millis(2), Duration::from_millis(8)),
-                )
+                    idle_ticks,
+                ))
             }
         })
         .map_err(|e| io::Error::other(format!("insert tick: {e}")))?;
@@ -5061,6 +5091,19 @@ pub fn run(
 mod env_tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn tick_backs_off_only_when_idle_and_never_below_fast() {
+        let fast = Duration::from_micros(2500);
+        // Busy / recently busy: full rate.
+        assert_eq!(next_tick_delay(fast, 0), fast);
+        assert_eq!(next_tick_delay(fast, IDLE_AFTER_TICKS), fast);
+        // Long idle: the old 8 ms tick.
+        assert_eq!(next_tick_delay(fast, IDLE_AFTER_TICKS + 1), IDLE_TICK);
+        // A slow display (already 8 ms) is unchanged, never made faster.
+        let slow = Duration::from_millis(8);
+        assert_eq!(next_tick_delay(slow, 1_000), slow);
+    }
 
     #[test]
     fn inhibit_escape_is_alt_shift_escape_only() {
