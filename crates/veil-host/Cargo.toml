@@ -19,6 +19,9 @@ tracing            = { workspace = true }
 chrono             = { workspace = true }
 veil-render        = { path = "../veil-render" }
 veil-config        = { path = "../veil-config" }
+veil-ipc           = { path = "../veil-ipc" }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
 crossterm          = { workspace = true }
 evdev              = { workspace = true }
 drm                = { workspace = true }
@@ -31,3 +34,6 @@ wayland-server     = { workspace = true }
 tracing-subscriber = { workspace = true }
 wl-clipboard-rs    = { workspace = true }
 mimalloc           = { workspace = true }
+
+[dev-dependencies]
+tempfile           = { workspace = true }

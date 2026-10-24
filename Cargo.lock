@@ -5007,14 +5007,28 @@ dependencies = [
  "libc",
  "libseat",
  "mimalloc",
+ "serde",
+ "serde_json",
  "smithay",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "veil-config",
+ "veil-ipc",
  "veil-render",
  "wayland-protocols",
  "wayland-server",
  "wl-clipboard-rs",
+]
+
+[[package]]
+name = "veil-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -4,12 +4,15 @@ members = [
     "crates/veil-config",
     "crates/veil-host",
     "crates/veil-login",
+    "crates/veil-ipc",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 # No default codecs: each crate opts into exactly what it decodes. veil-login
 # decodes untrusted avatars as root before login, so it gets PNG + JPEG only.
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
 image              = { version = "0.25", default-features = false }
 chrono             = "0.4"
 mlua               = { version = "0.12", features = ["lua54", "vendored"] }
@@ -35,6 +38,7 @@ uzers              = "0.12"
 thiserror          = "2"
 slint              = { version = "1.18", default-features = false }
 slint-build        = "1.18"
+tempfile           = "3"
 
 [profile.release]
 # opt-level "z" optimizes for SIZE and turns off most loop vectorization and
