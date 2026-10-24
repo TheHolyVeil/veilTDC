@@ -1,0 +1,18 @@
+[package]
+name        = "veil-ui"
+version     = "0.1.0"
+edition     = "2021"
+description = "Drawing kit, theme system, and layer-shell client runtime for Veil components"
+
+[dependencies]
+veil-text              = { path = "../veil-text" }
+veil-ipc               = { path = "../veil-ipc" }
+tiny-skia              = { workspace = true }
+smithay-client-toolkit = { workspace = true }
+wayland-client         = { workspace = true }
+wayland-protocols-wlr  = { workspace = true }
+crossbeam-channel      = { workspace = true }
+tracing                = { workspace = true }
+serde                  = { workspace = true }
+serde_json             = { workspace = true }
+thiserror              = { workspace = true }

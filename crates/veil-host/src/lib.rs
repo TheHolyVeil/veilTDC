@@ -10,6 +10,7 @@
 use std::sync::mpsc;
 use std::thread;
 
+pub mod cli;
 pub mod detile;
 pub mod font5x7;
 pub mod input;

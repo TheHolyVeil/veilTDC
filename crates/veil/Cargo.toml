@@ -1,0 +1,21 @@
+[package]
+name        = "veil"
+version     = "4.0.2"
+edition     = "2021"
+description = "Multi-call binary for the Veil desktop shell and compositor"
+
+[[bin]]
+name = "veil"
+path = "src/main.rs"
+
+[dependencies]
+veil-host   = { path = "../veil-host" }
+veil-bar    = { path = "../veil-bar", optional = true }
+veil-ipc    = { path = "../veil-ipc" }
+veil-config = { path = "../veil-config" }
+serde_json  = { workspace = true }
+mimalloc    = { workspace = true }
+
+[features]
+default = ["shell"]
+shell   = ["dep:veil-bar"]
