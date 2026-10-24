@@ -1,22 +1,40 @@
 [workspace]
-members = ["veil-render", "veil-config", "veil-host", "veil-login"]
+members = [
+    "crates/veil-render",
+    "crates/veil-config",
+    "crates/veil-host",
+    "crates/veil-login",
+]
 resolver = "2"
 
 [workspace.dependencies]
 # No default codecs: each crate opts into exactly what it decodes. veil-login
 # decodes untrusted avatars as root before login, so it gets PNG + JPEG only.
-image        = { version = "0.25", default-features = false }
-chrono       = "0.4"
-mlua         = { version = "0.12", features = ["lua54", "vendored"] }
-crossterm    = "0.29"
-evdev                 = "0.13"
-libc                  = "0.2"
-flate2                = "1.1"
-smithay               = { version = "0.7", default-features = false, features = ["wayland_frontend", "xwayland", "desktop", "backend_egl", "backend_gbm", "backend_drm", "renderer_gl"] }
-calloop               = "0.14"
-tracing               = "0.1"
-drm                   = "0.15"
-libseat               = "0.2"
+image              = { version = "0.25", default-features = false }
+chrono             = "0.4"
+mlua               = { version = "0.12", features = ["lua54", "vendored"] }
+crossterm          = "0.29"
+evdev              = "0.13"
+libc               = "0.2"
+flate2             = "1.1"
+smithay            = { version = "0.7", default-features = false, features = ["wayland_frontend", "xwayland", "desktop", "backend_egl", "backend_gbm", "backend_drm", "renderer_gl"] }
+calloop            = "0.14"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+drm                = "0.15"
+libseat            = "0.2"
+wayland-protocols  = { version = "0.32", features = ["server"] }
+wayland-server     = "0.31"
+wl-clipboard-rs    = "0.9"
+mimalloc           = "0.1.52"
+wgpu               = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
+pollster           = "1"
+bytemuck           = { version = "1.25", features = ["derive"] }
+pam-client2        = "0.5"
+uzers              = "0.12"
+thiserror          = "2"
+slint              = { version = "1.18", default-features = false }
+slint-build        = "1.18"
 
 [profile.release]
 # opt-level "z" optimizes for SIZE and turns off most loop vectorization and

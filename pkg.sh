@@ -19,8 +19,6 @@ tar -czf "$OUT" \
     config.lua \
     Cargo.toml \
     Cargo.lock \
-    veil-host \
-    veil-render \
-    veil-config
+    crates
 
 echo "$OUT"

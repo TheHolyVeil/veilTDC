@@ -11,7 +11,7 @@ name = "velogin"
 path = "src/main.rs"
 
 [dependencies]
-slint = { version = "1.18", default-features = false, features = [
+slint = { workspace = true, features = [
     "std",
     "compat-1-2",
     "backend-winit",        # nested dev/testing inside a compositor
@@ -19,12 +19,12 @@ slint = { version = "1.18", default-features = false, features = [
     "renderer-femtovg",     # GPU (EGL/GBM) — 6600 XT and most desktops
     "renderer-software",    # fallback for weak/embedded hardware
 ] }
-pam-client2 = "0.5"
+pam-client2 = { workspace = true }
 # Pre-auth decoder runs as root on untrusted files: PNG + JPEG only (LG7).
 image       = { workspace = true, features = ["png", "jpeg"] }
-uzers       = "0.12"
-thiserror   = "2"
+uzers       = { workspace = true }
+thiserror   = { workspace = true }
 libc        = { workspace = true }
 
 [build-dependencies]
-slint-build = "1.18"
+slint-build = { workspace = true }

@@ -26,8 +26,8 @@ libseat            = { workspace = true }
 libc               = { workspace = true }
 # Wallpaper decode: PNG + JPEG only, same minimal surface as veil-login.
 image              = { workspace = true, features = ["png", "jpeg"] }
-wayland-protocols  = { version = "0.32", features = ["server"] }
-wayland-server     = "0.31"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wl-clipboard-rs = "0.9"
-mimalloc        = "0.1.52"
+wayland-protocols  = { workspace = true }
+wayland-server     = { workspace = true }
+tracing-subscriber = { workspace = true }
+wl-clipboard-rs    = { workspace = true }
+mimalloc           = { workspace = true }
