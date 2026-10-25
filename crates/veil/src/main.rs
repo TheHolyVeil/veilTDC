@@ -8,6 +8,9 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -105,11 +108,40 @@ fn handle_ctl(args: &[String]) -> std::io::Result<()> {
 
     stream.write_all(&veil_ipc::encode(&msg).map_err(|e| std::io::Error::other(e.to_string()))?)?;
 
-    // Read response
+    // The server answers Hello first, then the command. Read frames until the
+    // one we're waiting for (Reply for a Cmd, Pong for a Ping), not just the
+    // first chunk that arrives.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+    let want_reply = matches!(msg, veil_ipc::ClientMessage::Cmd { .. });
+    let mut frames = veil_ipc::FrameBuffer::new();
     let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf)?;
-    let reply = String::from_utf8_lossy(&buf[..n]);
-    println!("{}", reply.trim());
-
-    Ok(())
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(std::io::Error::other("compositor closed the connection"));
+        }
+        frames.push(&buf[..n]).map_err(|e| std::io::Error::other(e.to_string()))?;
+        while let Ok(Some(m)) = frames.next_frame::<veil_ipc::ServerMessage>() {
+            match m {
+                veil_ipc::ServerMessage::Reply { ok, error, data, .. } if want_reply => {
+                    match (ok, error) {
+                        (true, _) => {
+                            if let Some(d) = data {
+                                println!("{d}");
+                            }
+                            return Ok(());
+                        }
+                        (false, e) => {
+                            return Err(std::io::Error::other(e.unwrap_or_else(|| "command failed".into())));
+                        }
+                    }
+                }
+                veil_ipc::ServerMessage::Pong if !want_reply => {
+                    println!("pong");
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
 }

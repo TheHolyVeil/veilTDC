@@ -42,6 +42,9 @@ pub enum InputCmd {
         /// Monitor 0's real refresh rate in millihertz (what the shared
         /// `wl_output` advertises and what `fps = 0` follows).
         refresh_mhz: u32,
+        /// Every monitor's own refresh in millihertz (same order as
+        /// `sizes`), so each `wl_output` advertises its real mode.
+        refresh_per_monitor: Vec<u32>,
     },
 
     /// Display an On-Screen Display (OSD) popup overlay.

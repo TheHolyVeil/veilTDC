@@ -702,6 +702,9 @@ impl BarPosition {
 pub struct BarConfig {
     pub enabled: bool,
     pub position: BarPosition,
+    /// Run the supervised `veil shell bar` (layer-shell) instead of the
+    /// built-in 12px bar. If it dies the built-in bar comes back by itself.
+    pub shell: bool,
 }
 
 impl Default for BarConfig {
@@ -709,6 +712,7 @@ impl Default for BarConfig {
         Self {
             enabled: true,
             position: BarPosition::Bottom,
+            shell: false,
         }
     }
 }
@@ -809,7 +813,8 @@ fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
         .get::<String>("position")
         .map(|s| BarPosition::from_str(&s))
         .unwrap_or(default.position);
-    BarConfig { enabled, position }
+    let shell = get_bool(&bt, "shell", default.shell);
+    BarConfig { enabled, position, shell }
 }
 
 /// A Lua boolean field with a default. `get::<bool>` alone is a trap: mlua

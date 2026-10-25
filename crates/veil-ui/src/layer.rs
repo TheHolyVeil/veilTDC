@@ -43,6 +43,8 @@ pub enum SurfacePosition {
 
 struct OutputSurface {
     output_id: u32,
+    /// wl_output name ("veil-host-1" under veil), "" if the compositor sent none.
+    name: String,
     layer_surface: SctLayerSurface,
     pool: SlotPool,
     width: u32,
@@ -97,6 +99,7 @@ impl LayerShellClient {
             input_tx: tx,
             mouse_x: 0.0,
             mouse_y: 0.0,
+            reconfigured: false,
         };
 
         let mut client = Self {
@@ -110,6 +113,18 @@ impl LayerShellClient {
 
     pub fn dispatch(&mut self) -> Result<(), String> {
         let _ = self.queue.flush();
+        // Pull whatever the compositor sent off the socket (non-blocking).
+        // `dispatch_pending` alone only handles events something else already
+        // read, so without this the bar never saw a later configure/resize,
+        // a monitor appearing, or any pointer event after the first roundtrip.
+        if let Some(guard) = self.queue.prepare_read() {
+            match guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(format!("Wayland read error: {e}")),
+            }
+        }
         self.queue.dispatch_pending(&mut self.state)
             .map_err(|e| format!("Dispatch error: {e}"))?;
         if self.state.surfaces.iter().any(|s| !s.configured) {
@@ -118,13 +133,22 @@ impl LayerShellClient {
         Ok(())
     }
 
+    /// True once since the last call if a surface was configured or resized
+    /// by the compositor. Redraw when it is: the committed buffer is still the
+    /// old size until you do.
+    pub fn take_reconfigured(&mut self) -> bool {
+        std::mem::take(&mut self.state.reconfigured)
+    }
+
     /// Render and commit pixels to each configured output surface.
-    pub fn present_for_each<F: FnMut(u32, u32) -> Vec<u8>>(&mut self, mut render: F) {
+    /// `render` gets the output's name so one process can draw something
+    /// different on each monitor.
+    pub fn present_for_each<F: FnMut(&str, u32, u32) -> Vec<u8>>(&mut self, mut render: F) {
         for surf in &mut self.state.surfaces {
             if surf.width == 0 || surf.height == 0 {
                 continue;
             }
-            let pixels = render(surf.width, surf.height);
+            let pixels = render(&surf.name, surf.width, surf.height);
             let stride = surf.width * 4;
             if let Ok((buffer, canvas)) = surf.pool.create_buffer(
                 surf.width as i32,
@@ -133,7 +157,15 @@ impl LayerShellClient {
                 wl_shm::Format::Argb8888,
             ) {
                 let len = canvas.len().min(pixels.len());
-                canvas[..len].copy_from_slice(&pixels[..len]);
+                // tiny-skia hands back premultiplied R,G,B,A bytes; wl_shm
+                // Argb8888 is B,G,R,A in memory (little-endian). Copying
+                // straight swaps red and blue on screen.
+                for (dst, src) in canvas[..len].chunks_exact_mut(4).zip(pixels[..len].chunks_exact(4)) {
+                    dst[0] = src[2];
+                    dst[1] = src[1];
+                    dst[2] = src[0];
+                    dst[3] = src[3];
+                }
                 let wl_surf = surf.layer_surface.wl_surface();
                 let _ = buffer.attach_to(wl_surf);
                 wl_surf.damage_buffer(0, 0, surf.width as i32, surf.height as i32);
@@ -160,6 +192,9 @@ struct ClientState {
     input_tx: Sender<UiInputEvent>,
     mouse_x: f64,
     mouse_y: f64,
+    /// Set when any surface was (re)configured; the app must redraw at the
+    /// new size. Read and cleared by `LayerShellClient::take_reconfigured`.
+    reconfigured: bool,
 }
 
 impl ClientState {
@@ -169,6 +204,11 @@ impl ClientState {
             return;
         }
 
+        let name = self
+            .output_state
+            .info(output)
+            .and_then(|i| i.name)
+            .unwrap_or_default();
         let surface = self.compositor.create_surface(qh);
         let layer_surface = self.layer_shell.create_layer_surface(
             qh,
@@ -204,6 +244,7 @@ impl ClientState {
 
         self.surfaces.push(OutputSurface {
             output_id,
+            name,
             layer_surface,
             pool,
             width: 0,
@@ -337,6 +378,7 @@ impl LayerShellHandler for ClientState {
                     s.height = cfg.new_size.1;
                 }
                 s.configured = true;
+                self.reconfigured = true;
                 break;
             }
         }

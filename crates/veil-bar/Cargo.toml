@@ -4,9 +4,6 @@ version     = "0.1.0"
 edition     = "2021"
 description = "Supervised desktop bar for Veil"
 
-[[bin]]
-name = "veil-bar"
-path = "src/main.rs"
 
 [dependencies]
 veil-ui                = { path = "../veil-ui" }

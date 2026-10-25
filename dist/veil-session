@@ -1,6 +1,6 @@
 #!/bin/sh
 # Veil desktop session. Started by the login manager (velogin) from
-# veil.desktop; runs veil-host directly on the VT's DRM/KMS display.
+# veil.desktop; runs veil directly on the VT's DRM/KMS display.
 #
 # If this exits right away, read ~/.local/state/veil/veil-host.log: veil-host
 # writes its own stderr there when launched from a login (libseat/DRM errors
@@ -18,4 +18,4 @@ export XDG_SESSION_TYPE=wayland
 # back to drawing text on the console.
 export VEIL_OUTPUT=drm
 
-exec veil-host start
+exec veil start

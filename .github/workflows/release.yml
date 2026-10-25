@@ -23,7 +23,7 @@ jobs:
       - name: Build
         run: cargo build --release
       - name: Rename binary
-        run: cp target/release/veil-host veil-host-x86_64-unknown-linux-gnu
+        run: cp target/release/veil veil-host-x86_64-unknown-linux-gnu
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -41,7 +41,7 @@ jobs:
       - name: Build
         run: cargo build --release
       - name: Rename binary
-        run: cp target/release/veil-host veil-host-aarch64-unknown-linux-gnu
+        run: cp target/release/veil veil-host-aarch64-unknown-linux-gnu
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

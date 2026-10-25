@@ -50,6 +50,11 @@ impl IpcServer {
         &self.socket_path
     }
 
+    /// Name a client gave in its `hello`, if it has sent one.
+    pub fn client_name(&self, client_id: usize) -> Option<String> {
+        self.clients.get(&client_id).and_then(|c| c.name.clone())
+    }
+
     /// Bind the Unix socket at mode 0600.
     pub fn bind(&mut self) -> Result<(), std::io::Error> {
         if let Some(parent) = self.socket_path.parent() {
@@ -58,8 +63,16 @@ impl IpcServer {
             let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
         }
 
-        // Clean up stale socket if present
+        // Clean up a stale socket, but never steal a live one: a second veil
+        // (e.g. a nested test run inside a real session) must not take the IPC
+        // socket away from the session that owns it.
         if self.socket_path.exists() {
+            if UnixStream::connect(&self.socket_path).is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("{} is owned by another running veil", self.socket_path.display()),
+                ));
+            }
             let _ = fs::remove_file(&self.socket_path);
         }
 
@@ -319,7 +332,9 @@ impl Default for IpcServer {
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        if self.socket_path.exists() {
+        // Only unlink a socket we actually bound; after a failed bind the
+        // path belongs to another running veil.
+        if self.listener.is_some() && self.socket_path.exists() {
             let _ = fs::remove_file(&self.socket_path);
         }
     }

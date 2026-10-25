@@ -60,6 +60,8 @@ bar = {
 	enabled = true,   -- false hides the bar entirely and gives tiled windows
 	                   -- back the full output height
 	position = "bottom", -- top | bottom
+	shell = true,     -- run the supervised bar (veil shell bar) over layer-shell.
+	                   -- If it crashes, the built-in bar takes over again.
 
 	-- Click any tile to launch it. This is separate from `keybinds.apps` /
 	-- top-level `apps` above — that table gives a shortcut a KEYBIND, this

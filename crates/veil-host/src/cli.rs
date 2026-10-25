@@ -361,6 +361,7 @@ pub fn run_cli() -> std::io::Result<()> {
         .send(crate::InputCmd::SetMonitors {
             sizes,
             refresh_mhz: output.refresh_mhz(0),
+            refresh_per_monitor: (0..n_monitors).map(|i| output.refresh_mhz(i)).collect(),
         });
     eprintln!("[veil-host] retargeting compositor: {n_monitors} monitor(s), virtual space {total_w}x{total_h}");
 

@@ -17,6 +17,9 @@ pub struct BarLayout {
     pub theme: Theme,
     pub text: TextSystem,
     pub height: u32,
+    /// Workspace state per monitor (index == compositor monitor index): each
+    /// monitor has its own workspaces, so each bar draws its own.
+    ws: Vec<(usize, Vec<usize>)>,
 }
 
 impl Default for BarLayout {
@@ -48,6 +51,7 @@ impl BarLayout {
             theme: Theme::default(),
             text: TextSystem::new(&FontConfig::default()),
             height,
+            ws: Vec::new(),
         }
     }
 
@@ -62,14 +66,18 @@ impl BarLayout {
         needs_redraw
     }
 
-    /// Handle IPC workspace event.
-    pub fn on_workspaces(&mut self, active: usize, occupied: Vec<usize>) {
-        for w in &mut self.left {
-            if let Some(ws) = w.as_any_mut().downcast_mut::<WorkspacesWidget>() {
-                ws.active = active;
-                ws.occupied = occupied.clone();
-            }
-        }
+    /// Handle IPC workspace event: one (active, occupied) pair per monitor.
+    pub fn on_workspaces(&mut self, monitors: Vec<(usize, Vec<usize>)>) {
+        self.ws = monitors;
+    }
+
+    /// Monitor index behind a wl_output name. Veil names them `veil-host-<n>`;
+    /// anything else (or no name) is monitor 0.
+    fn monitor_of(output_name: &str) -> usize {
+        output_name
+            .strip_prefix("veil-host-")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
     }
 
     /// Handle IPC focus / window title event.
@@ -89,6 +97,20 @@ impl BarLayout {
                 aw.muted = muted;
             }
         }
+    }
+
+    /// Render the bar for the monitor behind `output_name`, using that
+    /// monitor's own workspace state.
+    pub fn render_for(&mut self, output_name: &str, width: u32, height: u32) -> Vec<u8> {
+        if let Some((active, occupied)) = self.ws.get(Self::monitor_of(output_name)).cloned() {
+            for w in &mut self.left {
+                if let Some(ws) = w.as_any_mut().downcast_mut::<WorkspacesWidget>() {
+                    ws.active = active;
+                    ws.occupied = occupied.clone();
+                }
+            }
+        }
+        self.render(width, height)
     }
 
     /// Render entire bar into an ARGB8888 byte vector suitable for Wayland SHM commit.
@@ -160,5 +182,29 @@ mod tests {
         // Verify not completely empty
         let non_zero = pixels.iter().any(|&b| b > 0);
         assert!(non_zero);
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::BarLayout;
+
+    #[test]
+    fn monitor_index_comes_from_the_veil_output_name() {
+        assert_eq!(BarLayout::monitor_of("veil-host-0"), 0);
+        assert_eq!(BarLayout::monitor_of("veil-host-1"), 1);
+        // Not ours (another compositor, or no name): monitor 0.
+        assert_eq!(BarLayout::monitor_of("DP-2"), 0);
+        assert_eq!(BarLayout::monitor_of(""), 0);
+    }
+
+    #[test]
+    fn each_monitor_draws_its_own_workspace_state() {
+        let mut bar = BarLayout::new(36);
+        bar.on_workspaces(vec![(1, vec![1]), (3, vec![3, 4])]);
+        let a = bar.render_for("veil-host-0", 400, 36);
+        let b = bar.render_for("veil-host-1", 400, 36);
+        assert!(!a.is_empty() && !b.is_empty());
+        assert_ne!(a, b, "monitor 1 must not render monitor 0's workspaces");
     }
 }

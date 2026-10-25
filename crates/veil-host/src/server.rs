@@ -107,6 +107,14 @@ use smithay::backend::allocator::{
 };
 
 use crate::detile::GpuImporter;
+use crate::ipc::IpcServer;
+use crate::layer_shell::LayerShellManager;
+use crate::supervisor::Supervisor;
+use smithay::desktop::{layer_map_for_output, LayerSurface, WindowSurfaceType};
+use smithay::wayland::shell::wlr_layer::{
+    Layer as WlrLayer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
+    WlrLayerShellState,
+};
 use crate::launcher::Launcher;
 use crate::layout::{Layout, Rect};
 use crate::powermenu::{PowerAction, PowerMenu};
@@ -335,6 +343,24 @@ pub struct State {
     pub keyboard: KeyboardHandle<Self>,
     pub pointer: PointerHandle<Self>,
     pub output: Output,
+    /// One smithay `Output` per monitor (index == monitor index). They exist
+    /// only as the key for layer-shell's `layer_map_for_output`; `[0]` is the
+    /// same object as `output` above.
+    pub layer_outputs: Vec<Output>,
+    pub layer_shell: LayerShellManager,
+    /// Veil IPC socket (shell components + `veil ctl`) and the supervisor
+    /// that spawns/restarts those components. Both are driven from the tick.
+    pub ipc: IpcServer,
+    pub supervisor: Supervisor,
+    /// Last workspace / focus payloads sent over IPC, so events only go out
+    /// when something actually changed. `None` forces a resend (new client).
+    pub ipc_last_ws: Option<String>,
+    pub ipc_last_focus: Option<String>,
+    /// The shell bar starts only after the real monitor layout is known
+    /// (`SetMonitors`), not at boot while the compositor still has its
+    /// 1280x720 startup guess.
+    pub shell_ready: bool,
+    pub shell_started: bool,
     /// One entry per physical display, side by side left-to-right in
     /// detection order (see `InputCmd::SetMonitors`). `monitors[0]` is what
     /// the old flat `output_w`/`output_h`/`pointer_pos`/`fullscreen`/
@@ -572,6 +598,15 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // Layer-shell surfaces (the bar etc.): arrange, initial configure,
+        // exclusive-zone retile. Their buffers still go through the normal
+        // cache below like any other surface.
+        let had_buffer = self.surface_buffers.contains_key(&surface.id());
+        let layer_monitor = layer_commit(self, surface);
+        if let Some(i) = layer_monitor {
+            tracing::debug!("layer-shell: commit on monitor {i}");
+        }
+
         // Pull the newly-attached buffer (if any) and cache it as RGBA
         // keyed by surface id. We re-composite from all caches on tick.
         enum Assign {
@@ -731,6 +766,20 @@ impl CompositorHandler for State {
                 if let Err(e) = popup.send_configure() {
                     tracing::warn!("popup initial configure failed: {e:?}");
                 }
+            }
+        }
+
+        // A layer surface just got (or lost) its first buffer: the built-in
+        // bar yields to the shell bar only once the shell bar has something
+        // to show, so retile this monitor now.
+        if let Some(idx) = layer_monitor {
+            let has_buffer = self.surface_buffers.contains_key(&surface.id());
+            if has_buffer != had_buffer && idx < self.monitors.len() {
+                tracing::info!(
+                    "layer-shell: surface on monitor {idx} {} its buffer",
+                    if has_buffer { "got" } else { "lost" }
+                );
+                relayout_monitor(self, idx);
             }
         }
     }
@@ -1240,6 +1289,159 @@ delegate_xdg_decoration!(State);
 delegate_viewporter!(State);
 delegate_fractional_scale!(State);
 delegate_presentation!(State);
+smithay::delegate_layer_shell!(State);
+
+impl WlrLayerShellHandler for State {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell.state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        wl_output: Option<wl_output::WlOutput>,
+        _layer: WlrLayer,
+        namespace: String,
+    ) {
+        // Every monitor has its own wl_output now, so an explicit
+        // output request resolves to that monitor; none means "where the pointer is".
+        let idx = wl_output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .and_then(|o| self.layer_outputs.iter().position(|x| *x == o))
+            .unwrap_or_else(|| active_monitor_idx(self))
+            .min(self.layer_outputs.len() - 1);
+        let output = self.layer_outputs[idx].clone();
+        let layer = LayerSurface::new(surface, namespace);
+        let mapped = layer_map_for_output(&output).map_layer(&layer);
+        if let Err(e) = mapped {
+            tracing::warn!("layer-shell: could not map '{}': {e}", layer.namespace());
+        }
+    }
+
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        for idx in 0..self.layer_outputs.len() {
+            let output = self.layer_outputs[idx].clone();
+            let found = {
+                let mut map = layer_map_for_output(&output);
+                let found = map
+                    .layers()
+                    .find(|l| l.layer_surface() == &surface)
+                    .cloned();
+                if let Some(l) = &found {
+                    map.unmap_layer(l);
+                }
+                found
+            };
+            if found.is_some() {
+                self.surface_buffers.remove(&surface.wl_surface().id());
+                if idx < self.monitors.len() {
+                    relayout_monitor(self, idx);
+                }
+                mark_dirty_full(self);
+                break;
+            }
+        }
+    }
+}
+
+/// Commit hook for layer surfaces: re-arrange, answer the mandatory initial
+/// configure, and retile the monitor if the exclusive zones changed.
+fn layer_commit(state: &mut State, surface: &WlSurface) -> Option<usize> {
+    let Some((idx, output, layer)) = state.layer_outputs.iter().enumerate().find_map(|(i, o)| {
+        layer_map_for_output(o)
+            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+            .cloned()
+            .map(|l| (i, o.clone(), l))
+    }) else {
+        return None;
+    };
+
+    let zone_changed = {
+        let mut map = layer_map_for_output(&output);
+        let before = map.non_exclusive_zone();
+        map.arrange();
+        map.non_exclusive_zone() != before
+    };
+
+    let initial_sent = with_states(surface, |s| {
+        s.data_map
+            .get::<LayerSurfaceData>()
+            .map(|d| d.lock().unwrap().initial_configure_sent)
+            .unwrap_or(false)
+    });
+    if !initial_sent {
+        layer.layer_surface().send_configure();
+    }
+    if zone_changed && idx < state.monitors.len() {
+        relayout_monitor(state, idx);
+    }
+    Some(idx)
+}
+
+/// Re-arrange every monitor's layer map (output size changed) and retile.
+fn rearrange_layers(state: &mut State) {
+    for idx in 0..state.layer_outputs.len().min(state.monitors.len()) {
+        let output = state.layer_outputs[idx].clone();
+        layer_map_for_output(&output).arrange();
+        relayout_monitor(state, idx);
+    }
+}
+
+/// Region left for tiled windows after layer-shell exclusive zones, as
+/// (x, y, w, h) in monitor-local pixels.
+fn layer_work_area(state: &State, idx: usize) -> (i32, i32, u32, u32) {
+    let (w, h) = (state.monitors[idx].output_w, state.monitors[idx].output_h);
+    let Some(out) = state.layer_outputs.get(idx) else {
+        return (0, 0, w, h);
+    };
+    let z = layer_map_for_output(out).non_exclusive_zone();
+    if z.size.w > 0 && z.size.h > 0 {
+        (z.loc.x, z.loc.y, z.size.w as u32, z.size.h as u32)
+    } else {
+        (0, 0, w, h)
+    }
+}
+
+/// Is the supervised `veil-bar` mapped on this monitor *and* showing
+/// something? Until its first buffer lands the built-in bar stays, so a monitor
+/// is never left with no bar while the shell bar is still starting.
+fn shell_bar_mapped(state: &State, idx: usize) -> bool {
+    state.bar.shell
+        && state.layer_outputs.get(idx).is_some_and(|o| {
+            layer_map_for_output(o).layers().any(|l| {
+                l.namespace() == "veil-bar"
+                    && state.surface_buffers.contains_key(&l.wl_surface().id())
+            })
+        })
+}
+
+/// The built-in 12px bar shows when it is enabled and no supervised bar has
+/// taken its place. If the shell bar dies its layer surface goes away, this
+/// flips back to true, and the old bar returns on its own.
+fn legacy_bar_visible(state: &State, idx: usize) -> bool {
+    state.bar.enabled && !shell_bar_mapped(state, idx)
+}
+
+/// Blit the layer surfaces on the given layers, bottom-most layer first.
+fn blit_layers(
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+    cache: &HashMap<ObjectId, SurfaceBuf>,
+    output: &Output,
+    layers: &[WlrLayer],
+) {
+    let map = layer_map_for_output(output);
+    for &layer in layers {
+        for ls in map.layers_on(layer) {
+            let Some(g) = map.layer_geometry(ls) else {
+                continue;
+            };
+            blit_subtree(back, w, h, cache, ls.wl_surface(), (g.loc.x, g.loc.y));
+        }
+    }
+}
 // drm_syncobj's manager/surface/timeline dispatch — smithay 0.7.0 uses the
 // classic Dispatch/GlobalDispatch pattern here (not Dispatch2, which is
 // master-branch-only and not in this pinned version), hence its own macro
@@ -2389,16 +2591,17 @@ fn relayout_monitor(state: &mut State, idx: usize) {
     // just below, ignoring this: fullscreen conventionally covers the bar
     // too, and composite() skips drawing the bar while something's
     // fullscreen, so nothing's left peeking out from underneath it.
-    let (tile_h, tile_y) = if state.bar.enabled {
-        let h = output_h.saturating_sub(BAR_HEIGHT);
+    let (zone_x, zone_y, zone_w, zone_h) = layer_work_area(state, idx);
+    let (tile_h, tile_y) = if legacy_bar_visible(state, idx) {
+        let h = zone_h.saturating_sub(BAR_HEIGHT);
         let y = if state.bar.position == veil_config::BarPosition::Top {
-            BAR_HEIGHT as i32
+            zone_y + BAR_HEIGHT as i32
         } else {
-            0
+            zone_y
         };
         (h, y)
     } else {
-        (output_h, 0)
+        (zone_h, zone_y)
     };
 
     // Everyone tiles exactly as if nothing were fullscreen — this is what
@@ -2409,8 +2612,9 @@ fn relayout_monitor(state: &mut State, idx: usize) {
     // rects depend on it for viewport position — both are what caused
     // windows to visibly jump/shrink/shift left on fullscreen toggle).
     // The fullscreen window's rect is simply overridden afterward.
-    let mut rects = state.monitors[idx].layout.rects(n, output_w, tile_h);
+    let mut rects = state.monitors[idx].layout.rects(n, zone_w, tile_h);
     for r in rects.iter_mut() {
+        r.x += zone_x;
         r.y += tile_y;
     }
     if let Some(fs_i) = fs_idx {
@@ -2580,6 +2784,9 @@ fn composite_one_monitor(
     wallpaper_chooser_present: bool,
 ) {
     let now = Instant::now();
+    // Decided before `m` below borrows state.monitors: whole-state reads
+    // (layer maps) can't overlap that borrow.
+    let legacy_bar = legacy_bar_visible(state, idx);
     // One `&mut Monitor` borrow, reused for every monitor-scoped field
     // access below via `m.field` — NOT re-indexing `state.monitors[idx]`
     // repeatedly, which the borrow checker can't prove disjoint across
@@ -2625,6 +2832,18 @@ fn composite_one_monitor(
 
     let ws = m.active_workspace;
     let back = &mut m.composite_buf;
+
+    // Layer-shell Background + Bottom sit under every window.
+    if let Some(out) = state.layer_outputs.get(idx) {
+        blit_layers(
+            back,
+            w,
+            h,
+            &state.surface_buffers,
+            out,
+            &[WlrLayer::Background, WlrLayer::Bottom],
+        );
+    }
 
     // Toplevels (root buffer + subsurfaces) then their popups, each at its
     // tiled rect origin. Popups are positioned relative to their toplevel.
@@ -2713,6 +2932,22 @@ fn composite_one_monitor(
         );
     }
 
+    // Layer-shell Top + Overlay over the windows. Top hides while a window is
+    // fullscreen here (same test as the built-in bar below); Overlay never does.
+    if let Some(out) = state.layer_outputs.get(idx) {
+        let fs_here = m.fullscreen.as_ref().is_some_and(|fs| {
+            state.toplevels.iter().any(|t| {
+                t.alive() && t.monitor == idx && t.workspace == ws && t.wl_surface().as_ref() == Some(fs)
+            })
+        });
+        let upper: &[WlrLayer] = if fs_here {
+            &[WlrLayer::Overlay]
+        } else {
+            &[WlrLayer::Top, WlrLayer::Overlay]
+        };
+        blit_layers(back, w, h, &state.surface_buffers, out, upper);
+    }
+
     // Cursor on top — only on the monitor the pointer is actually over.
     // Every other monitor renders with no cursor overlay this tick.
     if idx == active_idx {
@@ -2749,7 +2984,7 @@ fn composite_one_monitor(
             t.alive() && t.monitor == idx && t.workspace == ws && t.wl_surface().as_ref() == Some(fs)
         })
     });
-    if state.bar.enabled && !fullscreen_visible {
+    if legacy_bar && !fullscreen_visible {
         // Occupancy is THIS monitor's own — a window on another monitor's
         // workspace 3 has no bearing on what this monitor's bar shows for
         // its own workspace 3. Matches the dumb-separation model: each
@@ -2941,6 +3176,12 @@ fn composite_and_send(state: &mut State) {
                 .filter(|f| f.alive())
                 .filter_map(|f| f.wl_surface()),
         )
+        // Layer surfaces (bar etc.) need callbacks too or they never redraw.
+        .chain(state.layer_outputs.iter().flat_map(|o| {
+            let map = layer_map_for_output(o);
+            let v: Vec<WlSurface> = map.layers().map(|l| l.wl_surface().clone()).collect();
+            v
+        }))
         .collect();
     let now = monotonic_now();
     let seq = state.frame_serial;
@@ -3487,7 +3728,12 @@ fn pick_focus(
     let xi = x as i32;
     let yi = y as i32;
 
-    // Floating (override-redirect) windows first — they're painted on top of
+    // Layer-shell Overlay sits above everything, including X11 popups.
+    if let Some(hit) = pick_layer(state, monitor, x, y, &[WlrLayer::Overlay]) {
+        return Some(hit);
+    }
+
+    // Floating (override-redirect) windows next — they're painted on top of
     // everything in composite(), so they must win hit-testing too, or a
     // dropdown/menu would be unclickable over the tiled window beneath it.
     // Last-mapped wins on overlap, same "last wins" convention as popups below.
@@ -3512,6 +3758,12 @@ fn pick_focus(
             .find(|t| t.wl_surface().as_ref() == Some(fs))
             .and_then(|t| t.wl_surface())
             .map(|surf| (surf, (0.0, 0.0).into()));
+    }
+
+    // Layer-shell Top (the bar) is above tiled windows. Fullscreen returned
+    // above, which is also when Top is hidden in composite().
+    if let Some(hit) = pick_layer(state, monitor, x, y, &[WlrLayer::Top]) {
+        return Some(hit);
     }
 
     // Live toplevels paired with their tiled rect, topmost (last) first.
@@ -3562,6 +3814,48 @@ fn pick_focus(
         if let Some(buf) = state.surface_buffers.get(&root.id()) {
             if xi >= r.x && yi >= r.y && xi < r.x + buf.w as i32 && yi < r.y + buf.h as i32 {
                 return Some((root.clone(), (r.x as f64, r.y as f64).into()));
+            }
+        }
+    }
+    // Nothing tiled under the pointer: layer surfaces below the windows.
+    pick_layer(
+        state,
+        monitor,
+        x,
+        y,
+        &[WlrLayer::Bottom, WlrLayer::Background],
+    )
+}
+
+/// Hit-test layer surfaces on `layers` (given top-most first) at a
+/// monitor-local point. Returns the surface and its origin in compositor
+/// space, the same shape `pick_focus` hands back for windows.
+fn pick_layer(
+    state: &State,
+    monitor: usize,
+    x: f64,
+    y: f64,
+    layers: &[WlrLayer],
+) -> Option<(
+    WlSurface,
+    smithay::utils::Point<f64, smithay::utils::Logical>,
+)> {
+    let out = state.layer_outputs.get(monitor)?;
+    let map = layer_map_for_output(out);
+    for &layer in layers {
+        for ls in map.layers_on(layer).rev() {
+            let Some(g) = map.layer_geometry(ls) else {
+                continue;
+            };
+            let local = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+                x - g.loc.x as f64,
+                y - g.loc.y as f64,
+            ));
+            if let Some((surf, off)) = ls.surface_under(local, WindowSurfaceType::ALL) {
+                return Some((
+                    surf,
+                    ((g.loc.x + off.x) as f64, (g.loc.y + off.y) as f64).into(),
+                ));
             }
         }
     }
@@ -4005,10 +4299,15 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                 .change_current_state(Some(mode), None, None, None);
             request_wallpaper(state);
             // Retile everyone into the new output extent.
+            rearrange_layers(state);
             relayout(state);
         }
 
-        InputCmd::SetMonitors { sizes, refresh_mhz } => {
+        InputCmd::SetMonitors {
+            sizes,
+            refresh_mhz,
+            refresh_per_monitor,
+        } => {
             if sizes.is_empty() {
                 tracing::warn!("SetMonitors: empty sizes list, ignoring");
                 return;
@@ -4060,6 +4359,42 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                 .output
                 .change_current_state(Some(mode), None, None, None);
             state.composite_interval = composite_interval_for(state.fps_cfg, refresh_mhz);
+
+            // One smithay Output per monitor so layer-shell has a map to
+            // arrange against. Monitor 0 is `state.output` (updated above).
+            while state.layer_outputs.len() < state.monitors.len() {
+                let n = state.layer_outputs.len();
+                let out = Output::new(
+                    format!("veil-host-{n}"),
+                    PhysicalProperties {
+                        size: (0, 0).into(),
+                        subpixel: Subpixel::Unknown,
+                        make: "veil".into(),
+                        model: "host".into(),
+                    },
+                );
+                // A real wl_output per extra monitor: the bar (and any other
+                // layer client) puts one surface on each advertised output.
+                let _ = out.create_global::<State>(&state.display_handle);
+                state.layer_outputs.push(out);
+            }
+            state.layer_outputs.truncate(state.monitors.len());
+            for i in 1..state.monitors.len() {
+                let m = &state.monitors[i];
+                let mode = OutputMode {
+                    size: (m.output_w as i32, m.output_h as i32).into(),
+                    refresh: refresh_per_monitor.get(i).copied().unwrap_or(refresh_mhz) as i32,
+                };
+                let origin = (m.rect.x, 0);
+                state.layer_outputs[i].change_current_state(
+                    Some(mode),
+                    Some(Transform::Normal),
+                    None,
+                    Some(origin.into()),
+                );
+            }
+            rearrange_layers(state);
+            state.shell_ready = true;
             // First time through this also loads the configured wallpaper;
             // later (hotplug / mode change) it just re-scales for new sizes.
             let wp_cfg = veil_config::config_path()
@@ -4447,6 +4782,150 @@ impl XwmHandler for LoopData {
     }
 }
 
+// ─── IPC + supervised shell ───────────────────────────────────────────────────
+
+/// Title of the keyboard-focused xdg toplevel ("" for X11 / nothing focused).
+fn focused_title(state: &State) -> String {
+    let Some(surface) = state.keyboard.current_focus() else {
+        return String::new();
+    };
+    with_states(&surface, |s| {
+        s.data_map
+            .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+            .and_then(|d| d.lock().unwrap().title.clone())
+    })
+    .unwrap_or_default()
+}
+
+/// Run one `veil ctl` / shell-component command.
+fn ipc_command(
+    state: &mut State,
+    cmd: &str,
+    args: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    use veil_ipc::commands as c;
+    let str_arg = |key: &str| args.get(key).and_then(|v| v.as_str());
+    match cmd {
+        c::CONFIG_RELOAD => {
+            reload_config(state);
+            Ok(None)
+        }
+        c::WORKSPACE_SWITCH => {
+            let n = args
+                .get("n")
+                .and_then(|v| v.as_u64())
+                .ok_or("workspace.switch needs {\"n\": 1..9}")?;
+            dispatch_action(state, veil_config::Action::SwitchWorkspace(n.min(255) as u8));
+            Ok(None)
+        }
+        c::LAUNCH => {
+            let exec = str_arg("exec").ok_or("launch needs {\"exec\": \"...\"}")?;
+            spawn_command(&state.socket_name, exec);
+            Ok(None)
+        }
+        c::COMPONENT_RESTART => {
+            let name = str_arg("name").filter(|n| !n.is_empty()).ok_or("restart needs a component name")?;
+            state.supervisor.restart_component(name, Instant::now())?;
+            Ok(None)
+        }
+        other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// Drive IPC and the supervisor once. Called every tick; returns true when
+/// anything happened (so the tick doesn't back off).
+fn ipc_pump(state: &mut State) -> bool {
+    use veil_ipc::{topics, ClientMessage, ServerMessage};
+    let now = Instant::now();
+    let mut busy = false;
+
+    // Start the shell bar once the real monitors are known (not at boot,
+    // when sizes are still the startup guess), and if the config enables it.
+    if state.shell_ready && state.bar.shell && !state.shell_started {
+        state.shell_started = true;
+        if let Err(e) = state.supervisor.start_component("bar", now) {
+            tracing::warn!("shell: bar did not start: {e}");
+        }
+    }
+
+    for (cid, msg) in state.ipc.poll_incoming() {
+        busy = true;
+        match &msg {
+            ClientMessage::Hello { name, .. } => {
+                state.supervisor.on_hello(name, now);
+                state.ipc_last_ws = None; // new client: resend current state
+                state.ipc_last_focus = None;
+            }
+            ClientMessage::Subscribe { .. } => {
+                state.ipc_last_ws = None;
+                state.ipc_last_focus = None;
+            }
+            // Heartbeat direction is client -> server (see veil-bar).
+            ClientMessage::Ping => {
+                if let Some(name) = state.ipc.client_name(cid) {
+                    state.supervisor.on_pong(&name, now);
+                }
+            }
+            _ => {}
+        }
+        let palette = serde_json::json!({});
+        let config = serde_json::json!({});
+        if let Some(ClientMessage::Cmd { id, cmd, args }) =
+            state.ipc.process_message(cid, msg, palette, config)
+        {
+            let reply = match ipc_command(state, &cmd, &args) {
+                Ok(data) => ServerMessage::Reply { id, ok: true, error: None, data },
+                Err(e) => ServerMessage::Reply { id, ok: false, error: Some(e), data: None },
+            };
+            let _ = state.ipc.send_to(cid, &reply);
+        }
+    }
+
+    for name in state.supervisor.tick(now) {
+        if let Err(e) = state.supervisor.start_component(&name, now) {
+            tracing::warn!("shell: restarting {name} failed: {e}");
+        }
+    }
+
+    // Events, only on change. Each monitor has its own workspaces, so the
+    // payload carries one (active, occupied) entry per monitor, in monitor
+    // order; the bar picks its own by output name (`veil-host-<n>`).
+    let monitors: Vec<serde_json::Value> = (0..state.monitors.len())
+        .map(|mon| {
+            let mut occupied: Vec<usize> = state
+                .toplevels
+                .iter()
+                .filter(|t| t.alive() && t.monitor == mon)
+                .map(|t| t.workspace as usize + 1)
+                .collect();
+            occupied.sort_unstable();
+            occupied.dedup();
+            serde_json::json!({
+                "active": state.monitors[mon].active_workspace as usize + 1,
+                "occupied": occupied,
+            })
+        })
+        .collect();
+    let ws = serde_json::json!({ "monitors": monitors });
+    let ws_key = ws.to_string();
+    if state.ipc_last_ws.as_deref() != Some(ws_key.as_str()) {
+        tracing::debug!("ipc: workspaces changed, broadcasting");
+        state.ipc.broadcast(topics::WORKSPACES, ws);
+        state.ipc_last_ws = Some(ws_key);
+        busy = true;
+    }
+    let focus = serde_json::json!({ "title": focused_title(state) });
+    let focus_key = focus.to_string();
+    if state.ipc_last_focus.as_deref() != Some(focus_key.as_str()) {
+        tracing::debug!("ipc: focus changed, broadcasting");
+        state.ipc.broadcast(topics::FOCUS, focus);
+        state.ipc_last_focus = Some(focus_key);
+        busy = true;
+    }
+    state.ipc.flush_outgoing();
+    busy
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     socket_name: &str,
@@ -4637,6 +5116,14 @@ pub fn run(
         seat,
         keyboard,
         pointer,
+        layer_outputs: vec![output.clone()],
+        layer_shell: LayerShellManager::new::<State>(&dh),
+        ipc: IpcServer::new(),
+        supervisor: Supervisor::new(),
+        ipc_last_ws: None,
+        ipc_last_focus: None,
+        shell_ready: false,
+        shell_started: false,
         output,
         // Startup guess — one monitor, sized to the terminal cell estimate
         // or CLI -w/-h. Rebuilt to match reality shortly after by
@@ -4713,6 +5200,27 @@ pub fn run(
     let listener_source = ListeningSocketSource::with_name(socket_name)
         .map_err(|e| io::Error::other(format!("bind {socket_name}: {e}")))?;
     let bound_name = listener_source.socket_name().to_os_string();
+
+    // Veil IPC + supervised shell. The default socket path is shared by every
+    // veil of this user, so a second (nested) instance falls back to a
+    // per-instance path instead of stealing the first one's socket.
+    if let Err(e) = data.state.ipc.bind() {
+        let alt = veil_ipc::socket_path().with_file_name(format!(
+            "ipc-{}.sock",
+            bound_name.to_string_lossy()
+        ));
+        tracing::warn!("IPC: default socket unavailable ({e}); using {}", alt.display());
+        data.state.ipc = IpcServer::with_path(alt);
+        if let Err(e) = data.state.ipc.bind() {
+            tracing::error!("IPC: cannot bind a socket, shell components disabled: {e}");
+        }
+    }
+    data.state
+        .supervisor
+        .set_wayland_display(bound_name.to_string_lossy().into_owned());
+    data.state
+        .supervisor
+        .set_ipc_socket(data.state.ipc.path().clone());
     handle
         .insert_source(listener_source, |stream, _, data| {
             let _ = data
@@ -4871,6 +5379,11 @@ pub fn run(
             while let Ok(cmd) = input_rx.try_recv() {
                 busy = true;
                 apply_input(&mut data.state, cmd);
+            }
+
+            // IPC clients (bar, `veil ctl`), supervisor, workspace/focus events.
+            if ipc_pump(&mut data.state) {
+                busy = true;
             }
 
             // Copy-out: hosted client set clipboard → push to host compositor.

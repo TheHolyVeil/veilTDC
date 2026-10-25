@@ -8,9 +8,6 @@ edition = "2021"
 
 [lib]
 
-[[bin]]
-name = "veil-host"
-path = "src/main.rs"
 
 [dependencies]
 smithay            = { workspace = true }

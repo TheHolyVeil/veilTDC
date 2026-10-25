@@ -15,6 +15,17 @@ use smithay_client_toolkit::shell::wlr_layer::Layer;
 
 /// Run the bar main loop.
 pub fn run_bar() -> Result<(), String> {
+    // Reached via `veil shell bar` (no standalone binary any more), so the
+    // subscriber has to be set up here or every log line is dropped.
+    // stderr, not the default stdout: the session log only captures stderr.
+    let filter = std::env::var("VEIL_LOG")
+        .ok()
+        .and_then(|f| tracing_subscriber::EnvFilter::try_new(f).ok())
+        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
     tracing::info!("Starting veil-bar...");
 
     let mut bar = BarLayout::new(36);
@@ -66,16 +77,21 @@ pub fn run_bar() -> Result<(), String> {
     let mut frame_buf = FrameBuffer::new();
     let mut read_buf = [0u8; 4096];
     let mut last_tick = Instant::now();
+    let mut last_ping = Instant::now();
     let mut needs_redraw = true;
 
     // Initial render
-    client.present_for_each(|w, h| bar.render(w, h));
+    client.present_for_each(|out, w, h| bar.render_for(out, w, h));
 
     loop {
         // Dispatch Wayland events
+        let t_dispatch = Instant::now();
         if let Err(e) = client.dispatch() {
             tracing::error!("Wayland dispatch error: {e}");
             break;
+        }
+        if t_dispatch.elapsed() > Duration::from_millis(40) {
+            tracing::debug!("bar: slow dispatch {:?}", t_dispatch.elapsed());
         }
 
         // Process IPC messages
@@ -102,14 +118,27 @@ pub fn run_bar() -> Result<(), String> {
             while let Ok(Some(msg)) = frame_buf.next_frame::<ServerMessage>() {
                 match msg {
                     ServerMessage::Event { topic, data } => {
+                        tracing::debug!("bar: event {topic}");
                         if topic == "workspaces" {
-                            let active = data.get("active").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-                            let occupied = data
-                                .get("occupied")
+                            let monitors = data
+                                .get("monitors")
                                 .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .map(|m| {
+                                            let active =
+                                                m.get("active").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                                            let occupied = m
+                                                .get("occupied")
+                                                .and_then(|v| v.as_array())
+                                                .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                                                .unwrap_or_default();
+                                            (active, occupied)
+                                        })
+                                        .collect()
+                                })
                                 .unwrap_or_default();
-                            bar.on_workspaces(active, occupied);
+                            bar.on_workspaces(monitors);
                             needs_redraw = true;
                         } else if topic == "focus" {
                             let title = data
@@ -134,8 +163,17 @@ pub fn run_bar() -> Result<(), String> {
             }
         }
 
-        // Check widget tick updates
+        // Heartbeat: the protocol is client Ping -> server Pong, so the
+        // supervisor's liveness check (10 s) only holds if we keep pinging.
         let now = Instant::now();
+        if now.duration_since(last_ping) >= Duration::from_secs(3) {
+            last_ping = now;
+            if let Some(stream) = &mut ipc_stream {
+                let _ = stream.write_all(&veil_ipc::encode(&ClientMessage::Ping).unwrap_or_default());
+            }
+        }
+
+        // Check widget tick updates
         if now.duration_since(last_tick) >= Duration::from_millis(500) {
             last_tick = now;
             if bar.update(now) {
@@ -143,10 +181,17 @@ pub fn run_bar() -> Result<(), String> {
             }
         }
 
+        // Compositor resized or configured a surface (new monitor, mode
+        // change): the committed buffer is the old size until we redraw.
+        if client.take_reconfigured() {
+            needs_redraw = true;
+        }
+
         // Redraw when state changed
         if needs_redraw {
             needs_redraw = false;
-            client.present_for_each(|w, h| bar.render(w, h));
+            tracing::debug!("bar: presenting");
+            client.present_for_each(|out, w, h| bar.render_for(out, w, h));
         }
 
         // Sleep to cap wakeups

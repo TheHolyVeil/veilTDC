@@ -6,6 +6,7 @@
 use fontdue::{Font, FontSettings};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tiny_skia::{Color, Pixmap};
 
 pub mod bitmap5x7;
@@ -39,9 +40,12 @@ pub struct FontConfig {
 }
 
 pub struct TextSystem {
-    ui_font: Option<Font>,
-    mono_font: Option<Font>,
-    icon_font: Option<Font>,
+    // Arc: draw() needs an owned handle while it mutates the glyph cache, and
+    // cloning a parsed Font (megabytes of glyph tables) per character was
+    // ~470 ms per bar render. An Arc clone is a pointer copy.
+    ui_font: Option<Arc<Font>>,
+    mono_font: Option<Arc<Font>>,
+    icon_font: Option<Arc<Font>>,
     glyph_cache: HashMap<GlyphKey, CachedGlyph>,
 }
 
@@ -86,7 +90,7 @@ impl TextSystem {
         }
     }
 
-    fn select_font(&self, ch: char, role: Role) -> Option<&Font> {
+    fn select_font(&self, ch: char, role: Role) -> Option<&Arc<Font>> {
         // Automatic Nerd Font routing: Private Use Area (U+E000-U+F8FF) or common NF ranges
         let is_icon = matches!(ch as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD);
         if is_icon && self.icon_font.is_some() {
@@ -265,13 +269,13 @@ fn blend_pixel(dst: &mut tiny_skia::PremultipliedColorU8, color: Color, alpha: f
         .unwrap_or(*dst);
 }
 
-fn resolve_font(custom: Option<&str>, search_paths: &[&str]) -> Option<Font> {
+fn resolve_font(custom: Option<&str>, search_paths: &[&str]) -> Option<Arc<Font>> {
     if let Some(name_or_path) = custom {
         let p = Path::new(name_or_path);
         if p.exists() {
             if let Ok(bytes) = std::fs::read(p) {
                 if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                    return Some(font);
+                    return Some(Arc::new(font));
                 }
             }
         }
@@ -282,7 +286,7 @@ fn resolve_font(custom: Option<&str>, search_paths: &[&str]) -> Option<Font> {
         if p.exists() {
             if let Ok(bytes) = std::fs::read(p) {
                 if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                    return Some(font);
+                    return Some(Arc::new(font));
                 }
             }
         }

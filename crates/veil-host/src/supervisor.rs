@@ -225,6 +225,25 @@ impl Supervisor {
         }
     }
 
+    /// `veil ctl restart <n>`: kill whatever is running, forget past crashes
+    /// (this is also the way out of `Failed`), and start it again.
+    pub fn restart_component(&mut self, name: &str, now: Instant) -> Result<(), String> {
+        let record = self
+            .components
+            .get_mut(name)
+            .ok_or_else(|| format!("Unknown component: {name}"))?;
+        if let Some(mut child) = record.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        record.pid = None;
+        record.crash_history.clear();
+        if record.state != SupervisorState::Disabled {
+            record.state = SupervisorState::Stopped;
+        }
+        self.start_component(name, now)
+    }
+
     /// Periodic tick: checks child exit status, startup timeouts, and ping watchdog.
     pub fn tick(&mut self, now: Instant) -> Vec<String> {
         let mut to_start = Vec::new();
