@@ -6,6 +6,7 @@ members = [
     "crates/veil-login",
     "crates/veil-ipc",
     "crates/veil-text",
+    "crates/veil-palette",
     "crates/veil-ui",
     "crates/veil-bar",
     "crates/veil",

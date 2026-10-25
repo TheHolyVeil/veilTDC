@@ -1,0 +1,9 @@
+[package]
+name        = "veil-palette"
+version     = "0.1.0"
+edition     = "2021"
+description = "Wallpaper-to-palette derivation and OKLab mixing shared by every Veil surface"
+
+# Deliberately no dependencies: this runs in the compositor, the shell
+# components and (later) velogin, and it is pure arithmetic on bytes.
+[dependencies]

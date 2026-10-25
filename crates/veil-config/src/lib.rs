@@ -479,6 +479,9 @@ pub enum ThemeName {
     /// Abyss's personal pick — deep, desaturated sage green. Not derived
     /// from any published palette; tuned by hand.
     DeepSage,
+    /// Colours derived from the wallpaper (see `veil-palette`). Until a
+    /// wallpaper has loaded the host chrome shows the Deep Sage set.
+    Wallpaper,
 }
 
 impl ThemeName {
@@ -495,6 +498,7 @@ impl ThemeName {
             "monokai" => Self::Monokai,
             "onedark" | "one_dark" | "one-dark" => Self::OneDark,
             "deepsage" | "deep_sage" | "deep-sage" | "sage" => Self::DeepSage,
+            "wallpaper" => Self::Wallpaper,
             _ => Self::Default,
         }
     }
@@ -513,6 +517,7 @@ impl ThemeName {
             Self::Monokai => "monokai",
             Self::OneDark => "onedark",
             Self::DeepSage => "deepsage",
+            Self::Wallpaper => "wallpaper",
         }
     }
 }
@@ -654,7 +659,7 @@ impl Theme {
             // all that green, soft teal-sage accent. Not sourced from any
             // published palette — hand-tuned, so touch it before anyone
             // else's preferences do.
-            ThemeName::DeepSage => Theme {
+            ThemeName::DeepSage | ThemeName::Wallpaper => Theme {
                 background: [0x23, 0x2b, 0x26],
                 panel_bg: [0x1a, 0x20, 0x1c, 245],
                 border: [0x87, 0xa0, 0x8d, 255],
@@ -664,6 +669,34 @@ impl Theme {
                 accent: [0x7f, 0xae, 0x9b, 255],
                 highlight: [0x2f, 0x38, 0x30, 255],
             },
+        }
+    }
+}
+
+/// `theme_mode = "dark" | "light" | "auto"`: which way `theme = "wallpaper"`
+/// leans. `auto` goes light only for a very bright wallpaper. Presets ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeMode {
+    #[default]
+    Dark,
+    Light,
+    Auto,
+}
+
+impl ThemeMode {
+    fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "light" => Self::Light,
+            "auto" => Self::Auto,
+            _ => Self::Dark,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Auto => "auto",
         }
     }
 }
@@ -858,6 +891,8 @@ pub struct VeilConfig {
     /// purely for round-tripping to things like `veil-host probe`, which
     /// wants to display the name, not the raw color bytes.
     pub theme_name: ThemeName,
+    /// `theme_mode` — only meaningful for `theme = "wallpaper"`.
+    pub theme_mode: ThemeMode,
     /// `bar = { ... }` config — see `BarConfig`.
     pub bar: BarConfig,
     /// Static wallpaper, if configured.
@@ -881,6 +916,7 @@ impl Default for VeilConfig {
             background: [0x8c, 0x8c, 0x8c],
             theme: Theme::for_name(ThemeName::Default),
             theme_name: ThemeName::Default,
+            theme_mode: ThemeMode::Dark,
             bar: BarConfig::default(),
             wallpaper: None,
         }
@@ -1002,6 +1038,10 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
             .unwrap_or(theme.background),
         theme,
         theme_name,
+        theme_mode: gl
+            .get::<String>("theme_mode")
+            .map(|s| ThemeMode::from_str(&s))
+            .unwrap_or(d.theme_mode),
         bar: parse_bar(&gl, &d.bar),
         wallpaper: parse_wallpaper(&gl),
     })
