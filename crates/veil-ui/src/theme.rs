@@ -60,6 +60,29 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// Build a theme from the shared palette tokens (what the compositor
+    /// publishes). Keeps the string `tokens` field in step for code that
+    /// still reads hex.
+    pub fn from_palette(p: &veil_palette::Tokens) -> Self {
+        let entries = p.hex_entries();
+        let get = |name: &str| {
+            entries.iter().find(|(n, _)| *n == name).map(|(_, v)| v.clone()).unwrap_or_default()
+        };
+        Self::from_tokens(ThemeTokens {
+            bg: get("bg"),
+            surface: get("surface"),
+            surface_hi: get("surface_hi"),
+            border: get("border"),
+            text: get("text"),
+            text_dim: get("text_dim"),
+            accent: get("accent"),
+            accent_text: get("accent_text"),
+            ok: get("ok"),
+            warn: get("warn"),
+            err: get("err"),
+        })
+    }
+
     pub fn from_tokens(tokens: ThemeTokens) -> Self {
         Self {
             bg: hex_color(&tokens.bg),

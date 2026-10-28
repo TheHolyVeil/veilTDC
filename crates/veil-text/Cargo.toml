@@ -7,4 +7,5 @@ edition = "2021"
 fontdue   = { workspace = true }
 tiny-skia = { workspace = true }
 tracing   = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }

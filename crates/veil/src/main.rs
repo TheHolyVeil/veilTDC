@@ -62,6 +62,8 @@ fn handle_ctl(args: &[String]) -> std::io::Result<()> {
         println!("  reload                  Reload config.lua");
         println!("  restart <component>     Restart a supervised component");
         println!("  workspace <num>         Switch to workspace number");
+        println!("  wallpaper <file>        Show this image as the wallpaper (until the next config reload)");
+        println!("  palette                 Print the current palette as JSON");
         return Ok(());
     }
 
@@ -90,6 +92,21 @@ fn handle_ctl(args: &[String]) -> std::io::Result<()> {
             id: 1,
             cmd: "component.restart".into(),
             args: serde_json::json!({ "name": args.get(1).unwrap_or(&"".into()) }),
+        },
+        "wallpaper" => {
+            // The compositor reads the file, so hand it an absolute path.
+            let p = std::path::Path::new(args.get(1).map(|s| s.as_str()).unwrap_or(""));
+            let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            veil_ipc::ClientMessage::Cmd {
+                id: 1,
+                cmd: "wallpaper.set".into(),
+                args: serde_json::json!({ "path": abs.to_string_lossy() }),
+            }
+        }
+        "palette" => veil_ipc::ClientMessage::Cmd {
+            id: 1,
+            cmd: "palette.get".into(),
+            args: serde_json::Value::Null,
         },
         "workspace" => {
             let n: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);

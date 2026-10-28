@@ -837,6 +837,77 @@ fn parse_wallpaper(gl: &mlua::Table) -> Option<WallpaperConfig> {
     })
 }
 
+/// `font = { ... }`: the one place fonts are chosen. Every Veil surface (the
+/// bar, the launcher, the help overlay, ...) reads this, and editing it takes
+/// effect live. All fields are optional; unset ones fall back to a sensible
+/// installed font. A family can be a name ("Inter") or an absolute path.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FontSettings {
+    pub family: Option<String>,
+    pub mono: Option<String>,
+    pub icons: Option<String>,
+    /// Tried in order for characters the main font does not have.
+    pub fallback: Vec<String>,
+    /// Base size in pixels. Surfaces scale their text from it. `None` = 14.
+    pub size: Option<f32>,
+    pub weight: FontWeight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontWeight {
+    #[default]
+    Regular,
+    Bold,
+}
+
+impl FontWeight {
+    fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "bold" => Self::Bold,
+            _ => Self::Regular,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Regular => "regular",
+            Self::Bold => "bold",
+        }
+    }
+}
+
+/// `font = "Inter"` is shorthand for `font = { family = "Inter" }`.
+fn parse_font(gl: &mlua::Table, default: &FontSettings) -> FontSettings {
+    let non_empty = |s: String| Some(s).filter(|s| !s.trim().is_empty());
+    match gl.get::<mlua::Value>("font") {
+        Ok(mlua::Value::String(s)) => FontSettings {
+            family: s.to_str().ok().and_then(|s| non_empty(s.to_string())),
+            ..default.clone()
+        },
+        Ok(mlua::Value::Table(t)) => {
+            let get = |key: &str| t.get::<String>(key).ok().and_then(non_empty);
+            FontSettings {
+                family: get("family"),
+                mono: get("mono"),
+                icons: get("icons"),
+                fallback: t
+                    .get::<Vec<String>>("fallback")
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(non_empty)
+                    .collect(),
+                // Clamp so a typo ("size = 400") can't make the UI unusable.
+                size: t.get::<f32>("size").ok().filter(|s| *s > 0.0).map(|s| s.clamp(8.0, 48.0)),
+                weight: t
+                    .get::<String>("weight")
+                    .map(|s| FontWeight::from_str(&s))
+                    .unwrap_or(default.weight),
+            }
+        }
+        _ => default.clone(),
+    }
+}
+
 fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
     let Ok(bt) = gl.get::<mlua::Table>("bar") else {
         return default.clone();
@@ -893,6 +964,8 @@ pub struct VeilConfig {
     pub theme_name: ThemeName,
     /// `theme_mode` — only meaningful for `theme = "wallpaper"`.
     pub theme_mode: ThemeMode,
+    /// `font = { ... }` — see [`FontSettings`].
+    pub font: FontSettings,
     /// `bar = { ... }` config — see `BarConfig`.
     pub bar: BarConfig,
     /// Static wallpaper, if configured.
@@ -917,6 +990,7 @@ impl Default for VeilConfig {
             theme: Theme::for_name(ThemeName::Default),
             theme_name: ThemeName::Default,
             theme_mode: ThemeMode::Dark,
+            font: FontSettings::default(),
             bar: BarConfig::default(),
             wallpaper: None,
         }
@@ -1043,6 +1117,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
             .map(|s| ThemeMode::from_str(&s))
             .unwrap_or(d.theme_mode),
         bar: parse_bar(&gl, &d.bar),
+        font: parse_font(&gl, &d.font),
         wallpaper: parse_wallpaper(&gl),
     })
 }
@@ -1252,5 +1327,48 @@ mod app_bind_tests {
             launches(&cfg),
             vec![('b', "firefox".into()), ('t', "foot".into())]
         );
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    fn parse(src: &str) -> FontSettings {
+        let lua = mlua::Lua::new();
+        lua.load(src).exec().unwrap();
+        parse_font(&lua.globals(), &FontSettings::default())
+    }
+
+    #[test]
+    fn string_shorthand_sets_the_family() {
+        let f = parse(r#"font = "Inter""#);
+        assert_eq!(f.family.as_deref(), Some("Inter"));
+        assert_eq!(f.weight, FontWeight::Regular);
+    }
+
+    #[test]
+    fn table_form_reads_every_field() {
+        let f = parse(r#"font = { family = "Inter", mono = "JetBrains Mono", icons = "Symbols Nerd Font", fallback = { "Noto Sans CJK JP", "Noto Color Emoji" }, size = 15, weight = "bold" }"#);
+        assert_eq!(f.family.as_deref(), Some("Inter"));
+        assert_eq!(f.mono.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(f.icons.as_deref(), Some("Symbols Nerd Font"));
+        assert_eq!(f.fallback, vec!["Noto Sans CJK JP", "Noto Color Emoji"]);
+        assert_eq!(f.size, Some(15.0));
+        assert_eq!(f.weight, FontWeight::Bold);
+    }
+
+    #[test]
+    fn missing_or_junk_values_fall_back_to_defaults() {
+        assert_eq!(parse("x = 1"), FontSettings::default());
+        assert_eq!(parse(r#"font = { family = "  " }"#).family, None);
+        assert_eq!(parse("font = 42"), FontSettings::default());
+    }
+
+    #[test]
+    fn absurd_sizes_are_clamped_not_trusted() {
+        assert_eq!(parse("font = { size = 400 }").size, Some(48.0));
+        assert_eq!(parse("font = { size = 1 }").size, Some(8.0));
+        assert_eq!(parse("font = { size = -3 }").size, None);
     }
 }

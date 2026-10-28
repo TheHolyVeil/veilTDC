@@ -574,7 +574,7 @@ mod tests {
     use super::*;
 
     fn solid(r: u8, g: u8, b: u8, n: usize) -> Vec<u8> {
-        std::iter::repeat([r, g, b, 255]).take(n).flatten().collect()
+        std::iter::repeat_n([r, g, b, 255], n).flatten().collect()
     }
 
     fn mixed(parts: &[((u8, u8, u8), usize)]) -> Vec<u8> {
@@ -638,8 +638,8 @@ mod tests {
     #[test]
     fn small_logo_on_grey_does_not_pick_the_logo() {
         let mut data = solid(128, 128, 128, 10_000);
-        for px in data.chunks_exact_mut(4).take(100) {
-            px.copy_from_slice(&[230, 20, 20, 255]);
+        for px in data.as_chunks_mut::<4>().0.iter_mut().take(100) {
+            *px = [230, 20, 20, 255];
         }
         let a = accent_of(&data, 100, 100);
         assert!(a[0] < a[1] + 40, "picked the tiny red logo: {a:?}");
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn transparent_and_black_images_fall_back_sanely() {
-        let clear: Vec<u8> = std::iter::repeat([255u8, 0, 0, 0]).take(400).flatten().collect();
+        let clear: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 0], 400).flatten().collect();
         assert_eq!(accent_of(&clear, 20, 20), DEFAULT_ACCENT);
         let t = from_rgba(&solid(0, 0, 0, 400), 20, 20, Mode::Dark);
         assert!(contrast(t.accent, t.surface) >= 4.5);

@@ -48,6 +48,11 @@ impl WallpaperEngine {
     }
 
     /// Whether any wallpaper file is configured.
+    /// The config in effect (None when no wallpaper is configured).
+    pub fn config(&self) -> Option<&WallpaperConfig> {
+        self.cfg.as_ref()
+    }
+
     pub fn is_active(&self) -> bool {
         !self.files.is_empty()
     }

@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use veil_ipc::{ClientMessage, FrameBuffer, ServerMessage};
-use veil_ui::{LayerShellClient, SurfacePosition};
+use veil_ui::{LayerShellClient, SurfacePosition, Theme};
 use smithay_client_toolkit::shell::wlr_layer::Layer;
 
 /// Run the bar main loop.
@@ -69,6 +69,7 @@ pub fn run_bar() -> Result<(), String> {
                 "focus".into(),
                 "volume".into(),
                 "palette".into(),
+                "config".into(),
             ],
         };
         let _ = stream.write_all(&veil_ipc::encode(&sub).unwrap_or_default());
@@ -79,6 +80,10 @@ pub fn run_bar() -> Result<(), String> {
     let mut last_tick = Instant::now();
     let mut last_ping = Instant::now();
     let mut needs_redraw = true;
+    // Palette: `shown` is what is on screen right now; a `palette` event
+    // starts a crossfade from it to the new tokens.
+    let mut shown = veil_palette::Tokens::default();
+    let mut fade: Option<(veil_palette::Tokens, veil_palette::Tokens, Instant)> = None;
 
     // Initial render
     client.present_for_each(|out, w, h| bar.render_for(out, w, h));
@@ -140,6 +145,8 @@ pub fn run_bar() -> Result<(), String> {
                                 .unwrap_or_default();
                             bar.on_workspaces(monitors);
                             needs_redraw = true;
+                        } else if topic == "palette" {
+                            fade = Some((shown, tokens_from_json(&data), Instant::now()));
                         } else if topic == "focus" {
                             let title = data
                                 .get("title")
@@ -153,6 +160,29 @@ pub fn run_bar() -> Result<(), String> {
                             let muted = data.get("muted").and_then(|v| v.as_bool()).unwrap_or(false);
                             bar.on_volume(vol, muted);
                             needs_redraw = true;
+                        } else if topic == "config" {
+                            if let Some(font_val) = data.get("font") {
+                                let fc = veil_text::FontConfig::from_json(font_val);
+                                if bar.text.reload(&fc) {
+                                    tracing::info!("bar: font reloaded to {:?}", bar.text.resolved_paths());
+                                    needs_redraw = true;
+                                }
+                            }
+                        }
+                    }
+                    ServerMessage::Hello { palette, config, .. } => {
+                        // First palette: no fade, there is nothing to fade from.
+                        if palette.is_object() {
+                            shown = tokens_from_json(&palette);
+                            bar.theme = Theme::from_palette(&shown);
+                            fade = None;
+                            needs_redraw = true;
+                        }
+                        // Bootstrap font from the hello reply so the bar uses
+                        // the configured font from its very first frame.
+                        if let Some(font_val) = config.get("font") {
+                            let fc = veil_text::FontConfig::from_json(font_val);
+                            bar.text.reload(&fc);
                         }
                     }
                     ServerMessage::Pong => {
@@ -187,6 +217,19 @@ pub fn run_bar() -> Result<(), String> {
             needs_redraw = true;
         }
 
+        // Palette crossfade: step it, redraw, finish when the 600 ms is up.
+        if let Some((from, to, started)) = fade {
+            let elapsed = started.elapsed().as_millis() as u64;
+            if elapsed >= veil_palette::CROSSFADE_MS {
+                shown = to;
+                fade = None;
+            } else {
+                shown = veil_palette::mix(&from, &to, veil_palette::crossfade_progress(elapsed));
+            }
+            bar.theme = Theme::from_palette(&shown);
+            needs_redraw = true;
+        }
+
         // Redraw when state changed
         if needs_redraw {
             needs_redraw = false;
@@ -194,9 +237,15 @@ pub fn run_bar() -> Result<(), String> {
             client.present_for_each(|out, w, h| bar.render_for(out, w, h));
         }
 
-        // Sleep to cap wakeups
-        std::thread::sleep(Duration::from_millis(50));
+        // Sleep to cap wakeups; ~60 fps while a palette fade is running.
+        std::thread::sleep(Duration::from_millis(if fade.is_some() { 16 } else { 50 }));
     }
 
     Ok(())
+}
+
+/// A `palette` payload (flat `{"bg": "#rrggbb", ...}`) as tokens. Anything
+/// missing or unparsable keeps its default, so a partial palette still works.
+fn tokens_from_json(v: &serde_json::Value) -> veil_palette::Tokens {
+    veil_palette::Tokens::from_hex_lookup(|k| v.get(k).and_then(|x| x.as_str()))
 }

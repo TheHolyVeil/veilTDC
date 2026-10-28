@@ -21,6 +21,7 @@ pub mod layer_shell;
 pub mod layout;
 pub mod lockfile;
 pub mod media;
+pub mod palette;
 pub mod output;
 pub mod powermenu;
 pub mod seat;
@@ -48,6 +49,9 @@ pub struct HostConfig {
     pub keybinds: veil_config::Keybinds,
     pub background: [u8; 3],
     pub theme: veil_config::Theme,
+    pub theme_name: veil_config::ThemeName,
+    pub theme_mode: veil_config::ThemeMode,
+    pub font: veil_config::FontSettings,
     pub bar: veil_config::BarConfig,
 }
 
@@ -69,6 +73,9 @@ impl Default for HostConfig {
             keybinds: veil_config::Keybinds::default(),
             background: [0x8c, 0x8c, 0x8c],
             theme: veil_config::Theme::for_name(veil_config::ThemeName::Default),
+            theme_name: veil_config::ThemeName::Default,
+            theme_mode: veil_config::ThemeMode::Dark,
+            font: veil_config::FontSettings::default(),
             bar: veil_config::BarConfig::default(),
         }
     }
@@ -105,6 +112,9 @@ impl Host {
                     config.keybinds,
                     config.background,
                     config.theme,
+                    config.theme_name,
+                    config.theme_mode,
+                    config.font,
                     config.bar,
                 ) {
                     eprintln!("[veil-host] server exited: {e}");

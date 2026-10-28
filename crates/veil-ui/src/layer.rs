@@ -160,7 +160,9 @@ impl LayerShellClient {
                 // tiny-skia hands back premultiplied R,G,B,A bytes; wl_shm
                 // Argb8888 is B,G,R,A in memory (little-endian). Copying
                 // straight swaps red and blue on screen.
-                for (dst, src) in canvas[..len].chunks_exact_mut(4).zip(pixels[..len].chunks_exact(4)) {
+                let (dst_px, _) = canvas[..len].as_chunks_mut::<4>();
+                let (src_px, _) = pixels[..len].as_chunks::<4>();
+                for (dst, src) in dst_px.iter_mut().zip(src_px) {
                     dst[0] = src[2];
                     dst[1] = src[1];
                     dst[2] = src[0];

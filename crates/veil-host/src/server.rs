@@ -399,6 +399,23 @@ pub struct State {
     /// Resolved color set for launcher/help/sidebar chrome — see
     /// `veil_config::Theme`. Swapped wholesale on `reload_config`.
     pub theme: veil_config::Theme,
+    /// Which theme `theme` came from, and its light/dark lean.
+    pub theme_name: veil_config::ThemeName,
+    pub theme_mode: veil_config::ThemeMode,
+    /// The token set every shell surface draws from (wallpaper-derived or a
+    /// preset). `palette_dirty` makes the next IPC pump write palette.json
+    /// and broadcast a `palette` event.
+    pub palette: veil_palette::Tokens,
+    pub palette_dirty: bool,
+    /// What the last loaded wallpaper told us; kept so a `theme_mode` change
+    /// can re-derive without reloading the image.
+    pub wallpaper_sample: Option<veil_palette::Sample>,
+    /// The compositor's own text engine (launcher, help and the other
+    /// built-in overlays). Same fonts as the bar: both read `font = { ... }`.
+    pub text: veil_text::TextSystem,
+    /// Set when the font settings changed; the next IPC pump tells the
+    /// shell components so they reload their fonts too.
+    pub font_dirty: bool,
     pub bar: veil_config::BarConfig,
     /// `<mod_key>+D` app launcher — `Some` while the modal is open. See
     /// `crate::launcher`. Not itself a `keybinds` config entry, same as help.
@@ -1348,14 +1365,12 @@ impl WlrLayerShellHandler for State {
 /// Commit hook for layer surfaces: re-arrange, answer the mandatory initial
 /// configure, and retile the monitor if the exclusive zones changed.
 fn layer_commit(state: &mut State, surface: &WlSurface) -> Option<usize> {
-    let Some((idx, output, layer)) = state.layer_outputs.iter().enumerate().find_map(|(i, o)| {
+    let (idx, output, layer) = state.layer_outputs.iter().enumerate().find_map(|(i, o)| {
         layer_map_for_output(o)
             .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
             .cloned()
             .map(|l| (i, o.clone(), l))
-    }) else {
-        return None;
-    };
+    })?;
 
     let zone_changed = {
         let mut map = layer_map_for_output(&output);
@@ -1859,16 +1874,18 @@ fn spawn_command(socket_name: &str, exec: &str) {
     }
 }
 
-fn draw_osd_overlay(osd: &OsdNotification, back: &mut [u8], w: u32, h: u32) {
-    use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
+fn draw_osd_overlay(osd: &OsdNotification, ts: &mut veil_text::TextSystem, back: &mut [u8], w: u32, h: u32) {
+    use crate::font5x7::fill_rect;
+    use veil_text::Role;
 
-    let scale = 2u32;
-    let advance = (GLYPH_W + 1) * scale;
-    let line_h = (GLYPH_H + 3) * scale;
+    let font_size = 13.0_f32;
+    let (char_w, line_h_f) = ts.measure("M", Role::UI, font_size);
+    let char_w = char_w as i32;
+    let line_h = (line_h_f + 4.0) as i32;
     let pad = 12i32;
 
-    let title_line = osd.title.to_ascii_uppercase().to_string();
-    let body_line = osd.body.to_ascii_uppercase().to_string();
+    let title_line = osd.title.clone();
+    let body_line = osd.body.clone();
 
     let has_bar = osd.progress.is_some();
     let bar_h = if has_bar { 14i32 } else { 0i32 };
@@ -1883,10 +1900,10 @@ fn draw_osd_overlay(osd: &OsdNotification, back: &mut [u8], w: u32, h: u32) {
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(0)
-        .max(18) as u32;
-    let box_w = (text_cols * advance + pad as u32 * 2).max(220);
+        .max(18) as i32;
+    let box_w = (text_cols * char_w + pad * 2).max(220) as u32;
     let box_h =
-        lines.len() as u32 * line_h + pad as u32 * 2 + if has_bar { bar_h as u32 } else { 0 };
+        (lines.len() as i32 * line_h + pad * 2 + if has_bar { bar_h } else { 0 }) as u32;
 
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = (h as i32 / 12).max(10);
@@ -1912,7 +1929,7 @@ fn draw_osd_overlay(osd: &OsdNotification, back: &mut [u8], w: u32, h: u32) {
     fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 10, 20, 240]);
 
     for (i, line) in lines.iter().enumerate() {
-        let ty = y0 + pad + i as i32 * line_h as i32;
+        let ty = y0 + pad + i as i32 * line_h;
         let color = if i == 0 {
             if is_error {
                 [255, 100, 100, 255]
@@ -1922,12 +1939,12 @@ fn draw_osd_overlay(osd: &OsdNotification, back: &mut [u8], w: u32, h: u32) {
         } else {
             [220, 220, 240, 255]
         };
-        draw_text(back, w, h, x0 + pad, ty, scale, line, color);
+        ts.draw_rgba(back, w, h, line, (x0 + pad) as f32, ty as f32, Role::UI, font_size, color);
     }
 
     if let Some(pct) = osd.progress {
         let bar_x = x0 + pad;
-        let bar_y = y0 + pad + lines.len() as i32 * line_h as i32 + 2;
+        let bar_y = y0 + pad + lines.len() as i32 * line_h + 2;
         let inner_w = box_w - (pad as u32 * 2);
         let filled_w = (inner_w * pct.min(100) as u32) / 100;
 
@@ -1967,6 +1984,14 @@ pub fn reload_config(state: &mut State) {
         255,
     ];
     state.theme = new_cfg.theme;
+    state.theme_name = new_cfg.theme_name;
+    state.theme_mode = new_cfg.theme_mode;
+    if state.text.reload(&font_config_of(&new_cfg.font)) {
+        tracing::info!("fonts reloaded: {:?}", state.text.resolved_paths());
+        state.font_dirty = true;
+        mark_dirty_full(state);
+    }
+    refresh_palette(state);
     state.bar = new_cfg.bar;
     state.fps_cfg = new_cfg.fps;
     set_wallpaper_config(state, new_cfg.wallpaper.clone());
@@ -3025,7 +3050,7 @@ fn composite_one_monitor(
     let on_active = idx == active_idx;
     if show_help && on_active {
         let keybinds = state.keybinds.clone();
-        draw_help_overlay(&keybinds, &theme, back, w, h);
+        draw_help_overlay(&keybinds, &theme, &mut state.text, back, w, h);
     }
     if launcher_present && on_active {
         if let Some(ref l) = state.launcher {
@@ -3034,14 +3059,14 @@ fn composite_one_monitor(
             // already mutably borrowed. Clone the launcher (it's tiny) rather
             // than fighting the borrow checker with unsafe aliasing.
             let l = l.clone();
-            draw_launcher_overlay(&l, mod_key, &theme, back, w, h);
+            draw_launcher_overlay(&l, mod_key, &theme, &mut state.text, back, w, h);
         }
     }
     if power_menu_present && on_active {
         if let Some(ref pm) = state.power_menu {
             let mod_key = state.keybinds.mod_key;
             let pm = pm.clone();
-            draw_power_menu_overlay(&pm, mod_key, &theme, back, w, h);
+            draw_power_menu_overlay(&pm, mod_key, &theme, &mut state.text, back, w, h);
         }
     }
     if wallpaper_chooser_present && on_active {
@@ -3058,7 +3083,7 @@ fn composite_one_monitor(
         } else {
             if on_active {
                 let osd_clone = osd.clone();
-                draw_osd_overlay(&osd_clone, back, w, h);
+                draw_osd_overlay(&osd_clone, &mut state.text, back, w, h);
             }
             state.dirty = true;
         }
@@ -3223,8 +3248,52 @@ fn request_wallpaper(state: &mut State) {
     }
 }
 
+/// config.lua's `font = { ... }` as the text engine's own config type.
+pub fn font_config_of(s: &veil_config::FontSettings) -> veil_text::FontConfig {
+    veil_text::FontConfig {
+        family: s.family.clone(),
+        mono: s.mono.clone(),
+        icons: s.icons.clone(),
+        fallback: s.fallback.clone(),
+        size: s.size.unwrap_or(0.0),
+        bold: s.weight == veil_config::FontWeight::Bold,
+    }
+}
+
+/// Re-derive the shell palette from the current theme settings and the last
+/// wallpaper sample, and publish it if it changed.
+fn refresh_palette(state: &mut State) {
+    let tokens = if state.theme_name == veil_config::ThemeName::Wallpaper {
+        match state.wallpaper_sample {
+            Some(s) => veil_palette::from_accent(
+                s.accent,
+                veil_palette::resolve_mode(crate::palette::mode_of(state.theme_mode), s.lightness),
+            ),
+            None => veil_palette::Tokens::default(),
+        }
+    } else {
+        crate::palette::tokens_for_preset(&state.theme)
+    };
+    if state.theme_name == veil_config::ThemeName::Wallpaper {
+        // The host's own chrome (launcher, help, overlays) follows too.
+        state.theme = crate::palette::chrome_theme(&tokens);
+        mark_dirty_full(state);
+    }
+    if tokens != state.palette {
+        state.palette = tokens;
+        state.palette_dirty = true;
+    }
+}
+
 /// Install freshly loaded layers on every monitor of matching size.
 fn apply_wallpaper_layers(state: &mut State, layers: Vec<crate::wallpaper::Layer>) {
+    // The first layer is monitor 0's; it is what the theme is sampled from.
+    if state.theme_name == veil_config::ThemeName::Wallpaper {
+        if let Some(l) = layers.first() {
+            state.wallpaper_sample = Some(veil_palette::sample_rgba(&l.rgba, l.size.0, l.size.1));
+            refresh_palette(state);
+        }
+    }
     for m in &mut state.monitors {
         m.wallpaper = layers
             .iter()
@@ -3462,15 +3531,18 @@ fn draw_bar(
 fn draw_help_overlay(
     keybinds: &veil_config::Keybinds,
     theme: &veil_config::Theme,
+    ts: &mut veil_text::TextSystem,
     back: &mut [u8],
     w: u32,
     h: u32,
 ) {
-    use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
+    use crate::font5x7::fill_rect;
+    use veil_text::Role;
 
-    let scale = 2u32;
-    let advance = (GLYPH_W + 1) * scale;
-    let line_h = (GLYPH_H + 3) * scale;
+    let font_size = 13.0_f32;
+    let (char_w, line_h_f) = ts.measure("M", Role::UI, font_size);
+    let char_w = char_w as u32;
+    let line_h = (line_h_f + 4.0) as u32;
     let pad = 12i32;
 
     let mod_label = keybinds.mod_key.label().to_ascii_uppercase();
@@ -3495,7 +3567,7 @@ fn draw_help_overlay(
     lines.push("SHIFT+ALT+E  QUIT (GRACEFUL)".to_string());
 
     let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u32;
-    let box_w = text_cols * advance + pad as u32 * 2;
+    let box_w = text_cols * char_w + pad as u32 * 2;
     let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
@@ -3515,7 +3587,7 @@ fn draw_help_overlay(
     for (i, line) in lines.iter().enumerate() {
         let ty = y0 + pad + i as i32 * line_h as i32;
         let color = if i == 0 { theme.header } else { theme.text };
-        draw_text(back, w, h, x0 + pad, ty, scale, line, color);
+        ts.draw_rgba(back, w, h, line, (x0 + pad) as f32, ty as f32, Role::UI, font_size, color);
     }
 }
 
@@ -3525,16 +3597,19 @@ fn draw_launcher_overlay(
     launcher: &Launcher,
     mod_key: veil_config::ModKey,
     theme: &veil_config::Theme,
+    ts: &mut veil_text::TextSystem,
     back: &mut [u8],
     w: u32,
     h: u32,
 ) {
-    use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
+    use crate::font5x7::fill_rect;
+    use veil_text::Role;
 
     const PAGE_SIZE: usize = 10;
-    let scale = 2u32;
-    let advance = (GLYPH_W + 1) * scale;
-    let line_h = (GLYPH_H + 3) * scale;
+    let font_size = 13.0_f32;
+    let (char_w, line_h_f) = ts.measure("M", Role::UI, font_size);
+    let char_w = char_w as u32;
+    let line_h = (line_h_f + 4.0) as u32;
     let pad = 12i32;
 
     let mod_label = mod_key.label().to_ascii_uppercase();
@@ -3578,7 +3653,7 @@ fn draw_launcher_overlay(
         .max()
         .unwrap_or(0)
         .max(40) as u32;
-    let box_w = text_cols * advance + pad as u32 * 2;
+    let box_w = text_cols * char_w + pad as u32 * 2;
     let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
@@ -3616,7 +3691,7 @@ fn draw_launcher_overlay(
         } else {
             theme.text
         };
-        draw_text(back, w, h, x0 + pad, ty, scale, line, color);
+        ts.draw_rgba(back, w, h, line, (x0 + pad) as f32, ty as f32, Role::UI, font_size, color);
     }
 }
 
@@ -3626,15 +3701,18 @@ fn draw_power_menu_overlay(
     menu: &PowerMenu,
     mod_key: veil_config::ModKey,
     theme: &veil_config::Theme,
+    ts: &mut veil_text::TextSystem,
     back: &mut [u8],
     w: u32,
     h: u32,
 ) {
-    use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
+    use crate::font5x7::fill_rect;
+    use veil_text::Role;
 
-    let scale = 2u32;
-    let advance = (GLYPH_W + 1) * scale;
-    let line_h = (GLYPH_H + 3) * scale;
+    let font_size = 13.0_f32;
+    let (char_w, line_h_f) = ts.measure("M", Role::UI, font_size);
+    let char_w = char_w as u32;
+    let line_h = (line_h_f + 4.0) as u32;
     let pad = 12i32;
 
     let mod_label = mod_key.label().to_ascii_uppercase();
@@ -3655,7 +3733,7 @@ fn draw_power_menu_overlay(
         .max()
         .unwrap_or(0)
         .max(40) as u32;
-    let box_w = text_cols * advance + pad as u32 * 2;
+    let box_w = text_cols * char_w + pad as u32 * 2;
     let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
@@ -3681,7 +3759,7 @@ fn draw_power_menu_overlay(
     for (i, line) in lines.iter().enumerate() {
         let ty = y0 + pad + i as i32 * line_h as i32;
         let color = if i == 0 { theme.header } else { theme.text };
-        draw_text(back, w, h, x0 + pad, ty, scale, line, color);
+        ts.draw_rgba(back, w, h, line, (x0 + pad) as f32, ty as f32, Role::UI, font_size, color);
     }
 }
 
@@ -4828,6 +4906,32 @@ fn ipc_command(
             state.supervisor.restart_component(name, Instant::now())?;
             Ok(None)
         }
+        c::WALLPAPER_SET => {
+            // Runtime override: lasts until the next config reload, which puts
+            // back whatever config.lua says.
+            let path = std::path::PathBuf::from(
+                str_arg("path").ok_or("wallpaper.set needs {\"path\": \"...\"}")?,
+            );
+            if !path.is_file() {
+                return Err(format!("{} is not a file", path.display()));
+            }
+            let fit = state
+                .wallpaper
+                .config()
+                .map_or(veil_config::WallpaperFit::Fill, |c| c.fit);
+            set_wallpaper_config(
+                state,
+                Some(veil_config::WallpaperConfig {
+                    paths: vec![path],
+                    interval_secs: 0,
+                    shuffle: false,
+                    fit,
+                }),
+            );
+            Ok(None)
+        }
+        // Not in the doc's command list; handy for scripts and debugging.
+        "palette.get" => Ok(Some(crate::palette::to_json(&state.palette))),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -4868,8 +4972,8 @@ fn ipc_pump(state: &mut State) -> bool {
             }
             _ => {}
         }
-        let palette = serde_json::json!({});
-        let config = serde_json::json!({});
+        let palette = crate::palette::to_json(&state.palette);
+        let config = serde_json::json!({ "font": state.text.config().to_json() });
         if let Some(ClientMessage::Cmd { id, cmd, args }) =
             state.ipc.process_message(cid, msg, palette, config)
         {
@@ -4885,6 +4989,31 @@ fn ipc_pump(state: &mut State) -> bool {
         if let Err(e) = state.supervisor.start_component(&name, now) {
             tracing::warn!("shell: restarting {name} failed: {e}");
         }
+    }
+
+    // A new palette (wallpaper changed, theme edited): write palette.json
+    // for anything that wants to read it, and tell the components, which
+    // crossfade to it.
+    if state.palette_dirty {
+        state.palette_dirty = false;
+        if let Err(e) = crate::palette::write_file(&state.palette) {
+            tracing::warn!("palette.json not written: {e}");
+        }
+        tracing::debug!("ipc: palette changed, broadcasting");
+        state.ipc.broadcast(topics::PALETTE, crate::palette::to_json(&state.palette));
+        busy = true;
+    }
+
+    // Font changed (config reload changed font.family/size/etc): tell every
+    // component so it can reload its own TextSystem and redraw.
+    if state.font_dirty {
+        state.font_dirty = false;
+        tracing::debug!("ipc: font changed, broadcasting config event");
+        state.ipc.broadcast(
+            topics::CONFIG,
+            serde_json::json!({ "font": state.text.config().to_json() }),
+        );
+        busy = true;
     }
 
     // Events, only on change. Each monitor has its own workspaces, so the
@@ -4941,6 +5070,9 @@ pub fn run(
     keybinds: veil_config::Keybinds,
     background: [u8; 3],
     theme: veil_config::Theme,
+    theme_name: veil_config::ThemeName,
+    theme_mode: veil_config::ThemeMode,
+    font: veil_config::FontSettings,
     bar: veil_config::BarConfig,
 ) -> io::Result<()> {
     let composite_interval = composite_interval_for(fps, 60_000);
@@ -5139,7 +5271,14 @@ pub fn run(
         keybinds,
         show_help: false,
         background: [background[0], background[1], background[2], 255],
+        palette: crate::palette::initial_tokens(theme_name, &theme),
         theme,
+        theme_name,
+        theme_mode,
+        palette_dirty: true,
+        wallpaper_sample: None,
+        text: veil_text::TextSystem::new(&font_config_of(&font)),
+        font_dirty: true,
         bar,
         // No anchor client to spawn into (`veil-host start`) → open straight
         // to the launcher instead of an empty screen with no hint of what to press.

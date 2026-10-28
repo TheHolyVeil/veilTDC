@@ -238,6 +238,9 @@ pub fn run_cli() -> std::io::Result<()> {
     cfg.keybinds = vcfg.keybinds.clone();
     cfg.background = vcfg.background;
     cfg.theme = vcfg.theme;
+    cfg.theme_name = vcfg.theme_name;
+    cfg.theme_mode = vcfg.theme_mode;
+    cfg.font = vcfg.font.clone();
     cfg.bar = vcfg.bar.clone();
     cfg.fps = vcfg.fps; // 0 = match the display (resolved in SetMonitors)
     cfg.clipboard_sync = vcfg.clipboard_sync;

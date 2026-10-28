@@ -5093,6 +5093,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "veil-ipc",
+ "veil-palette",
  "veil-text",
  "veil-ui",
  "wayland-client",
@@ -5126,7 +5127,9 @@ dependencies = [
  "tracing-subscriber",
  "veil-config",
  "veil-ipc",
+ "veil-palette",
  "veil-render",
+ "veil-text",
  "wayland-protocols",
  "wayland-server",
  "wl-clipboard-rs",
@@ -5175,6 +5178,7 @@ name = "veil-text"
 version = "0.1.0"
 dependencies = [
  "fontdue",
+ "serde_json",
  "thiserror 2.0.21",
  "tiny-skia 0.11.4",
  "tracing",
@@ -5192,6 +5196,7 @@ dependencies = [
  "tiny-skia 0.11.4",
  "tracing",
  "veil-ipc",
+ "veil-palette",
  "veil-text",
  "wayland-client",
  "wayland-protocols-wlr",

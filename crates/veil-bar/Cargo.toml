@@ -9,6 +9,7 @@ description = "Supervised desktop bar for Veil"
 veil-ui                = { path = "../veil-ui" }
 veil-text              = { path = "../veil-text" }
 veil-ipc               = { path = "../veil-ipc" }
+veil-palette           = { path = "../veil-palette" }
 tiny-skia              = { workspace = true }
 smithay-client-toolkit = { workspace = true }
 wayland-client         = { workspace = true }

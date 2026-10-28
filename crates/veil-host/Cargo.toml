@@ -17,6 +17,8 @@ chrono             = { workspace = true }
 veil-render        = { path = "../veil-render" }
 veil-config        = { path = "../veil-config" }
 veil-ipc           = { path = "../veil-ipc" }
+veil-palette       = { path = "../veil-palette" }
+veil-text          = { path = "../veil-text" }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 crossterm          = { workspace = true }

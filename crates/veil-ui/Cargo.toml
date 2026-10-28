@@ -7,6 +7,7 @@ description = "Drawing kit, theme system, and layer-shell client runtime for Vei
 [dependencies]
 veil-text              = { path = "../veil-text" }
 veil-ipc               = { path = "../veil-ipc" }
+veil-palette           = { path = "../veil-palette" }
 tiny-skia              = { workspace = true }
 smithay-client-toolkit = { workspace = true }
 wayland-client         = { workspace = true }
