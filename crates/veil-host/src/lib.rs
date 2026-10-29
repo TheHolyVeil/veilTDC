@@ -37,6 +37,20 @@ pub use input_backend::{InputBackend, InputCtx, InputGeometry};
 pub use output::OutputBackend;
 pub use sink::Frame;
 
+/// Overrides for the shell plumbing. The defaults are what a real session
+/// wants; tests and unusual setups set them instead of touching the process
+/// environment.
+#[derive(Clone, Default)]
+pub struct ShellOptions {
+    /// IPC socket path (default: `$XDG_RUNTIME_DIR/veil/ipc.sock`).
+    pub ipc_socket: Option<std::path::PathBuf>,
+    /// Binary the supervisor runs as `<exe> shell <name>` (default: this one).
+    pub shell_exe: Option<std::path::PathBuf>,
+    /// Layer-shell namespaces trusted without being supervisor children
+    /// (`shell.trusted`): they may use the overlay layer and exclusive keyboard.
+    pub trusted_namespaces: Vec<String>,
+}
+
 pub struct HostConfig {
     pub socket_name: String,
     pub width: u32,
@@ -53,6 +67,7 @@ pub struct HostConfig {
     pub theme_mode: veil_config::ThemeMode,
     pub font: veil_config::FontSettings,
     pub bar: veil_config::BarConfig,
+    pub shell: ShellOptions,
 }
 
 /// Signal handle returned by [`Host::spawn`]; flip via [`Host::stop`]
@@ -77,6 +92,7 @@ impl Default for HostConfig {
             theme_mode: veil_config::ThemeMode::Dark,
             font: veil_config::FontSettings::default(),
             bar: veil_config::BarConfig::default(),
+            shell: ShellOptions::default(),
         }
     }
 }
@@ -116,6 +132,7 @@ impl Host {
                     config.theme_mode,
                     config.font,
                     config.bar,
+                    config.shell,
                 ) {
                     eprintln!("[veil-host] server exited: {e}");
                 }

@@ -108,12 +108,15 @@ use smithay::backend::allocator::{
 
 use crate::detile::GpuImporter;
 use crate::ipc::IpcServer;
-use crate::layer_shell::LayerShellManager;
+use crate::layer_shell::{
+    kbd_name, layer_name, GrabAction, KeyboardGrabWatchdog, LayerShellManager,
+};
+use smithay::wayland::shell::wlr_layer::KeyboardInteractivity as WlrKbd;
 use crate::supervisor::Supervisor;
 use smithay::desktop::{layer_map_for_output, LayerSurface, WindowSurfaceType};
 use smithay::wayland::shell::wlr_layer::{
-    Layer as WlrLayer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
-    WlrLayerShellState,
+    ExclusiveZone, Layer as WlrLayer, LayerSurface as WlrLayerSurface, LayerSurfaceCachedState,
+    LayerSurfaceConfigure, LayerSurfaceData, WlrLayerShellHandler, WlrLayerShellState,
 };
 use crate::launcher::Launcher;
 use crate::layout::{Layout, Rect};
@@ -798,6 +801,8 @@ impl CompositorHandler for State {
                 );
                 relayout_monitor(self, idx);
             }
+            // Mapped, unmapped or changed keyboard mode: who owns the keyboard?
+            update_layer_keyboard(self);
         }
     }
 
@@ -830,9 +835,12 @@ impl XdgShellHandler for State {
         // client has no "current display": Chromium-family browsers then can't
         // resolve the display for fullscreen / scale and back out of it.
         self.output.enter(&wl);
-        let serial = self.next_serial();
-        let kb = self.keyboard.clone();
-        kb.set_focus(self, Some(wl), serial);
+        // An exclusive layer grab (launcher, lock) keeps the keyboard.
+        if exclusive_grab_surface(self).is_none() {
+            let serial = self.next_serial();
+            let kb = self.keyboard.clone();
+            kb.set_focus(self, Some(wl), serial);
+        }
 
         // New windows land on whichever monitor is active right now — the
         // dumb-multi-monitor placement rule (see MULTI_MONITOR_SCOPE.md):
@@ -1317,9 +1325,16 @@ impl WlrLayerShellHandler for State {
         &mut self,
         surface: WlrLayerSurface,
         wl_output: Option<wl_output::WlOutput>,
-        _layer: WlrLayer,
+        layer_req: WlrLayer,
         namespace: String,
     ) {
+        if layer_req == WlrLayer::Overlay
+            && !layer_client_trusted(self, surface.wl_surface(), &namespace)
+        {
+            tracing::warn!(
+                "layer-shell: untrusted '{namespace}' asked for the overlay layer; it is shown on top instead"
+            );
+        }
         // Every monitor has its own wl_output now, so an explicit
         // output request resolves to that monitor; none means "where the pointer is".
         let idx = wl_output
@@ -1336,7 +1351,18 @@ impl WlrLayerShellHandler for State {
         }
     }
 
+    fn ack_configure(&mut self, surface: WlSurface, configure: LayerSurfaceConfigure) {
+        // An ack is proof of life for the exclusive-keyboard watchdog.
+        if let Some(w) = self.layer_shell.active_watchdog.as_mut() {
+            if w.key == surface.id() {
+                w.on_ack(u32::from(configure.serial), Instant::now());
+            }
+        }
+    }
+
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        let dead = surface.wl_surface().clone();
+        self.layer_shell.revoked.remove(&dead.id());
         for idx in 0..self.layer_outputs.len() {
             let output = self.layer_outputs[idx].clone();
             let found = {
@@ -1359,6 +1385,11 @@ impl WlrLayerShellHandler for State {
                 break;
             }
         }
+        // The keyboard may have been on it (exclusive or on-demand).
+        if self.keyboard.current_focus().as_ref() == Some(&dead) {
+            refocus_keyboard(self);
+        }
+        update_layer_keyboard(self);
     }
 }
 
@@ -1371,6 +1402,30 @@ fn layer_commit(state: &mut State, surface: &WlSurface) -> Option<usize> {
             .cloned()
             .map(|l| (i, o.clone(), l))
     })?;
+
+    // Section 15 trust rule. The client's pending state still says what it
+    // asked for, so this is re-applied on every commit to the state that is
+    // actually used.
+    let trusted = layer_client_trusted(state, surface, layer.namespace());
+    let policy = state.layer_shell.policy.clone();
+    let revoked = state.layer_shell.revoked.contains(&surface.id());
+    with_states(surface, |s| {
+        let mut g = s.cached_state.get::<LayerSurfaceCachedState>();
+        let cur = g.current();
+        let (l, mut k) =
+            policy.sanitize(trusted, layer.namespace(), cur.layer, cur.keyboard_interactivity);
+        if revoked && k == WlrKbd::Exclusive {
+            k = WlrKbd::OnDemand;
+        }
+        cur.layer = l;
+        cur.keyboard_interactivity = k;
+    });
+    // A commit is proof of life for the exclusive-keyboard watchdog.
+    if let Some(w) = state.layer_shell.active_watchdog.as_mut() {
+        if w.key == surface.id() {
+            w.record_activity(Instant::now());
+        }
+    }
 
     let zone_changed = {
         let mut map = layer_map_for_output(&output);
@@ -1401,6 +1456,222 @@ fn rearrange_layers(state: &mut State) {
         layer_map_for_output(&output).arrange();
         relayout_monitor(state, idx);
     }
+}
+
+// ─── layer-shell keyboard ownership (sections 4, 6.1 and 15) ─────────────────
+
+/// Is the client behind this layer surface trusted: spawned by the supervisor
+/// (checked by PID, since a namespace string proves nothing) or listed in
+/// `shell.trusted`?
+fn layer_client_trusted(state: &State, surface: &WlSurface, namespace: &str) -> bool {
+    let supervised = surface
+        .client()
+        .and_then(|c| c.get_credentials(&state.display_handle).ok())
+        .is_some_and(|cr| cr.pid > 0 && state.supervisor.is_supervised_pid(cr.pid as u32));
+    state.layer_shell.policy.is_trusted(namespace, supervised)
+}
+
+fn find_layer_by_id(state: &State, id: &ObjectId) -> Option<LayerSurface> {
+    state.layer_outputs.iter().find_map(|o| {
+        layer_map_for_output(o)
+            .layers()
+            .find(|l| &l.wl_surface().id() == id)
+            .cloned()
+    })
+}
+
+fn find_layer_for_surface(state: &State, surface: &WlSurface) -> Option<LayerSurface> {
+    state.layer_outputs.iter().find_map(|o| {
+        layer_map_for_output(o)
+            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+            .cloned()
+    })
+}
+
+/// The exclusive-keyboard holder, if any: a mapped, un-revoked layer surface
+/// on overlay (preferred) or top. The trust rule already downgraded anything
+/// that may not hold it (see `layer_commit`).
+fn exclusive_grab_surface(state: &State) -> Option<WlSurface> {
+    for layer in [WlrLayer::Overlay, WlrLayer::Top] {
+        for o in &state.layer_outputs {
+            let map = layer_map_for_output(o);
+            // Later-mapped surfaces win within a layer.
+            for ls in map.layers_on(layer).rev() {
+                let id = ls.wl_surface().id();
+                if ls.cached_state().keyboard_interactivity == WlrKbd::Exclusive
+                    && state.surface_buffers.contains_key(&id)
+                    && !state.layer_shell.revoked.contains(&id)
+                {
+                    return Some(ls.wl_surface().clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Re-evaluate who owns the keyboard after a layer surface mapped, unmapped
+/// or changed its keyboard mode.
+fn update_layer_keyboard(state: &mut State) {
+    match exclusive_grab_surface(state) {
+        Some(s) => {
+            let id = s.id();
+            if state.layer_shell.active_watchdog.as_ref().is_none_or(|w| w.key != id) {
+                state.layer_shell.active_watchdog =
+                    Some(KeyboardGrabWatchdog::new(id, Instant::now()));
+            }
+            if state.keyboard.current_focus().as_ref() != Some(&s) {
+                let serial = state.next_serial();
+                let kb = state.keyboard.clone();
+                kb.set_focus(state, Some(s), serial);
+            }
+        }
+        None => {
+            if state.layer_shell.active_watchdog.take().is_some() {
+                refocus_keyboard(state);
+            }
+        }
+    }
+}
+
+/// Drive the exclusive-keyboard watchdog: probe a quiet holder, and take the
+/// keyboard back from one that stopped answering. The compositor-side half of
+/// "a hung launcher can never lock the user out".
+fn layer_keyboard_tick(state: &mut State, now: Instant) {
+    let Some(w) = state.layer_shell.active_watchdog.as_ref() else {
+        return;
+    };
+    let id = w.key.clone();
+    match w.tick(now) {
+        GrabAction::Idle => {}
+        GrabAction::Probe => {
+            if let Some(ls) = find_layer_by_id(state, &id) {
+                let serial = ls.layer_surface().send_configure();
+                if let Some(w) = state.layer_shell.active_watchdog.as_mut() {
+                    w.probe_sent(u32::from(serial), now);
+                }
+            }
+        }
+        GrabAction::Revoke => {
+            let ns = find_layer_by_id(state, &id)
+                .map(|l| l.namespace().to_string())
+                .unwrap_or_default();
+            tracing::warn!("layer-shell: '{ns}' stopped answering; exclusive keyboard grab revoked");
+            state.layer_shell.revoked.insert(id.clone());
+            state.layer_shell.active_watchdog = None;
+            // Downgrade now rather than at its next commit (it may never commit).
+            if let Some(ls) = find_layer_by_id(state, &id) {
+                with_states(ls.wl_surface(), |s| {
+                    let mut g = s.cached_state.get::<LayerSurfaceCachedState>();
+                    let cur = g.current();
+                    if cur.keyboard_interactivity == WlrKbd::Exclusive {
+                        cur.keyboard_interactivity = WlrKbd::OnDemand;
+                    }
+                });
+            }
+            refocus_keyboard(state);
+            update_layer_keyboard(state);
+            state.show_osd(
+                "SHELL",
+                format!("{} STOPPED ANSWERING", ns.trim_start_matches("veil-").to_uppercase()),
+                None,
+                Duration::from_secs(4),
+            );
+        }
+    }
+}
+
+/// A left press. A layer surface under the pointer that accepts keyboard
+/// input takes it (on-demand mode); a press anywhere else gives it back to the
+/// windows. Returns true when a layer surface consumed the click.
+fn layer_click_focus(state: &mut State) -> bool {
+    if exclusive_grab_surface(state).is_some() {
+        return false; // the grab already owns the keyboard
+    }
+    let hit = state
+        .pointer
+        .current_focus()
+        .and_then(|s| find_layer_for_surface(state, &s));
+    match hit {
+        Some(ls) => {
+            if ls.cached_state().keyboard_interactivity != WlrKbd::None {
+                let s = ls.wl_surface().clone();
+                if state.keyboard.current_focus().as_ref() != Some(&s) {
+                    let serial = state.next_serial();
+                    let kb = state.keyboard.clone();
+                    kb.set_focus(state, Some(s), serial);
+                }
+            }
+            true
+        }
+        None => {
+            let on_layer = state
+                .keyboard
+                .current_focus()
+                .is_some_and(|f| find_layer_for_surface(state, &f).is_some());
+            if on_layer {
+                refocus_keyboard(state);
+            }
+            false
+        }
+    }
+}
+
+/// `layers.list`: what the compositor believes about every layer surface,
+/// for `veil ctl` and the headless integration tests.
+fn layers_json(state: &State) -> serde_json::Value {
+    let focus = state.keyboard.current_focus();
+    let grab = exclusive_grab_surface(state).map(|s| s.id());
+    let (mut focus_ns, mut grab_ns): (Option<String>, Option<String>) = (None, None);
+    let mut outputs = Vec::new();
+    for (i, o) in state.layer_outputs.iter().enumerate() {
+        let map = layer_map_for_output(o);
+        let z = map.non_exclusive_zone();
+        let mut layers = Vec::new();
+        for layer in [WlrLayer::Background, WlrLayer::Bottom, WlrLayer::Top, WlrLayer::Overlay] {
+            for ls in map.layers_on(layer) {
+                let cs = ls.cached_state();
+                let id = ls.wl_surface().id();
+                if focus.as_ref() == Some(ls.wl_surface()) {
+                    focus_ns = Some(ls.namespace().to_string());
+                }
+                if grab.as_ref() == Some(&id) {
+                    grab_ns = Some(ls.namespace().to_string());
+                }
+                let g = map.layer_geometry(ls).unwrap_or_default();
+                let zone = match cs.exclusive_zone {
+                    ExclusiveZone::Exclusive(n) => n as i64,
+                    ExclusiveZone::Neutral => 0,
+                    ExclusiveZone::DontCare => -1,
+                };
+                layers.push(serde_json::json!({
+                    "namespace": ls.namespace(),
+                    "layer": layer_name(cs.layer),
+                    "keyboard": kbd_name(cs.keyboard_interactivity),
+                    "exclusive_zone": zone,
+                    "mapped": state.surface_buffers.contains_key(&id),
+                    "revoked": state.layer_shell.revoked.contains(&id),
+                    "geometry": [g.loc.x, g.loc.y, g.size.w, g.size.h],
+                }));
+            }
+        }
+        outputs.push(serde_json::json!({
+            "index": i,
+            "name": o.name(),
+            "work_area": [z.loc.x, z.loc.y, z.size.w, z.size.h],
+            "layers": layers,
+        }));
+    }
+    let keyboard_focus = match (&focus_ns, &focus) {
+        (Some(ns), _) => serde_json::json!(ns),
+        (None, Some(_)) => serde_json::json!("toplevel"),
+        (None, None) => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "outputs": outputs,
+        "keyboard_focus": keyboard_focus,
+        "grab": grab_ns,
+    })
 }
 
 /// Region left for tiled windows after layer-shell exclusive zones, as
@@ -2691,12 +2962,15 @@ fn relayout_monitor(state: &mut State, idx: usize) {
 fn refocus_keyboard(state: &mut State) {
     let idx = active_monitor_idx(state);
     let ws = state.monitors[idx].active_workspace;
-    let target = state
-        .toplevels
-        .iter()
-        .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
-        .nth(state.monitors[idx].layout.focused)
-        .and_then(|t| t.wl_surface());
+    // An exclusive layer grab outranks every window.
+    let target = exclusive_grab_surface(state).or_else(|| {
+        state
+            .toplevels
+            .iter()
+            .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
+            .nth(state.monitors[idx].layout.focused)
+            .and_then(|t| t.wl_surface())
+    });
     let serial = state.next_serial();
     let kb = state.keyboard.clone();
     kb.set_focus(state, target, serial);
@@ -4315,7 +4589,8 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // not whatever keyboard nav last visited. A click inside the
             // already-focused tile hits `t_idx == layout.focused` and no-ops,
             // so ordinary clicks/typing inside an app are unaffected.
-            if pressed && button == BTN_LEFT {
+            let layer_clicked = pressed && button == BTN_LEFT && layer_click_focus(state);
+            if pressed && button == BTN_LEFT && !layer_clicked {
                 let (px, py) = state.monitors[idx].pointer_pos;
                 if let Some(t_idx) = toplevel_at(state, idx, px, py) {
                     if t_idx != state.monitors[idx].layout.focused {
@@ -4637,7 +4912,7 @@ impl XwmHandler for State {
         // Only if already paired with a wl_surface (usually is, by this
         // point) — if not yet, it'll pick up focus on the next natural
         // refocus_keyboard call (prune tick, next window open/close, etc).
-        if let Some(wl) = wl {
+        if let Some(wl) = wl.filter(|_| exclusive_grab_surface(self).is_none()) {
             let serial = self.next_serial();
             let kb = self.keyboard.clone();
             kb.set_focus(self, Some(wl), serial);
@@ -4932,6 +5207,15 @@ fn ipc_command(
         }
         // Not in the doc's command list; handy for scripts and debugging.
         "palette.get" => Ok(Some(crate::palette::to_json(&state.palette))),
+        "layers.list" => Ok(Some(layers_json(state))),
+        "component.status" => Ok(Some(serde_json::Value::Array(
+            state
+                .supervisor
+                .status()
+                .into_iter()
+                .map(|(name, st, pid)| serde_json::json!({ "name": name, "state": st, "pid": pid }))
+                .collect(),
+        ))),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -4990,6 +5274,18 @@ fn ipc_pump(state: &mut State) -> bool {
             tracing::warn!("shell: restarting {name} failed: {e}");
         }
     }
+    // One OSD notice per component that gave up (crash loop).
+    for name in state.supervisor.take_failed() {
+        tracing::error!("shell: {name} is crash-looping; not restarting (veil ctl restart {name})");
+        state.show_osd(
+            "SHELL",
+            format!("{} KEEPS CRASHING", name.to_uppercase()),
+            None,
+            Duration::from_secs(6),
+        );
+        busy = true;
+    }
+    layer_keyboard_tick(state, now);
 
     // A new palette (wallpaper changed, theme edited): write palette.json
     // for anything that wants to read it, and tell the components, which
@@ -5074,6 +5370,7 @@ pub fn run(
     theme_mode: veil_config::ThemeMode,
     font: veil_config::FontSettings,
     bar: veil_config::BarConfig,
+    shell_opts: crate::ShellOptions,
 ) -> io::Result<()> {
     let composite_interval = composite_interval_for(fps, 60_000);
     let display: Display<State> =
@@ -5343,6 +5640,17 @@ pub fn run(
     // Veil IPC + supervised shell. The default socket path is shared by every
     // veil of this user, so a second (nested) instance falls back to a
     // per-instance path instead of stealing the first one's socket.
+    if let Some(path) = shell_opts.ipc_socket.clone() {
+        data.state.ipc = IpcServer::with_path(path);
+    }
+    if let Some(exe) = shell_opts.shell_exe.clone() {
+        data.state.supervisor.set_exe(exe);
+    }
+    data.state
+        .layer_shell
+        .policy
+        .trusted_namespaces
+        .extend(shell_opts.trusted_namespaces.iter().cloned());
     if let Err(e) = data.state.ipc.bind() {
         let alt = veil_ipc::socket_path().with_file_name(format!(
             "ipc-{}.sock",

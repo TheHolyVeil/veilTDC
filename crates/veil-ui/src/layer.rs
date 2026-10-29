@@ -345,15 +345,14 @@ impl PointerHandler for ClientState {
                         y: self.mouse_y,
                     });
                 }
-                PointerEventKind::Press { button, .. } => {
-                    if button == 272 {
+                PointerEventKind::Press { button, .. }
+                    if button == 272 => {
                         // Left mouse button
                         let _ = self.input_tx.send(UiInputEvent::Press {
                             x: self.mouse_x,
                             y: self.mouse_y,
                         });
                     }
-                }
                 _ => {}
             }
         }

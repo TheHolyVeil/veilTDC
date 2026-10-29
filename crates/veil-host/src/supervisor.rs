@@ -39,6 +39,8 @@ pub struct ComponentRecord {
     pub pid: Option<u32>,
     /// Timestamps of crashes within the last 60 seconds.
     pub crash_history: VecDeque<Instant>,
+    /// `Failed` was already reported to the user (one OSD notice per failure).
+    pub failed_announced: bool,
 }
 
 impl ComponentRecord {
@@ -54,8 +56,23 @@ impl ComponentRecord {
             child: None,
             pid: None,
             crash_history: VecDeque::new(),
+            failed_announced: false,
         }
     }
+}
+
+/// Kill a child and everything in its process group, then reap it.
+fn kill_group(child: &mut Child) {
+    // The child leads its own group (`process_group(0)` at spawn), so a
+    // negative pid reaches anything it forked too.
+    let pid = child.id() as i32;
+    if pid > 0 {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub struct Supervisor {
@@ -97,6 +114,54 @@ impl Supervisor {
 
     pub fn set_ipc_socket(&mut self, path: PathBuf) {
         self.ipc_socket = Some(path);
+    }
+
+    /// Run components from this binary instead of `current_exe()` (tests).
+    pub fn set_exe(&mut self, path: PathBuf) {
+        self.exe_path = Some(path);
+    }
+
+    /// Is `pid` a live child this supervisor spawned? This is what the
+    /// layer-shell trust rule asks; a namespace string proves nothing.
+    pub fn is_supervised_pid(&self, pid: u32) -> bool {
+        self.components
+            .values()
+            .any(|r| r.child.is_some() && r.pid == Some(pid))
+    }
+
+    /// Names that entered `Failed` since the last call, once each, so the
+    /// compositor can show one OSD notice per failure.
+    pub fn take_failed(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, r) in self.components.iter_mut() {
+            if matches!(r.state, SupervisorState::Failed { .. }) && !r.failed_announced {
+                r.failed_announced = true;
+                out.push(name.clone());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// (name, state, pid) for every component, sorted by name.
+    pub fn status(&self) -> Vec<(String, &'static str, Option<u32>)> {
+        let mut v: Vec<_> = self
+            .components
+            .values()
+            .map(|r| {
+                let st = match r.state {
+                    SupervisorState::Disabled => "disabled",
+                    SupervisorState::Starting { .. } => "starting",
+                    SupervisorState::Running { .. } => "running",
+                    SupervisorState::Backoff { .. } => "backoff",
+                    SupervisorState::Failed { .. } => "failed",
+                    SupervisorState::Stopped => "stopped",
+                };
+                (r.name.clone(), st, r.pid)
+            })
+            .collect();
+        v.sort();
+        v
     }
 
     fn register_defaults(&mut self) {
@@ -194,6 +259,9 @@ impl Supervisor {
         // Spawn child
         let mut cmd = Command::new(&exe);
         cmd.arg("shell").arg(name);
+        // Own process group: a restart or compositor exit kills the whole
+        // tree, not just the direct child.
+        cmd.process_group(0);
 
         if let Some(display) = wayland_display {
             cmd.env("WAYLAND_DISPLAY", display);
@@ -233,11 +301,11 @@ impl Supervisor {
             .get_mut(name)
             .ok_or_else(|| format!("Unknown component: {name}"))?;
         if let Some(mut child) = record.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_group(&mut child);
         }
         record.pid = None;
         record.crash_history.clear();
+        record.failed_announced = false;
         if record.state != SupervisorState::Disabled {
             record.state = SupervisorState::Stopped;
         }
@@ -253,6 +321,11 @@ impl Supervisor {
             if let Some(mut child) = record.child.take() {
                 match child.try_wait() {
                     Ok(Some(status)) => {
+                        // The leader is gone; sweep whatever it left in its
+                        // group so a crashed component leaks no orphans.
+                        unsafe {
+                            libc::kill(-(child.id() as i32), libc::SIGKILL);
+                        }
                         record.pid = None;
                         if status.success() && record.kind != ComponentKind::Persistent {
                             // Clean exit of on-demand or one-shot
@@ -278,7 +351,7 @@ impl Supervisor {
                     if now.saturating_duration_since(spawned_at) > Self::START_TIMEOUT {
                         // Timed out waiting for hello
                         if let Some(mut child) = record.child.take() {
-                            let _ = child.kill();
+                            kill_group(&mut child);
                         }
                         record.pid = None;
                         Self::handle_crash(record, now);
@@ -293,7 +366,7 @@ impl Supervisor {
                     // Watchdog: check pong for persistent components
                     if record.kind == ComponentKind::Persistent && now.saturating_duration_since(last_pong) > Self::PONG_TIMEOUT {
                         if let Some(mut child) = record.child.take() {
-                            let _ = child.kill();
+                            kill_group(&mut child);
                         }
                         record.pid = None;
                         Self::handle_crash(record, now);
@@ -311,6 +384,18 @@ impl Supervisor {
         }
 
         to_start
+    }
+}
+
+impl Drop for Supervisor {
+    /// The compositor is going away: take every component's whole group with
+    /// it (PDEATHSIG only covers the direct child).
+    fn drop(&mut self) {
+        for record in self.components.values_mut() {
+            if let Some(mut child) = record.child.take() {
+                kill_group(&mut child);
+            }
+        }
     }
 }
 
@@ -391,5 +476,112 @@ mod tests {
         let t_timeout = t0 + Duration::from_secs(6);
         sup.tick(t_timeout);
         assert!(matches!(sup.get("bar").unwrap().state, SupervisorState::Backoff { .. }));
+    }
+
+    /// A fake `veil` that ignores its args, forks a grandchild and sleeps.
+    /// Returns (script path, file the grandchild's pid is written to).
+    fn fake_exe(tag: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("veil-sup-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let grandchild = dir.join("grandchild.pid");
+        let script = dir.join("fake-veil");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nsleep 300 &\necho $! > {}\nwait\n", grandchild.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, grandchild)
+    }
+
+    fn alive(pid: i32) -> bool {
+        // Signal 0 only checks existence. A zombie still "exists", so also
+        // look at /proc for the Z state.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|s| !s.rsplit(')').next().unwrap_or("").trim_start().starts_with('Z'))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn kill_9_of_a_child_is_restarted_after_backoff() {
+        let (exe, _) = fake_exe("kill9");
+        let mut sup = Supervisor::new();
+        sup.set_exe(exe);
+        let t0 = Instant::now();
+        sup.start_component("bar", t0).unwrap();
+        let pid = sup.get("bar").unwrap().pid.unwrap();
+        assert!(sup.is_supervised_pid(pid));
+        sup.on_hello("bar", t0);
+        assert!(matches!(sup.get("bar").unwrap().state, SupervisorState::Running { .. }));
+
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // Let the kernel deliver it, then tick: exit is noticed, backoff starts.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(sup.tick(t0).is_empty());
+        assert!(matches!(sup.get("bar").unwrap().state, SupervisorState::Backoff { .. }));
+        assert!(!sup.is_supervised_pid(pid), "a dead child is no longer trusted");
+
+        // Before the 0.5 s backoff ends: nothing. After: the supervisor asks for a start.
+        assert!(sup.tick(t0 + Duration::from_millis(400)).is_empty());
+        let to_start = sup.tick(t0 + Duration::from_millis(600));
+        assert_eq!(to_start, vec!["bar".to_string()]);
+        sup.start_component("bar", t0 + Duration::from_millis(600)).unwrap();
+        let new_pid = sup.get("bar").unwrap().pid.unwrap();
+        assert_ne!(pid, new_pid);
+    }
+
+    #[test]
+    fn restart_kills_the_whole_process_group() {
+        let (exe, gpid_file) = fake_exe("group");
+        let mut sup = Supervisor::new();
+        sup.set_exe(exe);
+        let t0 = Instant::now();
+        sup.start_component("bar", t0).unwrap();
+        // Wait for the script to record its grandchild.
+        let mut grandchild = 0i32;
+        for _ in 0..50 {
+            if let Ok(s) = std::fs::read_to_string(&gpid_file) {
+                if let Ok(p) = s.trim().parse() {
+                    grandchild = p;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(grandchild > 0 && alive(grandchild));
+
+        sup.restart_component("bar", t0).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!alive(grandchild), "grandchild must die with its group");
+        drop(sup);
+    }
+
+    #[test]
+    fn dropping_the_supervisor_kills_its_children() {
+        let (exe, _) = fake_exe("drop");
+        let mut sup = Supervisor::new();
+        sup.set_exe(exe);
+        sup.start_component("bar", Instant::now()).unwrap();
+        let pid = sup.get("bar").unwrap().pid.unwrap() as i32;
+        assert!(alive(pid));
+        drop(sup);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!alive(pid));
+    }
+
+    #[test]
+    fn failure_is_announced_once() {
+        let mut sup = Supervisor::new();
+        let t0 = Instant::now();
+        let rec = sup.get_mut("bar").unwrap();
+        for i in 0..5 {
+            Supervisor::handle_crash(rec, t0 + Duration::from_secs(i));
+        }
+        assert_eq!(sup.take_failed(), vec!["bar".to_string()]);
+        assert!(sup.take_failed().is_empty());
     }
 }
