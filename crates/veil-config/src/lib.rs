@@ -731,13 +731,44 @@ impl BarPosition {
 /// derived straight from `keybinds.apps`/top-level `apps` (every
 /// `Action::Launch` bind becomes a tile) instead of a separate list, so an
 /// app never needs declaring twice.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BarConfig {
     pub enabled: bool,
     pub position: BarPosition,
     /// Run the supervised `veil shell bar` (layer-shell) instead of the
     /// built-in 12px bar. If it dies the built-in bar comes back by itself.
     pub shell: bool,
+    /// Shell bar height in logical px at the default font size (it scales
+    /// with `font.size`). Clamped to 24..=64.
+    pub height: u32,
+    /// Widget names for each section of the shell bar.
+    pub left: Vec<String>,
+    pub center: Vec<String>,
+    pub right: Vec<String>,
+    /// `strftime` format of the clock widget.
+    pub clock_format: String,
+    /// Mount point the disk widget reports.
+    pub disk_mount: String,
+    /// Coordinates for the weather widget. There is no auto-location.
+    pub weather: Option<BarWeather>,
+    /// `custom:<name>` widgets, in the order they were written.
+    pub custom: Vec<BarCustom>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BarWeather {
+    pub lat: f64,
+    pub lon: f64,
+    /// `"metric"` or `"imperial"`.
+    pub units: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BarCustom {
+    pub name: String,
+    pub command: String,
+    /// Seconds between runs.
+    pub interval: u32,
 }
 
 impl Default for BarConfig {
@@ -746,6 +777,14 @@ impl Default for BarConfig {
             enabled: true,
             position: BarPosition::Bottom,
             shell: false,
+            height: 36,
+            left: vec!["workspaces".into(), "window_title".into()],
+            center: vec!["clock".into()],
+            right: vec!["cpu".into(), "memory".into(), "battery".into(), "audio".into()],
+            clock_format: "%a %b %d  %H:%M".into(),
+            disk_mount: "/".into(),
+            weather: None,
+            custom: Vec::new(),
         }
     }
 }
@@ -918,7 +957,77 @@ fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
         .map(|s| BarPosition::from_str(&s))
         .unwrap_or(default.position);
     let shell = get_bool(&bt, "shell", default.shell);
-    BarConfig { enabled, position, shell }
+
+    let height = match bt.get::<mlua::Value>("height") {
+        Ok(mlua::Value::Integer(n)) if n > 0 => n as u32,
+        Ok(mlua::Value::Number(n)) if n > 0.0 => n as u32,
+        _ => default.height,
+    };
+    let list = |key: &str, d: &Vec<String>| -> Vec<String> {
+        match bt.get::<mlua::Value>(key) {
+            Ok(mlua::Value::Table(t)) => t
+                .sequence_values::<String>()
+                .filter_map(Result::ok)
+                .collect(),
+            _ => d.clone(),
+        }
+    };
+
+    // Per-widget options live under `bar.widgets`, so the sections stay a
+    // plain list of names.
+    let widgets = bt.get::<mlua::Table>("widgets").ok();
+    let sub = |name: &str| widgets.as_ref().and_then(|w| w.get::<mlua::Table>(name).ok());
+    let text = |t: &Option<mlua::Table>, key: &str| -> Option<String> {
+        t.as_ref().and_then(|t| t.get::<String>(key).ok()).filter(|s| !s.trim().is_empty())
+    };
+
+    let clock_format = text(&sub("clock"), "format").unwrap_or_else(|| default.clock_format.clone());
+    let disk_mount = text(&sub("disk"), "mount").unwrap_or_else(|| default.disk_mount.clone());
+
+    let weather = match sub("weather") {
+        Some(w) => match (w.get::<f64>("lat"), w.get::<f64>("lon")) {
+            (Ok(lat), Ok(lon)) => Some(BarWeather {
+                lat,
+                lon,
+                units: text(&Some(w.clone()), "units").unwrap_or_else(|| "metric".into()),
+            }),
+            _ => default.weather.clone(),
+        },
+        None => default.weather.clone(),
+    };
+
+    // `custom = { uptime = { command = "uptime -p", interval = 30 } }`. Lua
+    // map order is unspecified, so sort by name for a stable bar.
+    let mut custom: Vec<BarCustom> = Vec::new();
+    if let Some(ct) = sub("custom") {
+        for pair in ct.pairs::<String, mlua::Table>().filter_map(Result::ok) {
+            let (name, t) = pair;
+            let Ok(command) = t.get::<String>("command") else { continue };
+            let interval = match t.get::<mlua::Value>("interval") {
+                Ok(mlua::Value::Integer(n)) if n > 0 => n as u32,
+                Ok(mlua::Value::Number(n)) if n >= 1.0 => n as u32,
+                _ => 10,
+            };
+            custom.push(BarCustom { name, command, interval });
+        }
+        custom.sort_by(|a, b| a.name.cmp(&b.name));
+    } else {
+        custom = default.custom.clone();
+    }
+
+    BarConfig {
+        enabled,
+        position,
+        shell,
+        height,
+        left: list("left", &default.left),
+        center: list("center", &default.center),
+        right: list("right", &default.right),
+        clock_format,
+        disk_mount,
+        weather,
+        custom,
+    }
 }
 
 /// A Lua boolean field with a default. `get::<bool>` alone is a trap: mlua
@@ -1370,5 +1479,65 @@ mod font_tests {
         assert_eq!(parse("font = { size = 400 }").size, Some(48.0));
         assert_eq!(parse("font = { size = 1 }").size, Some(8.0));
         assert_eq!(parse("font = { size = -3 }").size, None);
+    }
+}
+
+#[cfg(test)]
+mod bar_tests {
+    use super::*;
+
+    fn parse(src: &str) -> BarConfig {
+        let lua = mlua::Lua::new();
+        lua.load(src).exec().unwrap();
+        parse_bar(&lua.globals(), &BarConfig::default())
+    }
+
+    #[test]
+    fn no_bar_table_keeps_defaults() {
+        assert_eq!(parse(""), BarConfig::default());
+    }
+
+    #[test]
+    fn sections_height_and_position() {
+        let b = parse(
+            r#"bar = { position = "top", height = 40,
+                left = { "activities", "workspaces" }, center = {}, right = { "cpu", "clock" } }"#,
+        );
+        assert_eq!(b.position, BarPosition::Top);
+        assert_eq!(b.height, 40);
+        assert_eq!(b.left, ["activities", "workspaces"]);
+        assert!(b.center.is_empty(), "an explicit empty section stays empty");
+        assert_eq!(b.right, ["cpu", "clock"]);
+    }
+
+    #[test]
+    fn widget_options() {
+        let b = parse(
+            r#"bar = { widgets = {
+                clock = { format = "%H:%M" },
+                disk = { mount = "/home" },
+                weather = { lat = 48.1, lon = 11.5, units = "imperial" },
+                custom = { zeta = { command = "echo z" }, alpha = { command = "uptime -p", interval = 30 } },
+            } }"#,
+        );
+        assert_eq!(b.clock_format, "%H:%M");
+        assert_eq!(b.disk_mount, "/home");
+        assert_eq!(b.weather, Some(BarWeather { lat: 48.1, lon: 11.5, units: "imperial".into() }));
+        let names: Vec<_> = b.custom.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "zeta"], "sorted by name, not Lua map order");
+        assert_eq!(b.custom[0].interval, 30);
+        assert_eq!(b.custom[1].interval, 10, "default interval");
+    }
+
+    #[test]
+    fn weather_without_coordinates_is_off() {
+        assert_eq!(parse(r#"bar = { widgets = { weather = { units = "metric" } } }"#).weather, None);
+    }
+
+    #[test]
+    fn existing_keys_still_work() {
+        let b = parse(r#"bar = { enabled = false, position = "bottom", shell = true }"#);
+        assert!(!b.enabled && b.shell);
+        assert_eq!(b.position, BarPosition::Bottom);
     }
 }

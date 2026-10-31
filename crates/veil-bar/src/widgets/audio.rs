@@ -2,8 +2,8 @@
 
 use std::time::Instant;
 use tiny_skia::Pixmap;
-use veil_text::{Role, TextSystem};
-use veil_ui::{Theme, Widget};
+use veil_text::TextSystem;
+use veil_ui::{Action, Metrics, Theme, Widget};
 
 pub struct AudioWidget {
     pub volume: u8,
@@ -39,11 +39,11 @@ impl Widget for AudioWidget {
         pixmap: &mut Pixmap,
         text: &mut TextSystem,
         theme: &Theme,
+        m: &Metrics,
         x: f32,
         y: f32,
         h: f32,
     ) -> f32 {
-        let ty = y + (h - 12.0) / 2.0;
         let color = if self.muted {
             theme.err
         } else {
@@ -57,13 +57,21 @@ impl Widget for AudioWidget {
             format!("{icon}{}%", self.volume)
         };
 
-        let drawn = text.draw(pixmap, &label, x + 6.0, ty, Role::UI, 12.0, color);
-        drawn + 12.0
+        crate::util::label(pixmap, text, m, x, y, h, &label, color)
     }
 
-    fn on_click(&mut self, _x: f32, _y: f32) -> Option<String> {
-        // Toggle mute or launch volume control
-        Some("volume.toggle_mute".into())
+    /// Click toggles mute.
+    fn on_click(&mut self, _x: f32) -> Option<Action> {
+        Some(Action::Ipc { cmd: "volume.step".into(), args: serde_json::json!({ "mute": true }) })
+    }
+
+    /// Scrolling up raises the volume, down lowers it (5% per notch).
+    fn on_scroll(&mut self, dy: f32) -> Option<Action> {
+        if dy == 0.0 {
+            return None;
+        }
+        let delta = if dy < 0.0 { 5 } else { -5 };
+        Some(Action::Ipc { cmd: "volume.step".into(), args: serde_json::json!({ "delta": delta }) })
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

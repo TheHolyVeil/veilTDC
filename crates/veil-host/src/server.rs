@@ -419,6 +419,9 @@ pub struct State {
     /// Set when the font settings changed; the next IPC pump tells the
     /// shell components so they reload their fonts too.
     pub font_dirty: bool,
+    /// The `bar` section changed on a config reload: broadcast it.
+    pub bar_dirty: bool,
+    pub last_volume_poll: Instant,
     pub bar: veil_config::BarConfig,
     /// `<mod_key>+D` app launcher — `Some` while the modal is open. See
     /// `crate::launcher`. Not itself a `keybinds` config entry, same as help.
@@ -1622,7 +1625,9 @@ fn layer_click_focus(state: &mut State) -> bool {
 fn layers_json(state: &State) -> serde_json::Value {
     let focus = state.keyboard.current_focus();
     let grab = exclusive_grab_surface(state).map(|s| s.id());
-    let (mut focus_ns, mut grab_ns): (Option<String>, Option<String>) = (None, None);
+    let pointer = state.pointer.current_focus();
+    let (mut focus_ns, mut grab_ns, mut pointer_ns): (Option<String>, Option<String>, Option<String>) =
+        (None, None, None);
     let mut outputs = Vec::new();
     for (i, o) in state.layer_outputs.iter().enumerate() {
         let map = layer_map_for_output(o);
@@ -1638,7 +1643,15 @@ fn layers_json(state: &State) -> serde_json::Value {
                 if grab.as_ref() == Some(&id) {
                     grab_ns = Some(ls.namespace().to_string());
                 }
-                let g = map.layer_geometry(ls).unwrap_or_default();
+                if pointer.as_ref() == Some(ls.wl_surface()) {
+                    pointer_ns = Some(ls.namespace().to_string());
+                }
+                // Location from the layer map; size from the configure the
+                // client acked. `layer_geometry`'s own size is the surface
+                // bbox, which is empty here (buffers are handled by the
+                // compositor, not by Smithay's renderer state).
+                let loc = map.layer_geometry(ls).unwrap_or_default().loc;
+                let size = ls.layer_surface().current_state().size.unwrap_or_default();
                 let zone = match cs.exclusive_zone {
                     ExclusiveZone::Exclusive(n) => n as i64,
                     ExclusiveZone::Neutral => 0,
@@ -1651,7 +1664,7 @@ fn layers_json(state: &State) -> serde_json::Value {
                     "exclusive_zone": zone,
                     "mapped": state.surface_buffers.contains_key(&id),
                     "revoked": state.layer_shell.revoked.contains(&id),
-                    "geometry": [g.loc.x, g.loc.y, g.size.w, g.size.h],
+                    "geometry": [loc.x, loc.y, size.w, size.h],
                 }));
             }
         }
@@ -1670,6 +1683,7 @@ fn layers_json(state: &State) -> serde_json::Value {
     serde_json::json!({
         "outputs": outputs,
         "keyboard_focus": keyboard_focus,
+        "pointer_focus": pointer_ns,
         "grab": grab_ns,
     })
 }
@@ -2263,6 +2277,9 @@ pub fn reload_config(state: &mut State) {
         mark_dirty_full(state);
     }
     refresh_palette(state);
+    if bar_settings_of(&state.bar) != bar_settings_of(&new_cfg.bar) {
+        state.bar_dirty = true;
+    }
     state.bar = new_cfg.bar;
     state.fps_cfg = new_cfg.fps;
     set_wallpaper_config(state, new_cfg.wallpaper.clone());
@@ -3523,6 +3540,35 @@ fn request_wallpaper(state: &mut State) {
 }
 
 /// config.lua's `font = { ... }` as the text engine's own config type.
+/// The shell bar's settings as they go over IPC. Components never link Lua,
+/// so this typed form is all the bar ever sees of `bar = { ... }`.
+pub fn bar_settings_of(b: &veil_config::BarConfig) -> veil_ipc::BarSettings {
+    veil_ipc::BarSettings {
+        position: b.position.label().to_string(),
+        height: b.height,
+        left: b.left.clone(),
+        center: b.center.clone(),
+        right: b.right.clone(),
+        clock_format: b.clock_format.clone(),
+        disk_mount: b.disk_mount.clone(),
+        weather: b.weather.as_ref().map(|w| veil_ipc::WeatherSettings {
+            lat: w.lat,
+            lon: w.lon,
+            units: w.units.clone(),
+        }),
+        custom: b
+            .custom
+            .iter()
+            .map(|c| veil_ipc::CustomWidget {
+                name: c.name.clone(),
+                command: c.command.clone(),
+                interval: c.interval,
+            })
+            .collect(),
+    }
+    .sanitized()
+}
+
 pub fn font_config_of(s: &veil_config::FontSettings) -> veil_text::FontConfig {
     veil_text::FontConfig {
         family: s.family.clone(),
@@ -3581,7 +3627,23 @@ fn apply_wallpaper_layers(state: &mut State, layers: Vec<crate::wallpaper::Layer
 /// Show any finished volume/brightness result. Cheap: one channel poll.
 fn media_tick(state: &mut State) {
     while let Some(u) = state.media.try_recv() {
-        state.show_osd(u.title, u.body, u.progress, Duration::from_secs(2));
+        if let Some((volume, muted)) = u.volume {
+            state.ipc.broadcast(
+                veil_ipc::topics::VOLUME,
+                serde_json::json!({ "volume": volume, "muted": muted }),
+            );
+        }
+        if !u.quiet {
+            state.show_osd(u.title, u.body, u.progress, Duration::from_secs(2));
+        }
+    }
+    // The bar only knows what it is told, so re-read now and then to catch
+    // changes made elsewhere (a mixer app). Only while someone listens.
+    if state.last_volume_poll.elapsed() >= Duration::from_secs(5) {
+        state.last_volume_poll = Instant::now();
+        if state.ipc.has_subscriber(veil_ipc::topics::VOLUME) {
+            state.media.send(crate::media::MediaCmd::VolumeQuery);
+        }
     }
 }
 
@@ -4199,15 +4261,21 @@ fn pick_layer(
             let Some(g) = map.layer_geometry(ls) else {
                 continue;
             };
-            let local = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
-                x - g.loc.x as f64,
-                y - g.loc.y as f64,
-            ));
-            if let Some((surf, off)) = ls.surface_under(local, WindowSurfaceType::ALL) {
-                return Some((
-                    surf,
-                    ((g.loc.x + off.x) as f64, (g.loc.y + off.y) as f64).into(),
-                ));
+            // Hit-test against the committed buffer, like windows and popups
+            // in `pick_focus`. Smithay's `surface_under` needs its own
+            // `RendererSurfaceState`, which this compositor never fills in, so
+            // it never hits: layer surfaces (the bar) got no pointer input.
+            let ws = ls.wl_surface();
+            let Some(buf) = state.surface_buffers.get(&ws.id()) else {
+                continue;
+            };
+            let (xi, yi) = (x as i32, y as i32);
+            if xi >= g.loc.x
+                && yi >= g.loc.y
+                && xi < g.loc.x + buf.w as i32
+                && yi < g.loc.y + buf.h as i32
+            {
+                return Some((ws.clone(), (g.loc.x as f64, g.loc.y as f64).into()));
             }
         }
     }
@@ -5176,6 +5244,43 @@ fn ipc_command(
             spawn_command(&state.socket_name, exec);
             Ok(None)
         }
+        c::VOLUME_STEP => {
+            use crate::media::MediaCmd;
+            if args.get("mute").and_then(|v| v.as_bool()).unwrap_or(false) {
+                state.media.send(MediaCmd::VolumeMute);
+            } else {
+                let delta = args
+                    .get("delta")
+                    .and_then(|v| v.as_i64())
+                    .ok_or("volume.step needs {\"delta\": n} or {\"mute\": true}")?;
+                // The worker steps by 5%; a delta of 10 is two steps.
+                let steps = (delta.unsigned_abs() / 5).clamp(1, 4);
+                let cmd = if delta >= 0 { MediaCmd::VolumeUp } else { MediaCmd::VolumeDown };
+                for _ in 0..steps {
+                    state.media.send(cmd);
+                }
+            }
+            Ok(None)
+        }
+        c::COMPONENT_TOGGLE => {
+            let name = str_arg("name").filter(|n| !n.is_empty()).ok_or("toggle needs a component name")?;
+            // The launcher and power menu are still the built-in overlays
+            // (phase 5 replaces them with components, keeping these as the
+            // fallback). Anything else does not exist yet.
+            match name {
+                "launch" => {
+                    state.launcher = if state.launcher.is_some() { None } else { Some(Launcher::new()) };
+                    mark_dirty_full(state);
+                    Ok(None)
+                }
+                "power" => {
+                    state.power_menu = if state.power_menu.is_some() { None } else { Some(PowerMenu::new()) };
+                    mark_dirty_full(state);
+                    Ok(None)
+                }
+                other => Err(format!("component '{other}' is not available yet")),
+            }
+        }
         c::COMPONENT_RESTART => {
             let name = str_arg("name").filter(|n| !n.is_empty()).ok_or("restart needs a component name")?;
             state.supervisor.restart_component(name, Instant::now())?;
@@ -5256,8 +5361,14 @@ fn ipc_pump(state: &mut State) -> bool {
             }
             _ => {}
         }
+        if matches!(msg, ClientMessage::Subscribe { ref topics } if topics.iter().any(|t| t == veil_ipc::topics::VOLUME)) {
+            state.media.send(crate::media::MediaCmd::VolumeQuery);
+        }
         let palette = crate::palette::to_json(&state.palette);
-        let config = serde_json::json!({ "font": state.text.config().to_json() });
+        let config = serde_json::json!({
+            "font": state.text.config().to_json(),
+            "bar": bar_settings_of(&state.bar).to_json(),
+        });
         if let Some(ClientMessage::Cmd { id, cmd, args }) =
             state.ipc.process_message(cid, msg, palette, config)
         {
@@ -5308,6 +5419,16 @@ fn ipc_pump(state: &mut State) -> bool {
         state.ipc.broadcast(
             topics::CONFIG,
             serde_json::json!({ "font": state.text.config().to_json() }),
+        );
+        busy = true;
+    }
+
+    // The bar section changed: only that section goes out (section 11.1).
+    if state.bar_dirty {
+        state.bar_dirty = false;
+        state.ipc.broadcast(
+            topics::CONFIG,
+            serde_json::json!({ "bar": bar_settings_of(&state.bar).to_json() }),
         );
         busy = true;
     }
@@ -5576,6 +5697,8 @@ pub fn run(
         wallpaper_sample: None,
         text: veil_text::TextSystem::new(&font_config_of(&font)),
         font_dirty: true,
+        bar_dirty: false,
+        last_volume_poll: Instant::now(),
         bar,
         // No anchor client to spawn into (`veil-host start`) → open straight
         // to the launcher instead of an empty screen with no hint of what to press.

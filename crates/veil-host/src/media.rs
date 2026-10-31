@@ -30,6 +30,8 @@ pub enum MediaCmd {
     VolumeUp,
     VolumeDown,
     VolumeMute,
+    /// Read the current volume without changing it or showing the OSD.
+    VolumeQuery,
     BrightnessUp,
     BrightnessDown,
 }
@@ -37,7 +39,7 @@ pub enum MediaCmd {
 impl MediaCmd {
     /// Steps (up/down) can be merged with identical neighbours; mute cannot.
     fn is_step(self) -> bool {
-        !matches!(self, MediaCmd::VolumeMute)
+        !matches!(self, MediaCmd::VolumeMute | MediaCmd::VolumeQuery)
     }
 }
 
@@ -47,6 +49,18 @@ pub struct OsdUpdate {
     pub title: &'static str,
     pub body: String,
     pub progress: Option<u8>,
+    /// Sink volume and mute state after the command, when it is known. The
+    /// compositor broadcasts it as the `volume` event.
+    pub volume: Option<(u8, bool)>,
+    /// Do not show the OSD (a background read, not something the user did).
+    pub quiet: bool,
+}
+
+impl OsdUpdate {
+    fn with_volume(mut self, v: Option<(u8, bool)>) -> Self {
+        self.volume = v;
+        self
+    }
 }
 
 pub struct MediaWorker {
@@ -124,6 +138,7 @@ fn run_cmd(cmd: MediaCmd, step: u32) -> OsdUpdate {
         MediaCmd::VolumeUp => volume_step(true, step),
         MediaCmd::VolumeDown => volume_step(false, step),
         MediaCmd::VolumeMute => volume_mute(),
+        MediaCmd::VolumeQuery => volume_query(),
         MediaCmd::BrightnessUp => brightness_step(true, step),
         MediaCmd::BrightnessDown => brightness_step(false, step),
     }
@@ -180,6 +195,8 @@ fn osd(title: &'static str, body: impl Into<String>, progress: Option<u8>) -> Os
         title,
         body: body.into(),
         progress,
+        volume: None,
+        quiet: false,
     }
 }
 
@@ -203,20 +220,24 @@ fn volume_step(up: bool, step: u32) -> OsdUpdate {
     // PipeWire. `-l 1.0` stops it going past 100%.
     let wp = format!("{step}%{}", sign(up));
     if applied("wpctl", &["set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", &wp]).is_some() {
-        return match read_wpctl() {
+        let now = read_wpctl();
+        return match now {
             Some((_, true)) => osd(T, "MUTED", Some(0)),
             Some((pct, false)) => pct_osd(T, pct),
             None => osd(T, format!("{}{step}%", sign(up)), None),
-        };
+        }
+        .with_volume(now);
     }
 
     // ALSA.
     let am = format!("{step}%{}", sign(up));
     if let Some(out) = applied("amixer", &["sset", "Master", &am]) {
-        return match parse_bracket_percent(&out) {
+        let pct = parse_bracket_percent(&out);
+        return match pct {
             Some(pct) => pct_osd(T, pct),
             None => osd(T, format!("{}{step}%", sign(up)), None),
-        };
+        }
+        .with_volume(pct.map(|p| (p, false)));
     }
 
     // PulseAudio. No built-in limit, so read back and clamp.
@@ -230,21 +251,32 @@ fn volume_step(up: bool, step: u32) -> OsdUpdate {
         return match pct {
             Some(p) => pct_osd(T, p),
             None => osd(T, format!("{}{step}%", sign(up)), None),
-        };
+        }
+        .with_volume(pct.map(|p| (p, false)));
     }
 
     osd(T, "NO AUDIO CONTROL", None)
+}
+
+/// Read the sink volume for the bar. Same helper order as stepping.
+fn volume_query() -> OsdUpdate {
+    let v = read_wpctl().or_else(|| read_pactl().map(|p| (p.min(100), false)));
+    let mut u = osd("VOLUME", "", None).with_volume(v);
+    u.quiet = true;
+    u
 }
 
 fn volume_mute() -> OsdUpdate {
     const T: &str = "VOLUME";
 
     if applied("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]).is_some() {
-        return match read_wpctl() {
+        let now = read_wpctl();
+        return match now {
             Some((_, true)) => osd(T, "MUTED", Some(0)),
             Some((pct, false)) => osd(T, format!("UNMUTED ({pct}%)"), Some(pct)),
             None => osd(T, "TOGGLED", None),
-        };
+        }
+        .with_volume(now);
     }
     if let Some(out) = applied("amixer", &["sset", "Master", "toggle"]) {
         return if out.contains("[off]") {

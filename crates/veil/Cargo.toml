@@ -19,3 +19,6 @@ mimalloc    = { workspace = true }
 [features]
 default = ["shell"]
 shell   = ["dep:veil-bar"]
+
+[dev-dependencies]
+veil-ui = { path = "../veil-ui" }

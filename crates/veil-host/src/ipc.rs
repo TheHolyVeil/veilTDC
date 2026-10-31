@@ -247,6 +247,11 @@ impl IpcServer {
         Ok(())
     }
 
+    /// Is anyone subscribed to `topic`?
+    pub fn has_subscriber(&self, topic: &str) -> bool {
+        self.clients.values().any(|c| c.subscriptions.contains(topic))
+    }
+
     /// Broadcast an event to all subscribers of `topic`.
     pub fn broadcast(&mut self, topic: &str, data: serde_json::Value) {
         let event = ServerMessage::Event {

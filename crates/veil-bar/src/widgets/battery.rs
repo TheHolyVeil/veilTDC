@@ -4,8 +4,8 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tiny_skia::Pixmap;
-use veil_text::{Role, TextSystem};
-use veil_ui::{Theme, Widget};
+use veil_text::TextSystem;
+use veil_ui::{Metrics, Theme, Widget};
 
 pub struct BatteryWidget {
     pct: u8,
@@ -74,6 +74,7 @@ impl Widget for BatteryWidget {
         pixmap: &mut Pixmap,
         text: &mut TextSystem,
         theme: &Theme,
+        m: &Metrics,
         x: f32,
         y: f32,
         h: f32,
@@ -82,7 +83,6 @@ impl Widget for BatteryWidget {
             return 0.0;
         }
 
-        let ty = y + (h - 12.0) / 2.0;
         let color = if self.charging {
             theme.ok
         } else if self.pct <= 15 {
@@ -95,8 +95,7 @@ impl Widget for BatteryWidget {
 
         let icon = if self.charging { "󰂄 " } else { "󰁹 " };
         let label = format!("{icon}{}%", self.pct);
-        let drawn = text.draw(pixmap, &label, x + 6.0, ty, Role::UI, 12.0, color);
-        drawn + 12.0
+        crate::util::label(pixmap, text, m, x, y, h, &label, color)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

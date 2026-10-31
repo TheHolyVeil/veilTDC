@@ -3,8 +3,8 @@
 use std::fs;
 use std::time::{Duration, Instant};
 use tiny_skia::Pixmap;
-use veil_text::{Role, TextSystem};
-use veil_ui::{Theme, Widget};
+use veil_text::TextSystem;
+use veil_ui::{Metrics, Theme, Widget};
 
 pub struct CpuWidget {
     prev_idle: u64,
@@ -62,11 +62,11 @@ impl Widget for CpuWidget {
         pixmap: &mut Pixmap,
         text: &mut TextSystem,
         theme: &Theme,
+        m: &Metrics,
         x: f32,
         y: f32,
         h: f32,
     ) -> f32 {
-        let ty = y + (h - 12.0) / 2.0;
         let color = if self.pct > 80.0 {
             theme.err
         } else if self.pct > 50.0 {
@@ -78,8 +78,7 @@ impl Widget for CpuWidget {
         // Icon + percentage
         let icon = " ";
         let label = format!("{icon}{:.0}%", self.pct);
-        let drawn = text.draw(pixmap, &label, x + 6.0, ty, Role::UI, 12.0, color);
-        drawn + 12.0
+        crate::util::label(pixmap, text, m, x, y, h, &label, color)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

@@ -6,6 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub mod bar;
+pub use bar::{BarSettings, CustomWidget, WeatherSettings};
+
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_MESSAGE_SIZE: usize = 65536; // 64 KiB
 pub const MAX_SUBSCRIBER_QUEUE: usize = 1024 * 1024; // 1 MiB

@@ -30,8 +30,13 @@ use wayland_client::{
 
 #[derive(Debug, Clone)]
 pub enum UiInputEvent {
-    Motion { x: f64, y: f64 },
-    Press { x: f64, y: f64 },
+    /// `output` is the wl_output name of the surface the pointer is over
+    /// ("veil-host-1" under veil), so a multi-monitor client knows which
+    /// surface's layout `x`/`y` belong to.
+    Motion { x: f64, y: f64, output: String },
+    Press { x: f64, y: f64, output: String },
+    /// Vertical scroll: negative is up, positive is down.
+    Scroll { x: f64, y: f64, dy: f64, output: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +44,19 @@ pub enum SurfacePosition {
     Top,
     Bottom,
     CenterOverlay,
+}
+
+/// Everything a layer-shell client chooses about its surface. `new` covers
+/// the bar's needs; tests and other components use `with_options`.
+#[derive(Debug, Clone)]
+pub struct LayerOptions {
+    pub namespace: String,
+    pub layer: Layer,
+    pub anchor: Anchor,
+    /// Requested size; 0 on an axis means "stretch to the anchors".
+    pub size: (u32, u32),
+    pub exclusive_zone: i32,
+    pub keyboard: KeyboardInteractivity,
 }
 
 struct OutputSurface {
@@ -66,8 +84,36 @@ impl LayerShellClient {
         height: u32,
         exclusive: bool,
     ) -> Result<Self, String> {
-        let conn = Connection::connect_to_env()
-            .map_err(|e| format!("Failed to connect to Wayland display: {e}"))?;
+        let anchor = match position {
+            SurfacePosition::Top => Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+            SurfacePosition::Bottom => Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+            SurfacePosition::CenterOverlay => Anchor::empty(),
+        };
+        Self::with_options(
+            LayerOptions {
+                namespace: namespace.to_string(),
+                layer,
+                anchor,
+                size: (0, height),
+                exclusive_zone: if exclusive { height as i32 } else { 0 },
+                keyboard: KeyboardInteractivity::None,
+            },
+            None,
+        )
+    }
+
+    /// Full control over the surface. `stream` connects to a specific
+    /// compositor socket instead of `$WAYLAND_DISPLAY`, so a test can talk to
+    /// an in-process compositor without touching the process environment.
+    pub fn with_options(
+        opts: LayerOptions,
+        stream: Option<std::os::unix::net::UnixStream>,
+    ) -> Result<Self, String> {
+        let conn = match stream {
+            Some(s) => Connection::from_socket(s),
+            None => Connection::connect_to_env(),
+        }
+        .map_err(|e| format!("Failed to connect to Wayland display: {e}"))?;
         let (globals, queue) = registry_queue_init::<ClientState>(&conn)
             .map_err(|e| format!("Failed to init Wayland registry: {e}"))?;
         let qh = queue.handle();
@@ -89,16 +135,13 @@ impl LayerShellClient {
             seat_state,
             shm,
             layer_shell,
-            namespace: namespace.to_string(),
-            layer,
-            position,
-            height,
-            exclusive,
+            opts,
             surfaces: Vec::new(),
             pointer: None,
             input_tx: tx,
             mouse_x: 0.0,
             mouse_y: 0.0,
+            hover: String::new(),
             reconfigured: false,
         };
 
@@ -136,6 +179,21 @@ impl LayerShellClient {
     /// True once since the last call if a surface was configured or resized
     /// by the compositor. Redraw when it is: the committed buffer is still the
     /// old size until you do.
+    /// Change the surface's geometry on every output at runtime (bar height
+    /// or edge changed, font size changed). The compositor answers with a
+    /// configure and adjusts the exclusive zone.
+    pub fn reconfigure(&mut self, anchor: Anchor, size: (u32, u32), exclusive_zone: i32) {
+        self.state.opts.anchor = anchor;
+        self.state.opts.size = size;
+        self.state.opts.exclusive_zone = exclusive_zone;
+        for s in &self.state.surfaces {
+            s.layer_surface.set_anchor(anchor);
+            s.layer_surface.set_size(size.0, size.1);
+            s.layer_surface.set_exclusive_zone(exclusive_zone);
+            s.layer_surface.commit();
+        }
+    }
+
     pub fn take_reconfigured(&mut self) -> bool {
         std::mem::take(&mut self.state.reconfigured)
     }
@@ -184,22 +242,28 @@ struct ClientState {
     seat_state: SeatState,
     shm: Shm,
     layer_shell: LayerShell,
-    namespace: String,
-    layer: Layer,
-    position: SurfacePosition,
-    height: u32,
-    exclusive: bool,
+    opts: LayerOptions,
     surfaces: Vec<OutputSurface>,
     pointer: Option<ThemedPointer>,
     input_tx: Sender<UiInputEvent>,
     mouse_x: f64,
     mouse_y: f64,
+    /// Output name of the surface the pointer last entered.
+    hover: String,
     /// Set when any surface was (re)configured; the app must redraw at the
     /// new size. Read and cleared by `LayerShellClient::take_reconfigured`.
     reconfigured: bool,
 }
 
 impl ClientState {
+    fn output_name_of(&self, wl: &wl_surface::WlSurface) -> String {
+        self.surfaces
+            .iter()
+            .find(|s| s.layer_surface.wl_surface() == wl)
+            .map(|s| s.name.clone())
+            .unwrap_or_default()
+    }
+
     fn add_output(&mut self, qh: &QueueHandle<Self>, output: &wl_output::WlOutput) {
         let output_id = output.id().protocol_id();
         if self.surfaces.iter().any(|s| s.output_id == output_id) {
@@ -215,25 +279,15 @@ impl ClientState {
         let layer_surface = self.layer_shell.create_layer_surface(
             qh,
             surface,
-            self.layer,
-            Some(&self.namespace),
+            self.opts.layer,
+            Some(&self.opts.namespace),
             Some(output),
         );
 
-        let anchor = match self.position {
-            SurfacePosition::Top => Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
-            SurfacePosition::Bottom => Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            SurfacePosition::CenterOverlay => Anchor::empty(),
-        };
-
-        layer_surface.set_anchor(anchor);
-        if self.exclusive {
-            layer_surface.set_exclusive_zone(self.height as i32);
-        } else {
-            layer_surface.set_exclusive_zone(0);
-        }
-        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer_surface.set_size(0, self.height);
+        layer_surface.set_anchor(self.opts.anchor);
+        layer_surface.set_exclusive_zone(self.opts.exclusive_zone);
+        layer_surface.set_keyboard_interactivity(self.opts.keyboard);
+        layer_surface.set_size(self.opts.size.0, self.opts.size.1);
         layer_surface.commit();
 
         let pool = match SlotPool::new(8 * 1024 * 1024, &self.shm) {
@@ -332,9 +386,11 @@ impl PointerHandler for ClientState {
                     }
                     self.mouse_x = ev.position.0;
                     self.mouse_y = ev.position.1;
+                    self.hover = self.output_name_of(&ev.surface);
                     let _ = self.input_tx.send(UiInputEvent::Motion {
                         x: self.mouse_x,
                         y: self.mouse_y,
+                        output: self.hover.clone(),
                     });
                 }
                 PointerEventKind::Motion { .. } => {
@@ -343,7 +399,24 @@ impl PointerHandler for ClientState {
                     let _ = self.input_tx.send(UiInputEvent::Motion {
                         x: self.mouse_x,
                         y: self.mouse_y,
+                        output: self.hover.clone(),
                     });
+                }
+                PointerEventKind::Axis { vertical, .. } => {
+                    // Wheels report whole notches; touchpads report distance.
+                    let dy = if vertical.discrete != 0 {
+                        vertical.discrete as f64
+                    } else {
+                        vertical.absolute.signum()
+                    };
+                    if dy != 0.0 {
+                        let _ = self.input_tx.send(UiInputEvent::Scroll {
+                            x: self.mouse_x,
+                            y: self.mouse_y,
+                            dy,
+                            output: self.hover.clone(),
+                        });
+                    }
                 }
                 PointerEventKind::Press { button, .. }
                     if button == 272 => {
@@ -351,6 +424,7 @@ impl PointerHandler for ClientState {
                         let _ = self.input_tx.send(UiInputEvent::Press {
                             x: self.mouse_x,
                             y: self.mouse_y,
+                            output: self.hover.clone(),
                         });
                     }
                 _ => {}

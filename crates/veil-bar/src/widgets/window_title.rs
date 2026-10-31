@@ -3,10 +3,11 @@
 use std::time::Instant;
 use tiny_skia::Pixmap;
 use veil_text::{Role, TextSystem};
-use veil_ui::{Theme, Widget};
+use veil_ui::{Metrics, Theme, Widget};
 
 pub struct WindowTitleWidget {
     pub title: String,
+    /// Widest the title may get at the default font size; scales with it.
     pub max_width: f32,
 }
 
@@ -39,6 +40,7 @@ impl Widget for WindowTitleWidget {
         pixmap: &mut Pixmap,
         text: &mut TextSystem,
         theme: &Theme,
+        m: &Metrics,
         x: f32,
         y: f32,
         h: f32,
@@ -47,10 +49,10 @@ impl Widget for WindowTitleWidget {
             return 0.0;
         }
 
-        let ellipsized = text.ellipsize(&self.title, Role::UI, 13.0, self.max_width);
-        let ty = y + (h - 13.0) / 2.0;
-        let drawn = text.draw(pixmap, &ellipsized, x + 8.0, ty, Role::UI, 13.0, theme.text);
-        drawn + 16.0
+        let ellipsized = text.ellipsize(&self.title, Role::UI, m.font, m.px(self.max_width));
+        let ty = y + (h - m.font) / 2.0;
+        let drawn = text.draw(pixmap, &ellipsized, x + m.pad, ty, Role::UI, m.font, theme.text);
+        drawn + m.pad * 2.0
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

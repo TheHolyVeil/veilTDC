@@ -20,3 +20,10 @@ chrono                 = { workspace = true }
 serde                  = { workspace = true }
 serde_json             = { workspace = true }
 libc                   = { workspace = true }
+zbus                   = { workspace = true }
+ureq                   = { workspace = true }
+png                    = { workspace = true }
+futures-lite           = { workspace = true }
+
+[dev-dependencies]
+tempfile               = { workspace = true }
