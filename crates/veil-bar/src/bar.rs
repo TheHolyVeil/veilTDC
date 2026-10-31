@@ -231,9 +231,9 @@ impl BarLayout {
         // Measure with a scratch pixmap; widgets must not depend on its size.
         let mut scratch = Pixmap::new(1, 1).expect("1x1 pixmap");
         let mut widths: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for si in 0..3 {
+        for (si, section_widths) in widths.iter_mut().enumerate() {
             for e in &mut self.sections[si] {
-                widths[si].push(e.widget.draw(&mut scratch, &mut self.text, &self.theme, &m, 0.0, 0.0, h));
+                section_widths.push(e.widget.draw(&mut scratch, &mut self.text, &self.theme, &m, 0.0, 0.0, h));
             }
         }
         let total = |ws: &Vec<f32>| -> f32 {

@@ -70,6 +70,7 @@ pub fn fill_rounded_rect(
 }
 
 /// Stroke a rounded rectangle outline.
+#[allow(clippy::too_many_arguments)]
 pub fn stroke_rounded_rect(
     pixmap: &mut Pixmap,
     x: f32,
@@ -86,10 +87,12 @@ pub fn stroke_rounded_rect(
     let mut paint = Paint::default();
     paint.set_color(color);
     paint.anti_alias = true;
-    let mut stroke = Stroke::default();
-    stroke.width = width;
-    stroke.line_cap = LineCap::Round;
-    stroke.line_join = LineJoin::Round;
+    let stroke = Stroke {
+        width,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Default::default()
+    };
     if let Some(path) = rounded_rect_path(x, y, w, h, r) {
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }

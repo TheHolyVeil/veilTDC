@@ -775,7 +775,7 @@ impl Default for BarConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            position: BarPosition::Bottom,
+            position: BarPosition::Top,
             shell: false,
             height: 36,
             left: vec!["workspaces".into(), "window_title".into()],

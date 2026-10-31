@@ -281,7 +281,7 @@ pub fn read_names(path: &Path) -> Option<(String, String)> {
     }
     let mut dir = vec![0u8; num_tables * 16];
     f.read_exact(&mut dir).ok()?;
-    let (offset, length) = dir.chunks_exact(16).find_map(|rec| {
+    let (offset, length) = dir.as_chunks::<16>().0.iter().find_map(|rec| {
         if &rec[0..4] != b"name" {
             return None;
         }
@@ -331,7 +331,7 @@ pub fn parse_name_table(t: &[u8]) -> Option<(String, String)> {
 }
 
 fn utf16be(raw: &[u8]) -> String {
-    let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
     String::from_utf16_lossy(&units)
 }
 
@@ -461,18 +461,18 @@ pub(crate) mod tests {
         std::fs::write(&a, fake_sfnt(&[(1, "Alpha"), (2, "Regular")])).unwrap();
         std::fs::write(dir.join("notes.txt"), "not a font").unwrap();
 
-        let first = FontIndex::scan_dirs(&[dir.clone()], None);
+        let first = FontIndex::scan_dirs(std::slice::from_ref(&dir), None);
         assert_eq!(first.len(), 1);
         assert_eq!(first.entries()[0].family, "Alpha");
 
         // Poison the cached family; an unchanged file must keep the cached value.
         let mut poisoned = first.clone();
         poisoned.entries[0].family = "FromCache".into();
-        assert_eq!(FontIndex::scan_dirs(&[dir.clone()], Some(&poisoned)).entries()[0].family, "FromCache");
+        assert_eq!(FontIndex::scan_dirs(std::slice::from_ref(&dir), Some(&poisoned)).entries()[0].family, "FromCache");
 
         // A changed mtime forces a re-read.
         poisoned.entries[0].mtime = 0;
-        assert_eq!(FontIndex::scan_dirs(&[dir.clone()], Some(&poisoned)).entries()[0].family, "Alpha");
+        assert_eq!(FontIndex::scan_dirs(std::slice::from_ref(&dir), Some(&poisoned)).entries()[0].family, "Alpha");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

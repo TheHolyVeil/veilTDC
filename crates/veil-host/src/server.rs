@@ -3364,7 +3364,7 @@ fn composite_one_monitor(
         if let Some(wc) = state.wallpaper_chooser.as_mut() {
             let g = crate::wallpaper_chooser::geometry(w, h);
             wc.set_view(g.cols, g.rows);
-            wc.draw(&theme, back, w, h);
+            wc.draw(&theme, &mut state.text, back, w, h);
         }
     }
     if let Some(ref osd) = state.osd {

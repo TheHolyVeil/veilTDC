@@ -482,8 +482,11 @@ mod tests {
     /// Returns (script path, file the grandchild's pid is written to).
     fn fake_exe(tag: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("veil-sup-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("veil-sup-{tag}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         let grandchild = dir.join("grandchild.pid");
         let script = dir.join("fake-veil");
         std::fs::write(

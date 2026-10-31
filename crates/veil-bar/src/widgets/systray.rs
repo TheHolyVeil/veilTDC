@@ -82,7 +82,7 @@ pub fn argb_to_premul_rgba(w: i32, h: i32, data: &[u8]) -> Option<Icon> {
         return None;
     }
     let mut out = Vec::with_capacity(data.len());
-    for px in data.chunks_exact(4) {
+    for px in data.as_chunks::<4>().0 {
         let (a, r, g, b) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
         out.extend_from_slice(&[(r * a / 255) as u8, (g * a / 255) as u8, (b * a / 255) as u8, a as u8]);
     }
@@ -144,18 +144,18 @@ pub fn load_png(path: &Path) -> Option<Icon> {
     let mut rgba = Vec::with_capacity(info.width as usize * info.height as usize * 4);
     match info.color_type {
         png::ColorType::Rgba => {
-            for p in data.chunks_exact(4) {
+            for p in data.as_chunks::<4>().0 {
                 let a = p[3] as u32;
                 rgba.extend_from_slice(&[(p[0] as u32 * a / 255) as u8, (p[1] as u32 * a / 255) as u8, (p[2] as u32 * a / 255) as u8, p[3]]);
             }
         }
         png::ColorType::Rgb => {
-            for p in data.chunks_exact(3) {
+            for p in data.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[p[0], p[1], p[2], 255]);
             }
         }
         png::ColorType::GrayscaleAlpha => {
-            for p in data.chunks_exact(2) {
+            for p in data.as_chunks::<2>().0 {
                 let a = p[1] as u32;
                 let v = (p[0] as u32 * a / 255) as u8;
                 rgba.extend_from_slice(&[v, v, v, p[1]]);
@@ -563,9 +563,9 @@ mod tests {
         for s in [16, 48, 128] {
             write_png(&root.join(format!("hicolor/{s}x{s}/apps/foo.png")), 1, 1, png::ColorType::Rgb, &[0, 0, 0]);
         }
-        let found = find_icon_file("foo", "", &[root.clone()], 32).unwrap();
+        let found = find_icon_file("foo", "", std::slice::from_ref(&root), 32).unwrap();
         assert!(found.to_string_lossy().contains("48x48"));
-        let largest = find_icon_file("foo", "", &[root.clone()], 512).unwrap();
+        let largest = find_icon_file("foo", "", std::slice::from_ref(&root), 512).unwrap();
         assert!(largest.to_string_lossy().contains("128x128"));
         assert!(find_icon_file("nope", "", &[root], 32).is_none());
         assert!(find_icon_file("", "", &[], 32).is_none());

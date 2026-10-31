@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
-use crate::font5x7::{draw_text, fill_rect, GLYPH_W};
+use crate::font5x7::fill_rect;
+use veil_text::{Role, TextSystem};
 
 /// Preview size in pixels (16:9).
 pub const THUMB_W: u32 = 224;
@@ -27,7 +28,7 @@ const OUTER: u32 = 14;
 const HEADER_H: u32 = 30;
 const BAR_W: u32 = 8;
 const BAR_GAP: u32 = 6;
-const TEXT_SCALE: u32 = 2;
+const APPROX_CHAR_W: u32 = 12;
 
 /// Where everything sits for a given screen size. Pure, so it is testable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,7 +81,7 @@ const EMPTY_MSG: &str = "NO WALLPAPERS FOUND";
 
 /// The small box shown when there is nothing to choose from: `(x, y, w, h)`.
 fn empty_rect(w: u32, h: u32) -> (i32, i32, u32, u32) {
-    let text_w = EMPTY_MSG.len() as u32 * (GLYPH_W + 1) * TEXT_SCALE;
+    let text_w = EMPTY_MSG.len() as u32 * APPROX_CHAR_W;
     let bw = text_w + OUTER * 4;
     let bh = OUTER * 2 + HEADER_H + 20;
     ((w as i32 - bw as i32) / 2, (h as i32 - bh as i32) / 2, bw, bh)
@@ -324,16 +325,17 @@ impl WallpaperChooser {
     }
 
     /// Draw the panel centred on a `w`×`h` RGBA buffer.
-    pub fn draw(&self, theme: &veil_config::Theme, back: &mut [u8], w: u32, h: u32) {
+    pub fn draw(&self, theme: &veil_config::Theme, ts: &mut TextSystem, back: &mut [u8], w: u32, h: u32) {
         let n = self.items.len();
+        let font_size = 13.0_f32;
         if n == 0 {
             let (x, y, bw, bh) = empty_rect(w, h);
             fill_rect(back, w, h, x - 2, y - 2, bw + 4, bh + 4, theme.border);
             fill_rect(back, w, h, x, y, bw, bh, theme.panel_bg);
             let tx = x + (OUTER * 2) as i32;
-            draw_text(back, w, h, tx, y + OUTER as i32, TEXT_SCALE, EMPTY_MSG, theme.header);
+            ts.draw_rgba(back, w, h, EMPTY_MSG, tx as f32, (y + OUTER as i32) as f32, Role::UI, font_size, theme.header);
             let hint_y = y + (OUTER + HEADER_H) as i32;
-            draw_text(back, w, h, tx, hint_y, TEXT_SCALE, "ESC CLOSE", theme.text_dim);
+            ts.draw_rgba(back, w, h, "ESC CLOSE", tx as f32, hint_y as f32, Role::UI, font_size, theme.text_dim);
             return;
         }
         let g = geometry(w, h);
@@ -346,18 +348,20 @@ impl WallpaperChooser {
             self.selected + 1,
             n
         );
-        draw_text(
+        ts.draw_rgba(
             back,
             w,
             h,
-            g.x + OUTER as i32,
-            g.y + OUTER as i32,
-            TEXT_SCALE,
             &title,
+            (g.x + OUTER as i32) as f32,
+            (g.y + OUTER as i32) as f32,
+            Role::UI,
+            font_size,
             theme.header,
         );
 
-        let max_chars = (THUMB_W / ((GLYPH_W + 1) * TEXT_SCALE)) as usize;
+        let (char_w, _) = ts.measure("M", Role::UI, font_size);
+        let max_chars = if char_w > 0.0 { (THUMB_W as f32 / char_w) as usize } else { 20 };
         for r in 0..g.rows {
             for c in 0..g.cols {
                 let slot = (self.scroll_row + r) * g.cols + c;
@@ -377,11 +381,11 @@ impl WallpaperChooser {
                     Thumb::Loaded(px) => blit_thumb(back, w, h, tx, ty, px),
                     Thumb::Unloaded => {
                         fill_rect(back, w, h, tx, ty, THUMB_W, THUMB_H, theme.text_dim);
-                        draw_text(back, w, h, tx + 8, ty + 8, TEXT_SCALE, "LOADING", theme.panel_bg);
+                        ts.draw_rgba(back, w, h, "LOADING", (tx + 8) as f32, (ty + 8) as f32, Role::UI, font_size, theme.panel_bg);
                     }
                     Thumb::Failed => {
                         fill_rect(back, w, h, tx, ty, THUMB_W, THUMB_H, theme.text_dim);
-                        draw_text(back, w, h, tx + 8, ty + 8, TEXT_SCALE, "CANT LOAD", theme.panel_bg);
+                        ts.draw_rgba(back, w, h, "CANT LOAD", (tx + 8) as f32, (ty + 8) as f32, Role::UI, font_size, theme.panel_bg);
                     }
                 }
                 let mut name = self.items[slot]
@@ -393,17 +397,18 @@ impl WallpaperChooser {
                     name.insert_str(0, "* ");
                 }
                 if name.chars().count() > max_chars {
-                    name = name.chars().take(max_chars - 2).collect::<String>() + "..";
+                    name = name.chars().take(max_chars.saturating_sub(2)).collect::<String>() + "..";
                 }
                 let color = if selected { theme.header } else { theme.text };
-                draw_text(
+                ts.draw_rgba(
                     back,
                     w,
                     h,
-                    tx,
-                    ty + THUMB_H as i32 + 6,
-                    TEXT_SCALE,
                     &name,
+                    tx as f32,
+                    (ty + THUMB_H as i32 + 6) as f32,
+                    Role::UI,
+                    font_size,
                     color,
                 );
             }
@@ -570,7 +575,8 @@ mod tests {
         assert_eq!(c.hit_test(ex + 1, ey + 1, w, h), Hit::Panel);
         assert_eq!(c.hit_test(ex + ew as i32 + 5, ey + eh as i32 + 5, w, h), Hit::Outside);
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        c.draw(&veil_config::Theme::for_name(veil_config::ThemeName::Default), &mut buf, w, h);
+        let mut ts = veil_text::TextSystem::new(&veil_text::FontConfig::default());
+        c.draw(&veil_config::Theme::for_name(veil_config::ThemeName::Default), &mut ts, &mut buf, w, h);
         assert!(buf.iter().any(|&b| b != 0), "message box was not drawn");
     }
 
@@ -589,6 +595,7 @@ mod tests {
         let g = geometry(w, h);
         c.set_view(g.cols, g.rows);
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        c.draw(&veil_config::Theme::for_name(veil_config::ThemeName::Default), &mut buf, w, h);
+        let mut ts = veil_text::TextSystem::new(&veil_text::FontConfig::default());
+        c.draw(&veil_config::Theme::for_name(veil_config::ThemeName::Default), &mut ts, &mut buf, w, h);
     }
 }

@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn runs_the_command_and_exposes_its_output() {
-        let mut w = CustomWidget::new("t", "echo hello; echo ignored", 60);
+        let w = CustomWidget::new("t", "echo hello; echo ignored", 60);
         assert_eq!(w.name(), "custom:t");
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(3) {

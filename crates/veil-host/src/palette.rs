@@ -92,6 +92,11 @@ pub fn write_file(t: &Tokens) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     let mut f = std::fs::File::create(&tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     f.write_all(serde_json::to_string_pretty(&to_json(t))?.as_bytes())?;
     f.write_all(b"\n")?;
     f.sync_all()?;

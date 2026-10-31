@@ -725,14 +725,14 @@ mod tests {
         let mut ts = TextSystem::bitmap_only();
         let (w, h) = (80u32, 30u32);
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        for px in buf.chunks_exact_mut(4) {
+        for px in buf.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[0, 0, 0, 255]);
         }
         let adv = ts.draw_rgba(&mut buf, w, h, "Hi", 4.0, 4.0, Role::UI, 14.0, [255, 255, 255, 255]);
         assert!(adv > 0.0);
-        let lit = buf.chunks_exact(4).filter(|p| p[0] > 200).count();
+        let lit = buf.as_chunks::<4>().0.iter().filter(|p| p[0] > 200).count();
         assert!(lit > 10, "text should light some pixels, got {lit}");
-        assert!(buf.chunks_exact(4).all(|p| p[3] == 255), "an opaque target stays opaque");
+        assert!(buf.as_chunks::<4>().0.iter().all(|p| p[3] == 255), "an opaque target stays opaque");
 
         // Off every edge: must clip, not panic or write out of bounds.
         let before = buf.clone();
@@ -747,7 +747,7 @@ mod tests {
         let (w, h) = (40u32, 20u32);
         let mut buf: Vec<u8> = std::iter::repeat_n([0u8, 0, 100, 255], (w * h) as usize).flatten().collect();
         ts.draw_rgba(&mut buf, w, h, "I", 2.0, 2.0, Role::UI, 14.0, [200, 0, 0, 128]);
-        let mixed = buf.chunks_exact(4).find(|p| p[0] > 50 && p[0] < 150).expect("a blended pixel");
+        let mixed = buf.as_chunks::<4>().0.iter().find(|p| p[0] > 50 && p[0] < 150).expect("a blended pixel");
         assert!(mixed[2] > 20 && mixed[2] < 100, "blue background partly shows through: {mixed:?}");
     }
 
