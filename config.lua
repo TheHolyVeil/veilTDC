@@ -36,9 +36,13 @@ gpu_power = "high" -- high | low  (low = prefer the integrated GPU on hybrid lap
 --   "deepsage"   -- Abyss's own: deep, desaturated sage green, hand-tuned,
 --                    not sourced from any published palette.
 --                    ("deep_sage" / "deep-sage" / "sage" also accepted)
+--   "wallpaper"  -- Colours derived from the current wallpaper (veil-palette).
+--                    Shows the Deep Sage set until a wallpaper has loaded.
+--                    Leans dark/light per `theme_mode` below.
 --
 theme = "default" -- default | nord | dracula | catppuccin | gruvbox | everforest
-                   -- | tokyonight | solarized | rosepine | monokai | onedark | deepsage
+                   -- | tokyonight | solarized | rosepine | monokai | onedark | deepsage | wallpaper
+theme_mode = "dark" -- dark | light | auto; only used by theme = "wallpaper" (auto goes light only for a very bright wallpaper)
 
 -- Bare background color, shown wherever no window covers. Otherwise
 -- uncovered space is pure black — an actual void, which you can now
@@ -46,34 +50,63 @@ theme = "default" -- default | nord | dracula | catppuccin | gruvbox | everfores
 --
 -- This OVERRIDES the theme's own background when set — comment this line
 -- out entirely to let `theme` above pick the background for you instead.
-background = "#8c8c8c" -- hex, "#RRGGBB" or "RRGGBB" — cement grey default
+-- background = "#8c8c8c" -- hex, "#RRGGBB" or "RRGGBB" — cement grey default
 
--- Status bar: workspace widget + clock + app shortcuts. Fixed three-column
--- layout (workspace widget 16 chars, clock 8 chars, shortcuts fill the
--- rest), 12px tall, rendered with the same built-in 5x7 bitmap font as the
--- help/launcher overlays — no new font engine. Themed by `theme` above
--- (panel_bg for the strip, text/text_dim/accent for the columns).
+-- Fonts: the one place every Veil surface (bar, launcher, help overlay, ...)
+-- reads, applied live on reload. Every field is optional; anything unset falls
+-- back to an installed font, and the built-in 5x7 bitmap font is the last
+-- resort. A family is a name or an absolute path to a font file.
+-- `font = "Inter"` is shorthand for `font = { family = "Inter" }`.
+-- font = {
+--   family = "Inter",             -- UI text
+--   mono = "JetBrains Mono",      -- monospace text
+--   icons = "Symbols Nerd Font",  -- icon glyphs
+--   fallback = { "Noto Sans CJK JP", "Noto Color Emoji" }, -- missing glyphs, tried in order
+--   size = 14,                    -- base px, clamped 8..48; the bar height scales with it
+--   weight = "regular",           -- regular | bold
+-- }
+
+-- Status bar. `shell = true` runs the supervised shell bar (veil-bar, over
+-- layer-shell) and falls back to the built-in 12px bitmap bar if it crashes;
+-- `shell = false` means the built-in bar only. The shell bar takes its fonts
+-- from `font` above and its colours from `theme`.
 --
--- App labels render UPPERCASE regardless of case here — the bitmap font is
--- caps-only, same as the help overlay's keybind list.
+-- Widgets (names for left / center / right, drawn in the order listed):
+--   workspaces  window_title  clock  battery  cpu  memory  disk  temp
+--   network  audio  media  weather  systray  notifications
+--   control_center  activities  custom:<name>
+-- An unknown or unconfigured widget (e.g. weather without coordinates) is
+-- skipped with a log line; it never takes the bar down.
+--
+-- App tiles come from the Launch binds in `apps` below. There is no
+-- `bar.apps` list; the parser never read one.
 bar = {
 	enabled = true,   -- false hides the bar entirely and gives tiled windows
 	                   -- back the full output height
-	position = "bottom", -- top | bottom
-	shell = true,     -- run the supervised bar (veil shell bar) over layer-shell.
-	                   -- If it crashes, the built-in bar takes over again.
+	position = "top", -- top | bottom
+	height = 36,      -- px at the default font size (scales with font.size); clamped 24..64
+	shell = true,
 
-	-- Click any tile to launch it. This is separate from `keybinds.apps` /
-	-- top-level `apps` above — that table gives a shortcut a KEYBIND, this
-	-- one puts it on the BAR. Set both (matching name + exec) if you want
-	-- an app both clickable and keybound, e.g. `apps = { f = "firefox" }`
-	-- above alongside the firefox entry below for Alt+F too.
-	apps = {
-		{ name = "firefox",  exec = "firefox" },
-		{ name = "foot",     exec = "foot" },
-		{ name = "nautilus", exec = "nautilus" },
-		{ name = "code",     exec = "code" },
+	left   = { "window_title", "workspaces", "systray", "notifications", "activities" },
+	center = { "clock", "weather" },
+	right  = { "media", "cpu", "memory", "temp", "disk", "network", "audio", "control_center" },
+
+	-- Per-widget options.
+	widgets = {
+		clock = { format = "%a %b %d  %H:%M" }, -- strftime
+		disk  = { mount = "/" },
+		-- Fill in your coordinates (no auto-location) and uncomment; until then weather is skipped.
+		-- weather = { lat = 0.0, lon = 0.0, units = "metric" }, -- metric | imperial
+		-- custom = { uptime = { command = "uptime -p", interval = 30 } }, -- then add "custom:uptime" to a section
 	},
+}
+
+-- App binds (mod_key + key). Each one also appears as a clickable tile on the
+-- bar, in the order listed. Format: { key, command }; "enter" = Return.
+apps = {
+	{ "enter", "kitty" },          -- Alt+Enter
+	{ "b",     "helium-browser" }, -- Alt+B
+	{ "e",     "dolphin" },        -- Alt+E
 }
 
 -- Output backend. "auto" (default) picks terminal under a WM/SSH, DRM/KMS on
@@ -97,6 +130,7 @@ keybinds = {
 	swap = "s", -- Alt+S (swap with neighbor)
 	rotate = "r", -- Alt+R (rotate split axis)
 	close = "q", -- Alt+Q (close window)
+	fullscreen = "f", -- Alt+F (fullscreen the focused window)
 	resize_grow = "=", -- Alt+= (grow primary pane)
 	resize_shrink = "-",
 	toggle_layout = "w", --Switch between Dwindle and scroll window management, scroll has no window cap.
@@ -105,8 +139,8 @@ keybinds = {
 	volume_up = "[", -- Alt+[
 	volume_down = "]", -- Alt+]
 	-- volume_mute = "m",
-	-- brightness_up = "]",
-	-- brightness_down = "[",
+	-- brightness_up = ".",   -- not "]" / "[": those are the volume binds above
+	-- brightness_down = ",",
 }
 -- Help overlay: <mod_key>+/ (e.g. Alt+/ above) always toggles a keybind
 -- cheat-sheet — hardcoded, not itself a config entry.

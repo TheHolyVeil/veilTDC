@@ -353,6 +353,28 @@ fn bind_key(s: &str) -> Option<char> {
     }
 }
 
+/// (Lua field name, Action): order here is the help-menu display order.
+const KEYBIND_FIELDS: [(&str, Action); 18] = [
+    ("focus_left", Action::FocusLeft),
+    ("focus_right", Action::FocusRight),
+    ("focus_up", Action::FocusUp),
+    ("focus_down", Action::FocusDown),
+    ("swap", Action::Swap),
+    ("rotate", Action::Rotate),
+    ("close", Action::Close),
+    ("resize_grow", Action::ResizeGrow),
+    ("resize_shrink", Action::ResizeShrink),
+    ("toggle_layout", Action::ToggleLayout),
+    ("fullscreen", Action::ToggleFullscreen),
+    ("reload_config", Action::ReloadConfig),
+    ("wallpaper_chooser", Action::WallpaperChooser),
+    ("volume_up", Action::VolumeUp),
+    ("volume_down", Action::VolumeDown),
+    ("volume_mute", Action::VolumeMute),
+    ("brightness_up", Action::BrightnessUp),
+    ("brightness_down", Action::BrightnessDown),
+];
+
 fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
     let default = Keybinds::default();
     // No `keybinds` table: fall back to the globals table itself, so a bare
@@ -366,29 +388,7 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         .map(|s| ModKey::from_str(&s))
         .unwrap_or(default.mod_key);
 
-    // (Lua field name, Action) — order here is the help-menu display order.
-    const FIELDS: [(&str, Action); 18] = [
-        ("focus_left", Action::FocusLeft),
-        ("focus_right", Action::FocusRight),
-        ("focus_up", Action::FocusUp),
-        ("focus_down", Action::FocusDown),
-        ("swap", Action::Swap),
-        ("rotate", Action::Rotate),
-        ("close", Action::Close),
-        ("resize_grow", Action::ResizeGrow),
-        ("resize_shrink", Action::ResizeShrink),
-        ("toggle_layout", Action::ToggleLayout),
-        ("fullscreen", Action::ToggleFullscreen),
-        ("reload_config", Action::ReloadConfig),
-        ("wallpaper_chooser", Action::WallpaperChooser),
-        ("volume_up", Action::VolumeUp),
-        ("volume_down", Action::VolumeDown),
-        ("volume_mute", Action::VolumeMute),
-        ("brightness_up", Action::BrightnessUp),
-        ("brightness_down", Action::BrightnessDown),
-    ];
-
-    let mut binds: Vec<(char, Action)> = FIELDS
+    let mut binds: Vec<(char, Action)> = KEYBIND_FIELDS
         .iter()
         .filter_map(|(field, action)| {
             let key = match t.get::<mlua::Value>(*field) {
@@ -1106,6 +1106,156 @@ impl Default for VeilConfig {
     }
 }
 
+// ---- unknown-key warnings --------------------------------------------------
+// The parsers read what they know and ignore the rest, so a typo (or a key the
+// code never read, like the old `bar.apps`) used to fail silently. These
+// tables mirror what the parsers above read; extend them with the parsers.
+
+const TOP_KEYS: &[&str] = &[
+    "quality", "fps", "clipboard_sync", "refresh", "cage_timeout_secs", "input",
+    "gpu_render", "gpu_power", "output", "background", "theme", "theme_mode",
+    "keybinds", "apps", "font", "bar", "wallpaper",
+];
+const FONT_KEYS: &[&str] = &["family", "mono", "icons", "fallback", "size", "weight"];
+const WALLPAPER_KEYS: &[&str] = &["engine", "paths", "path", "interval", "shuffle", "fit"];
+const BAR_KEYS: &[&str] = &[
+    "enabled", "position", "shell", "height", "left", "center", "right", "widgets",
+];
+const WIDGET_KEYS: &[&str] = &["clock", "disk", "weather", "custom"];
+
+/// Keys a `keybinds` table accepts (also valid at top level when there is no
+/// `keybinds` table, because the parser falls back to the globals).
+fn keybind_keys() -> Vec<&'static str> {
+    ["mod_key", "apps"]
+        .into_iter()
+        .chain(KEYBIND_FIELDS.iter().map(|(f, _)| *f))
+        .collect()
+}
+
+fn global_names(gl: &mlua::Table) -> std::collections::HashSet<String> {
+    gl.pairs::<String, mlua::Value>()
+        .flatten()
+        .map(|(k, _)| k)
+        .collect()
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// The known key closest to `name`, if it is plausibly a typo of it.
+fn closest<'a>(name: &str, known: &[&'a str]) -> Option<&'a str> {
+    known
+        .iter()
+        .map(|k| (edit_distance(name, k), *k))
+        .filter(|(d, _)| *d <= 2 && *d < name.chars().count())
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
+}
+
+/// Keys that parse fine in Lua but that no code ever read, with what to do.
+fn dead_key_hint(full: &str) -> Option<&'static str> {
+    match full {
+        "bar.apps" => Some("bar tiles come from the Launch binds in `apps`"),
+        _ => None,
+    }
+}
+
+fn unknown_key_message(path: &str, name: &str, known: &[&str]) -> String {
+    let full = if path.is_empty() { name.to_string() } else { format!("{path}.{name}") };
+    if let Some(hint) = dead_key_hint(&full) {
+        return format!("[config] `{full}` is not read: {hint}");
+    }
+    match closest(name, known) {
+        Some(c) => format!("[config] unknown key `{full}` (ignored); did you mean `{c}`?"),
+        None => format!("[config] unknown key `{full}` (ignored)"),
+    }
+}
+
+/// Warn about named keys of `t` that are not in `known`. Positional entries
+/// (integer keys, like `wallpaper = { "a", "b" }`) are not names, so skipped.
+fn lint_table(path: &str, t: &mlua::Table, known: &[&str], out: &mut Vec<String>) {
+    let mut names: Vec<String> = t
+        .pairs::<mlua::Value, mlua::Value>()
+        .flatten()
+        .filter_map(|(k, _)| match k {
+            mlua::Value::String(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .filter(|n| !known.contains(&n.as_str()))
+        .collect();
+    names.sort();
+    out.extend(names.iter().map(|n| unknown_key_message(path, n, known)));
+}
+
+/// Every warning for a loaded config. `builtin` is the set of globals that
+/// existed before the user's script ran (the Lua stdlib), so only keys the
+/// script itself defined are checked. Helper functions are left alone.
+fn lint_config(gl: &mlua::Table, builtin: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let kb = gl.get::<mlua::Table>("keybinds").ok();
+    let mut top_known: Vec<&str> = TOP_KEYS.to_vec();
+    if kb.is_none() {
+        top_known.extend(keybind_keys());
+    }
+
+    let mut user: Vec<String> = gl
+        .pairs::<String, mlua::Value>()
+        .flatten()
+        .filter(|(k, v)| !builtin.contains(k) && !matches!(v, mlua::Value::Function(_)))
+        .map(|(k, _)| k)
+        .filter(|k| !top_known.contains(&k.as_str()))
+        .collect();
+    user.sort();
+    out.extend(user.iter().map(|k| unknown_key_message("", k, &top_known)));
+
+    if let Some(kb) = &kb {
+        lint_table("keybinds", kb, &keybind_keys(), &mut out);
+    }
+    if let Ok(t) = gl.get::<mlua::Table>("font") {
+        lint_table("font", &t, FONT_KEYS, &mut out);
+    }
+    if let Ok(t) = gl.get::<mlua::Table>("wallpaper") {
+        lint_table("wallpaper", &t, WALLPAPER_KEYS, &mut out);
+    }
+    if let Ok(bar) = gl.get::<mlua::Table>("bar") {
+        lint_table("bar", &bar, BAR_KEYS, &mut out);
+        if let Ok(w) = bar.get::<mlua::Table>("widgets") {
+            lint_table("bar.widgets", &w, WIDGET_KEYS, &mut out);
+            for (name, keys) in [
+                ("clock", &["format"][..]),
+                ("disk", &["mount"][..]),
+                ("weather", &["lat", "lon", "units"][..]),
+            ] {
+                if let Ok(t) = w.get::<mlua::Table>(name) {
+                    lint_table(&format!("bar.widgets.{name}"), &t, keys, &mut out);
+                }
+            }
+            if let Ok(c) = w.get::<mlua::Table>("custom") {
+                for (name, t) in c.pairs::<String, mlua::Table>().flatten() {
+                    lint_table(
+                        &format!("bar.widgets.custom.{name}"),
+                        &t,
+                        &["command", "interval"],
+                        &mut out,
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Parse `"#RRGGBB"` or `"RRGGBB"` into RGB bytes. `None` on anything else —
 /// callers fall back to the default rather than erroring the whole config.
 pub fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
@@ -1173,8 +1323,12 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
     };
 
     let lua = Lua::new();
+    let builtin = global_names(&lua.globals());
     if let Err(e) = lua.load(&src).exec() {
         return Err(format!("{e}"));
+    }
+    for w in lint_config(&lua.globals(), &builtin) {
+        eprintln!("{w}");
     }
 
     let d = VeilConfig::default();
@@ -1539,5 +1693,64 @@ mod bar_tests {
         let b = parse(r#"bar = { enabled = false, position = "bottom", shell = true }"#);
         assert!(!b.enabled && b.shell);
         assert_eq!(b.position, BarPosition::Bottom);
+    }
+}
+
+#[cfg(test)]
+mod lint_tests {
+    use super::*;
+
+    fn lint(src: &str) -> Vec<String> {
+        let lua = Lua::new();
+        let builtin = global_names(&lua.globals());
+        lua.load(src).exec().unwrap();
+        lint_config(&lua.globals(), &builtin)
+    }
+
+    #[test]
+    fn a_typo_names_the_key_and_suggests_the_fix() {
+        let w = lint(r#"bar = { heigth = 40 }"#);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("bar.heigth") && w[0].contains("did you mean `height`"), "{w:?}");
+        let w = lint(r#"thme = "nord""#);
+        assert!(w[0].contains("`thme`") && w[0].contains("`theme`"), "{w:?}");
+    }
+
+    #[test]
+    fn the_old_bar_apps_list_gets_a_pointer_not_a_guess() {
+        let w = lint(r#"bar = { apps = { { name = "x", exec = "x" } } }"#);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("not read") && w[0].contains("`apps`"), "{w:?}");
+    }
+
+    #[test]
+    fn nested_widget_and_font_keys_are_checked() {
+        let w = lint(
+            r#"font = { famly = "x" }
+               bar = { widgets = { weather = { lat = 1, lon = 2, unit = "metric" },
+                                   custom = { up = { cmd = "uptime" } } } }"#,
+        );
+        let joined = w.join("\n");
+        assert!(joined.contains("font.famly") && joined.contains("`family`"), "{w:?}");
+        assert!(joined.contains("bar.widgets.weather.unit"), "{w:?}");
+        assert!(joined.contains("bar.widgets.custom.up.cmd"), "{w:?}");
+    }
+
+    #[test]
+    fn valid_shapes_stay_quiet() {
+        // top-level keybind keys (no `keybinds` table), positional wallpaper
+        // entries, helper functions and locals are all fine
+        assert!(lint(r#"mod_key = "alt"
+                         focus_left = "h"
+                         wallpaper = { "a.png", "b.png", shuffle = true }
+                         function helper() end"#).is_empty());
+        assert!(lint(r#"keybinds = { mod_key = "alt", fullscreen = "f", apps = { { "enter", "kitty" } } }
+                         font = "Inter""#).is_empty());
+    }
+
+    #[test]
+    fn the_shipped_config_has_no_warnings() {
+        // keeps ./config.lua honest as the parser grows
+        assert_eq!(lint(include_str!("../../../config.lua")), Vec::<String>::new());
     }
 }

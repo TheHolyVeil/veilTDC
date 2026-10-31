@@ -2165,7 +2165,6 @@ fn draw_osd_overlay(osd: &OsdNotification, ts: &mut veil_text::TextSystem, back:
 
     let font_size = 13.0_f32;
     let (char_w, line_h_f) = ts.measure("M", Role::UI, font_size);
-    let char_w = char_w as i32;
     let line_h = (line_h_f + 4.0) as i32;
     let pad = 12i32;
 
@@ -2180,13 +2179,9 @@ fn draw_osd_overlay(osd: &OsdNotification, ts: &mut veil_text::TextSystem, back:
         lines.push(body_line);
     }
 
-    let text_cols = lines
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(18) as i32;
-    let box_w = (text_cols * char_w + pad * 2).max(220) as u32;
+    let min_text_w = (18.0 * char_w).ceil() as i32;
+    let text_w = (widest_line_px(ts, &lines, font_size) as i32).max(min_text_w);
+    let box_w = (text_w + pad * 2).max(220) as u32;
     let box_h =
         (lines.len() as i32 * line_h + pad * 2 + if has_bar { bar_h } else { 0 }) as u32;
 
@@ -3876,8 +3871,7 @@ fn draw_help_overlay(
     use veil_text::Role;
 
     let font_size = 13.0_f32;
-    let (char_w, line_h_f) = ts.measure("M", Role::UI, font_size);
-    let char_w = char_w as u32;
+    let (_, line_h_f) = ts.measure("M", Role::UI, font_size);
     let line_h = (line_h_f + 4.0) as u32;
     let pad = 12i32;
 
@@ -3902,8 +3896,7 @@ fn draw_help_overlay(
     lines.push("ALT+TAB  CYCLE WINDOWS".to_string());
     lines.push("SHIFT+ALT+E  QUIT (GRACEFUL)".to_string());
 
-    let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u32;
-    let box_w = text_cols * char_w + pad as u32 * 2;
+    let box_w = widest_line_px(ts, &lines, font_size) + pad as u32 * 2;
     let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
@@ -3927,6 +3920,19 @@ fn draw_help_overlay(
     }
 }
 
+/// Width in px of the widest line, measured with the real font. Modal boxes
+/// used to be `chars x width("M")` with that width truncated to an integer,
+/// which only holds for a monospace font with a whole-pixel advance. At 13px
+/// a 7.8px advance became 7, leaving the box ~10% short, so the title line
+/// hung off the right edge once the UI font became JetBrains Mono.
+fn widest_line_px(ts: &mut veil_text::TextSystem, lines: &[String], font_size: f32) -> u32 {
+    lines
+        .iter()
+        .map(|l| ts.measure(l, veil_text::Role::UI, font_size).0)
+        .fold(0.0_f32, f32::max)
+        .ceil() as u32
+}
+
 /// `<mod_key>+D` launcher modal: query box + top matches, same font/box
 /// style as the help overlay. Selected row gets a highlight bar.
 fn draw_launcher_overlay(
@@ -3944,7 +3950,6 @@ fn draw_launcher_overlay(
     const PAGE_SIZE: usize = 10;
     let font_size = 13.0_f32;
     let (char_w, line_h_f) = ts.measure("M", Role::UI, font_size);
-    let char_w = char_w as u32;
     let line_h = (line_h_f + 4.0) as u32;
     let pad = 12i32;
 
@@ -3983,13 +3988,8 @@ fn draw_launcher_overlay(
         }
     }
 
-    let text_cols = lines
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(40) as u32;
-    let box_w = text_cols * char_w + pad as u32 * 2;
+    let min_text_w = (40.0 * char_w).ceil() as u32;
+    let box_w = widest_line_px(ts, &lines, font_size).max(min_text_w) + pad as u32 * 2;
     let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
@@ -4047,7 +4047,6 @@ fn draw_power_menu_overlay(
 
     let font_size = 13.0_f32;
     let (char_w, line_h_f) = ts.measure("M", Role::UI, font_size);
-    let char_w = char_w as u32;
     let line_h = (line_h_f + 4.0) as u32;
     let pad = 12i32;
 
@@ -4063,13 +4062,8 @@ fn draw_power_menu_overlay(
         lines.push(a.label().to_string());
     }
 
-    let text_cols = lines
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(40) as u32;
-    let box_w = text_cols * char_w + pad as u32 * 2;
+    let min_text_w = (40.0 * char_w).ceil() as u32;
+    let box_w = widest_line_px(ts, &lines, font_size).max(min_text_w) + pad as u32 * 2;
     let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
     let x0 = ((w as i32 - box_w as i32) / 2).max(0);
     let y0 = ((h as i32 - box_h as i32) / 2).max(0);
