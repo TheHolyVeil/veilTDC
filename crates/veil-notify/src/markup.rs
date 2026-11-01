@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(plain(&parse("1 < 2 and 3 > 2")), "1 < 2 and 3 > 2");
         assert_eq!(plain(&parse("a <")), "a <");
         assert_eq!(plain(&parse("<<b>x")), "<x");
-        assert_eq!(plain(&parse("x<3>")), "x");
+        assert_eq!(plain(&parse("x<3>")), "x<3>", "a tag name must start with a letter");
     }
 
     #[test]
@@ -358,8 +358,8 @@ mod tests {
         let out = sanitize("<b>0123456789</b>", 8);
         assert_eq!(out, "<b>01234\u{2026}</b>", "cut inside the text, tags rebalanced");
         // a cut that lands inside a tag or entity drops the fragment
-        assert_eq!(sanitize("abcd<b", 6), "abcd\u{2026}");
-        assert_eq!(sanitize("abcd&am", 7), "abcd\u{2026}");
+        assert_eq!(sanitize("abcd<bold>", 6), "abcd\u{2026}");
+        assert_eq!(sanitize("abcd&amp;x", 7), "abcd\u{2026}");
         assert_eq!(sanitize("ééé", 3), "é\u{2026}");
         assert_eq!(sanitize("short", 100), "short");
         assert_eq!(sanitize("trailing  \n", 100), "trailing");

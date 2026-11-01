@@ -9,6 +9,7 @@ members = [
     "crates/veil-palette",
     "crates/veil-ui",
     "crates/veil-bar",
+    "crates/veil-notify",
     "crates/veil",
 ]
 resolver = "2"
