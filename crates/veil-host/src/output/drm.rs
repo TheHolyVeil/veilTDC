@@ -57,6 +57,13 @@ struct Monitor {
     crtc: crtc::Handle,
     conn: connector::Handle,
     mode: Mode,
+    /// Every mode the connector offered (kernel order, preferred first),
+    /// kept for wlr-output-management.
+    modes: Vec<Mode>,
+    /// Kernel-style connector name, e.g. `DP-1`, `HDMI-A-2`.
+    name: String,
+    /// Physical size in mm as reported by EDID; (0, 0) if unknown.
+    phys_mm: (u32, u32),
     width: u32,
     height: u32,
     bufs: [DumbBuffer; 2],
@@ -112,6 +119,25 @@ fn mode_mhz(m: &drm::control::Mode) -> u32 {
         return m.vrefresh() * 1000;
     }
     (m.clock() as u64 * 1_000_000 / denom) as u32
+}
+
+/// Kernel-style connector name (`DP-1`, `HDMI-A-2`, `eDP-1`). Matches on the
+/// variant's Debug text so it can't break if the `drm` crate adds variants.
+fn connector_name(iface: connector::Interface, id: u32) -> String {
+    let raw = format!("{iface:?}");
+    let base = match raw.as_str() {
+        "DisplayPort" => "DP",
+        "EmbeddedDisplayPort" => "eDP",
+        "HDMIA" => "HDMI-A",
+        "HDMIB" => "HDMI-B",
+        "DVII" => "DVI-I",
+        "DVID" => "DVI-D",
+        "DVIA" => "DVI-A",
+        "SVideo" => "SVIDEO",
+        "NinePinDIN" => "DIN",
+        other => other,
+    };
+    format!("{base}-{id}")
 }
 
 /// Choose the mode to drive. Resolution is always the first (preferred)
@@ -401,6 +427,9 @@ impl DrmOutput {
                     crtc,
                     conn: con.handle(),
                     mode,
+                    modes: con.modes().to_vec(),
+                    name: connector_name(con.interface(), con.interface_id()),
+                    phys_mm: con.size().unwrap_or((0, 0)),
                     width,
                     height,
                     bufs: [b0, b1],
@@ -664,6 +693,40 @@ impl OutputBackend for DrmOutput {
             }
         }
         Ok(())
+    }
+
+    fn heads(&self) -> Vec<crate::output_management::HeadInfo> {
+        use crate::output_management::{HeadInfo, ModeInfo};
+        self.monitors
+            .iter()
+            .map(|m| {
+                let same = |a: &Mode, b: &Mode| {
+                    a.size() == b.size() && a.clock() == b.clock() && mode_mhz(a) == mode_mhz(b)
+                };
+                HeadInfo {
+                    name: m.name.clone(),
+                    description: m.name.clone(),
+                    make: String::new(),
+                    model: String::new(),
+                    phys_mm: (m.phys_mm.0 as i32, m.phys_mm.1 as i32),
+                    modes: m
+                        .modes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, md)| ModeInfo {
+                            width: md.size().0 as i32,
+                            height: md.size().1 as i32,
+                            refresh_mhz: mode_mhz(md) as i32,
+                            // Same assumption pick_mode makes: the kernel
+                            // lists the preferred mode first.
+                            preferred: i == 0,
+                        })
+                        .collect(),
+                    current: m.modes.iter().position(|md| same(md, &m.mode)).unwrap_or(0),
+                    position: (0, 0), // filled in by the compositor
+                }
+            })
+            .collect()
     }
 
     fn get_size(&self, monitor: usize) -> (u32, u32) {

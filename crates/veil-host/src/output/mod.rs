@@ -79,6 +79,14 @@ pub trait OutputBackend {
         false
     }
 
+    /// Snapshot of every output's identity and mode list, for
+    /// wlr-output-management. Same order as `0..monitor_count()`. Empty
+    /// (the default) means "can't reconfigure": the protocol is then not
+    /// advertised at all.
+    fn heads(&self) -> Vec<crate::output_management::HeadInfo> {
+        Vec::new()
+    }
+
     /// Poll for output backend events (e.g. DRM VBLANK completion).
     /// Returns Ok(true) if an event was processed.
     fn poll_events(&mut self, _timeout: std::time::Duration) -> io::Result<bool> {

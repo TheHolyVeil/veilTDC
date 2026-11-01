@@ -47,6 +47,14 @@ pub enum InputCmd {
         refresh_per_monitor: Vec<u32>,
     },
 
+    /// Output-management snapshot (one entry per head, same order as
+    /// `SetMonitors.sizes`), sent right after `SetMonitors`. Empty/absent
+    /// for the terminal backend, which then never advertises the
+    /// wlr-output-management global.
+    SetHeads {
+        heads: Vec<crate::output_management::HeadInfo>,
+    },
+
     /// Display an On-Screen Display (OSD) popup overlay.
     Osd {
         title: String,

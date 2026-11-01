@@ -1,0 +1,17 @@
+[package]
+name        = "veil-notify"
+version     = "0.1.0"
+edition     = "2021"
+description = "Veil notification service: data model, markup sanitiser, history store, rate limiter"
+
+# Step 1 of phase 4 is pure data logic: no D-Bus, no Wayland. zbus, veil-ui and
+# veil-ipc join in the later steps.
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+libc       = { workspace = true }
+
+[dev-dependencies]
+tempfile   = { workspace = true }

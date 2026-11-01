@@ -30,6 +30,7 @@ libc               = { workspace = true }
 image              = { workspace = true, features = ["png", "jpeg"] }
 wayland-protocols  = { workspace = true }
 wayland-server     = { workspace = true }
+wayland-protocols-wlr = { workspace = true, features = ["server"] }
 tracing-subscriber = { workspace = true }
 wl-clipboard-rs    = { workspace = true }
 mimalloc           = { workspace = true }

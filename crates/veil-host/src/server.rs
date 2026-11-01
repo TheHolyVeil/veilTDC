@@ -364,6 +364,10 @@ pub struct State {
     /// 1280x720 startup guess.
     pub shell_ready: bool,
     pub shell_started: bool,
+    /// wlr-output-management state (heads/modes snapshot + bound clients).
+    pub(crate) output_mgmt: crate::output_management::OutputManagement,
+    /// ext-idle-notify listeners + idle-inhibit tracking.
+    pub(crate) idle_notify: crate::idle_notify::IdleNotify,
     /// One entry per physical display, side by side left-to-right in
     /// detection order (see `InputCmd::SetMonitors`). `monitors[0]` is what
     /// the old flat `output_w`/`output_h`/`pointer_pos`/`fullscreen`/
@@ -1128,8 +1132,14 @@ impl PointerConstraintsHandler for State {
 }
 
 impl IdleInhibitHandler for State {
-    fn inhibit(&mut self, _surface: WlSurface) {}
-    fn uninhibit(&mut self, _surface: WlSurface) {}
+    fn inhibit(&mut self, surface: WlSurface) {
+        let lh = self.loop_handle.clone();
+        self.idle_notify.inhibit(surface, lh.as_ref());
+    }
+    fn uninhibit(&mut self, surface: WlSurface) {
+        let lh = self.loop_handle.clone();
+        self.idle_notify.uninhibit(&surface, lh.as_ref());
+    }
 }
 
 impl TabletSeatHandler for State {}
@@ -4281,6 +4291,20 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
     let serial = state.next_serial();
     let time = state.start_time.elapsed().as_millis() as u32;
 
+    // ext-idle-notify: every real input source (evdev, crossterm, touch,
+    // SSH-injected, ...) funnels through here, and this runs *before*
+    // routing to nested compositors, so typing into a nested Niri still
+    // counts as activity.
+    if matches!(
+        cmd,
+        InputCmd::Key { .. }
+            | InputCmd::PointerMotionAbs { .. }
+            | InputCmd::PointerButton { .. }
+            | InputCmd::Scroll { .. }
+    ) {
+        state.idle_notify.activity(state.loop_handle.as_ref());
+    }
+
     match cmd {
         InputCmd::Key {
             keycode, pressed, ..
@@ -4716,6 +4740,18 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // Retile everyone into the new output extent.
             rearrange_layers(state);
             relayout(state);
+        }
+
+        InputCmd::SetHeads { mut heads } => {
+            // Positions come from the compositor's own arrangement, not the
+            // backend (which has no idea where monitors sit in the row).
+            for (i, h) in heads.iter_mut().enumerate() {
+                if let Some(m) = state.monitors.get(i) {
+                    h.position = (m.rect.x, m.rect.y);
+                }
+            }
+            let dh = state.display_handle.clone();
+            state.output_mgmt.set_heads(&dh, heads);
         }
 
         InputCmd::SetMonitors {
@@ -5661,6 +5697,8 @@ pub fn run(
         keyboard,
         pointer,
         layer_outputs: vec![output.clone()],
+        output_mgmt: Default::default(),
+        idle_notify: crate::idle_notify::IdleNotify::new(&dh),
         layer_shell: LayerShellManager::new::<State>(&dh),
         ipc: IpcServer::new(),
         supervisor: Supervisor::new(),
