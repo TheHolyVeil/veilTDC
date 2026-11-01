@@ -26,16 +26,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build velogin
-        run: cargo build --release -p veil-login --bin velogin
+        run: cargo build --release --bin velogin
       - name: Stage release bundle
         run: |
           set -eu
           rm -rf release
           mkdir -p release/velogin/dist/pam.d
           cp target/release/velogin release/velogin/velogin
-          cp veil-login/dist/velogin.service release/velogin/dist/velogin.service
-          cp veil-login/dist/pam.d/velogin release/velogin/dist/pam.d/velogin
-          cp veil-login/dist/install.sh release/velogin/install.sh
+          cp crates/veil-login/dist/velogin.service release/velogin/dist/velogin.service
+          cp crates/veil-login/dist/pam.d/velogin release/velogin/dist/pam.d/velogin
+          cp crates/veil-login/dist/install.sh release/velogin/install.sh
           chmod 755 release/velogin/velogin release/velogin/install.sh
       - name: Create velogin tarball
         run: |
