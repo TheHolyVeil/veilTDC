@@ -18,7 +18,7 @@ impl IdGen {
     /// A fresh id. Wraps from `u32::MAX` to 1, skipping 0.
     pub fn alloc(&self) -> u32 {
         self.0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(if v == u32::MAX { 1 } else { v + 1 }))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(if v == u32::MAX { 1 } else { v + 1 }))
             .unwrap_or(1)
     }
 

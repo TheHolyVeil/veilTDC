@@ -222,3 +222,119 @@ fn invalid<E: Into<Box<dyn std::error::Error + Send + Sync>>>(e: E) -> io::Error
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::test_notification as n;
+
+    #[test]
+    fn push_replaces_and_evicts_oldest() {
+        let mut s = Store::new(3);
+        for id in 1..=3 {
+            assert!(s.push(n(id, "x")).is_empty());
+        }
+        assert_eq!(s.push(n(4, "x")), vec![1]);
+        assert_eq!(s.newest_first().map(|n| n.id).collect::<Vec<_>>(), vec![4, 3, 2]);
+        // replacing id 2 moves it to the newest slot without evicting
+        assert!(s.push(n(2, "new")).is_empty());
+        assert_eq!(s.newest_first().map(|n| n.id).collect::<Vec<_>>(), vec![2, 4, 3]);
+        assert_eq!(s.get(2).unwrap().summary, "new");
+        assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn unread_read_remove_clear() {
+        let mut s = Store::new(10);
+        s.push(n(1, "a"));
+        s.push(n(2, "b"));
+        assert_eq!(s.summary(), Summary { count: 2, dnd: false });
+        assert!(s.mark_all_read());
+        assert!(!s.mark_all_read(), "second call changes nothing");
+        assert_eq!(s.unread(), 0);
+        assert_eq!(s.remove(1).unwrap().id, 1);
+        assert!(s.remove(1).is_none());
+        assert_eq!(s.clear(), 1);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn dnd_and_dirty_tracking() {
+        let mut s = Store::new(10);
+        assert!(!s.take_dirty());
+        assert!(s.set_dnd(true));
+        assert!(!s.set_dnd(true), "no change, no dirt");
+        assert!(s.take_dirty());
+        assert!(!s.take_dirty(), "reading the flag clears it");
+        s.push(n(1, "a"));
+        assert!(s.take_dirty());
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("veil").join("notify-history.json");
+        let mut s = Store::new(100);
+        for id in 1..=3 {
+            let mut note = n(id, &format!("note {id}"));
+            note.image = Some(crate::model::Image { width: 1, height: 1, rgba: vec![1, 2, 3, 4] });
+            s.push(note);
+        }
+        s.mark_all_read();
+        s.set_dnd(true);
+        s.save(&path, 4).unwrap();
+
+        let back = Store::load(&path, &Limits::default());
+        assert_eq!(back.next_id, 4, "ids continue after a restart");
+        let back = back.store;
+        assert_eq!(back.len(), 3);
+        assert!(back.dnd());
+        assert_eq!(back.unread(), 0);
+        assert_eq!(back.get(2).unwrap().summary, "note 2");
+        assert!(back.get(2).unwrap().image.is_none(), "images are not persisted");
+    }
+
+    #[test]
+    fn file_and_directory_are_private_and_no_temp_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("veil").join("notify-history.json");
+        Store::new(10).save(&path, 1).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        let leftovers = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "only the history file remains");
+    }
+
+    #[test]
+    fn bad_files_load_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.json");
+        let lim = Limits::default();
+        assert!(Store::load(&path, &lim).store.is_empty(), "missing");
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(Store::load(&path, &lim).store.is_empty(), "corrupt");
+        std::fs::write(&path, br#"{"version":99,"next_id":5,"dnd":true,"items":[]}"#).unwrap();
+        let loaded = Store::load(&path, &lim);
+        assert!(!loaded.store.dnd(), "wrong version is ignored whole");
+        assert_eq!(loaded.next_id, 1);
+        std::fs::write(&path, vec![b' '; (MAX_FILE_BYTES + 1) as usize]).unwrap();
+        assert!(Store::load(&path, &lim).store.is_empty(), "oversize");
+    }
+
+    #[test]
+    fn load_repairs_ids_dupes_and_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.json");
+        let mut s = Store::new(100);
+        for id in [1, 2, 3, 9] {
+            s.push(n(id, "x"));
+        }
+        // a file claiming a counter below its own entries
+        s.save(&path, 2).unwrap();
+        assert_eq!(Store::load(&path, &Limits::default()).next_id, 10, "counter jumps past the highest id");
+
+        let lim = Limits { history: 2, ..Limits::default() };
+        let capped = Store::load(&path, &lim).store;
+        assert_eq!(capped.newest_first().map(|n| n.id).collect::<Vec<_>>(), vec![9, 3]);
+    }
+}

@@ -4,14 +4,18 @@ version     = "0.1.0"
 edition     = "2021"
 description = "Veil notification service: data model, markup sanitiser, history store, rate limiter"
 
-# Step 1 of phase 4 is pure data logic: no D-Bus, no Wayland. zbus, veil-ui and
+# Steps 1 and 2 are pure logic. Step 3 adds the D-Bus service (zbus, driven by
+# one worker thread, same pattern as veil-bar's media widget). veil-ui and
 # veil-ipc join in the later steps.
 [dependencies]
-serde      = { workspace = true }
-serde_json = { workspace = true }
-thiserror  = { workspace = true }
-tracing    = { workspace = true }
-libc       = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+libc              = { workspace = true }
+zbus              = { workspace = true }
+crossbeam-channel = { workspace = true }
+futures-lite      = { workspace = true }
 
 [dev-dependencies]
 tempfile   = { workspace = true }

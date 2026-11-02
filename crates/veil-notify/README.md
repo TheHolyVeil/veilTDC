@@ -3,20 +3,24 @@
 The Veil notification service (phase 4 of the Veil Shell Architecture).
 Scope and decisions live in `Veil_Shell.md`, section 11, Phase 4.
 
-## State: step 2 of 7 (pure logic: data, timing, geometry)
+## State: step 3 of 7 (data, timing, geometry, D-Bus service)
 
 | Step | What | State |
 | --- | --- | --- |
 | 1 | `text`, `markup`, `model`, `store`, `rate` | done |
-| 2 | `timers` (expiry state machine), `layout` (toast stack geometry) | done, 58 tests total |
-| 3 | `dbus` (zbus 6 service, signals, name queueing) | next |
-| 4 | IPC wiring, host relay, bell fix in `veil-bar` | |
+| 2 | `timers` (expiry state machine), `layout` (toast stack geometry) | done |
+| 3 | `dbus` (zbus 6 service, signals, name queueing), `ids` | done, 72 tests total |
+| 4 | IPC wiring, host relay, bell fix in `veil-bar` | next |
 | 5 | toasts | |
 | 6 | history panel | |
 | 7 | supervisor and `veil shell notify` registration | |
 
-No D-Bus, no Wayland, no threads yet: everything here is deterministic and
-the clock is always an argument.
+No Wayland yet. Everything except `dbus` is deterministic and takes the clock as
+an argument. `dbus` runs one worker thread (`veil-notify-dbus`) and talks to the
+main loop only through channels. Try it without any UI:
+
+    cargo run -p veil-notify --example headless
+    notify-send -A yes=Yes --wait "hi"        # prints: yes
 
 ## Invariants (do not break)
 
@@ -28,12 +32,27 @@ the clock is always an argument.
 - **Banned characters** (controls, bidi overrides) never reach a stored string.
 - **Action keys are never truncated**, because they are echoed back to the app
   in `ActionInvoked`. A key that is too long is dropped with its action.
-- **Ids** are never 0 and never reused across a restart: the counter is in the
-  history file and is lifted above the highest stored id on load.
+- **Ids** are never 0 and never reused across a restart. The counter is an
+  `ids::IdGen` (atomic, shared with the D-Bus thread, which must return an id
+  synchronously); the main loop saves `IdGen::peek()` with the history and
+  `store::Loaded::next_id` is lifted above the highest stored id on load.
 - **History file**: `$XDG_RUNTIME_DIR/veil/notify-history.json`, 0600, directory
   0700, written by temp file plus rename. Loading never fails: a missing,
   foreign-owned, oversized, corrupt or wrong-version file is an empty store.
   Images are not persisted. Restored entries are history only, never re-toasted.
+- **D-Bus name**: requested with *no* flags (queue, never steal, not replaceable).
+  zbus's `Builder::name` and `request_name` use `REPLACE_EXISTING | DO_NOT_QUEUE`,
+  the opposite, so the name is requested with `request_name_with_flags` after
+  `serve_at`. A queued daemon polls for ownership every 2 s; an owner never wakes
+  on its own.
+- **`replaces_id` / `CloseNotification` work for any caller** if the id was
+  handed out. Do not add per-sender ownership: every `notify-send -r` is a new
+  bus connection, so it breaks the standard volume-script pattern, and any
+  session client can already post under any app name. `replaces_id` returns the
+  same id (spec); an id never handed out is not honoured.
+- **D-Bus handlers stay cheap**: parse, sanitise, allocate an id, `try_send` into
+  a bounded channel (256). A full queue drops the event, it never blocks D-Bus
+  or grows memory.
 - **Rate limiter table is bounded** (256 apps, then one shared bucket).
 - **Timers**: only the newest `max_visible` toasts count down; hidden ones are
   paused, never expired unseen. Hover pauses all of them. Critical and timeout 0
@@ -54,6 +73,9 @@ rate limit 20 per 10 s per app, default timeout 5 s (clamped 0.5 s to 1 h),
 
 ## Known limits
 
+- We do not emit the optional `ActivationToken` signal (spec 1.3).
+- Two zbus builds exist in the workspace: 6.x here and in `veil-bar`, 5.19 pulled
+  in by Slint (velogin). Harmless, costs compile time only.
 - `x<y and z>w` reads as a tag and loses `<y and z>`. Ambiguous input; the
   alternative is rendering real tags as text, which is worse.
 - `<br>` is accepted as a newline though the spec does not list it; apps send it.
