@@ -30,6 +30,9 @@ pub struct IpcServer {
     socket_path: PathBuf,
     next_client_id: usize,
     clients: HashMap<usize, IpcClient>,
+    /// Last `notifications` event, replayed to anyone who subscribes later
+    /// (a restarted bar must not show a stale bell until the next change).
+    notifications: Option<serde_json::Value>,
 }
 
 impl IpcServer {
@@ -43,6 +46,7 @@ impl IpcServer {
             socket_path: path,
             next_client_id: 1,
             clients: HashMap::new(),
+            notifications: None,
         }
     }
 
@@ -285,6 +289,45 @@ impl IpcServer {
         self.flush_outgoing();
     }
 
+    /// The notification commands. `notifications.set` (from `notify`) is cached
+    /// and rebroadcast as the `notifications` event; `notify.dnd` and
+    /// `notify.panel` (from keybinds, `veil ctl`, the bar) go to `notify` as a
+    /// `notify.control` event. `None` when `cmd` is not one of them.
+    pub fn notify_command(
+        &mut self,
+        cmd: &str,
+        args: &serde_json::Value,
+    ) -> Option<Result<Option<serde_json::Value>, String>> {
+        use veil_ipc::{
+            commands as c,
+            notify::{Control, NotificationsState},
+            topics,
+        };
+        let control = match cmd {
+            c::NOTIFICATIONS_SET => {
+                let state = match NotificationsState::from_args(args) {
+                    Ok(s) => s,
+                    Err(e) => return Some(Err(e)),
+                };
+                let data = serde_json::to_value(state).unwrap_or_default();
+                self.notifications = Some(data.clone());
+                self.broadcast(topics::NOTIFICATIONS, data);
+                return Some(Ok(None));
+            }
+            c::NOTIFY_DND => Control::dnd_from_args(args),
+            c::NOTIFY_PANEL => Control::panel_from_args(args),
+            _ => return None,
+        };
+        Some(control.and_then(|ctl| {
+            // Nobody to tell: say so instead of pretending it worked.
+            if !self.has_subscriber(topics::NOTIFY_CONTROL) {
+                return Err("notify is not running".into());
+            }
+            self.broadcast(topics::NOTIFY_CONTROL, serde_json::to_value(ctl).unwrap_or_default());
+            Ok(None)
+        }))
+    }
+
     /// Handle standard protocol messages (Hello, Subscribe, Ping) internally.
     /// Non-standard or command messages are returned for the compositor to dispatch.
     pub fn process_message(
@@ -313,9 +356,16 @@ impl IpcServer {
                 None
             }
             ClientMessage::Subscribe { topics } => {
+                let wants_notifications = topics.iter().any(|t| t == veil_ipc::topics::NOTIFICATIONS);
                 if let Some(client) = self.clients.get_mut(&client_id) {
                     for t in topics {
                         client.subscriptions.insert(t);
+                    }
+                }
+                if wants_notifications {
+                    if let Some(data) = self.notifications.clone() {
+                        let event = ServerMessage::Event { topic: veil_ipc::topics::NOTIFICATIONS.into(), data };
+                        let _ = self.send_to(client_id, &event);
                     }
                 }
                 None
@@ -379,6 +429,176 @@ mod tests {
         let msgs = server.poll_incoming();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].1, hello);
+    }
+
+    // ---- notification relay
+
+    /// A connected, subscribed test client, plus the server-side bookkeeping.
+    fn connect_subscribed(server: &mut IpcServer, path: &std::path::Path, topics: &[&str]) -> UnixStream {
+        let client = UnixStream::connect(path).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+        server.poll_incoming();
+        let id = *server.clients.keys().max().unwrap();
+        let sub = ClientMessage::Subscribe { topics: topics.iter().map(|t| t.to_string()).collect() };
+        server.process_message(id, sub, serde_json::Value::Null, serde_json::Value::Null);
+        client
+    }
+
+    /// Every event the client has received so far.
+    fn drain_events(client: &mut UnixStream) -> Vec<(String, serde_json::Value)> {
+        let mut fb = FrameBuffer::new();
+        let mut buf = [0u8; 4096];
+        if let Ok(n) = client.read(&mut buf) {
+            fb.push(&buf[..n]).unwrap();
+        }
+        let mut out = Vec::new();
+        while let Ok(Some(ServerMessage::Event { topic, data })) = fb.next_frame::<ServerMessage>() {
+            out.push((topic, data));
+        }
+        out
+    }
+
+    fn server_at(dir: &tempfile::TempDir) -> (IpcServer, PathBuf) {
+        let path = dir.path().join("n.sock");
+        let mut server = IpcServer::with_path(path.clone());
+        server.bind().unwrap();
+        (server, path)
+    }
+
+    #[test]
+    fn notifications_set_is_rebroadcast_and_replayed_to_late_subscribers() {
+        let dir = tempdir().unwrap();
+        let (mut server, path) = server_at(&dir);
+        let mut early = connect_subscribed(&mut server, &path, &["notifications"]);
+
+        let r = server.notify_command("notifications.set", &serde_json::json!({"count": 3, "dnd": false}));
+        assert!(matches!(r, Some(Ok(None))));
+        assert_eq!(
+            drain_events(&mut early),
+            vec![("notifications".to_string(), serde_json::json!({"count": 3, "dnd": false}))]
+        );
+
+        // A bar that starts (or restarts) afterwards gets the current state at once.
+        let mut late = connect_subscribed(&mut server, &path, &["workspaces", "notifications"]);
+        assert_eq!(
+            drain_events(&mut late),
+            vec![("notifications".to_string(), serde_json::json!({"count": 3, "dnd": false}))]
+        );
+        // ...and a client that does not ask for the topic gets nothing.
+        let mut other = connect_subscribed(&mut server, &path, &["workspaces"]);
+        assert!(drain_events(&mut other).is_empty());
+    }
+
+    #[test]
+    fn notifications_set_rejects_bad_arguments_and_caches_nothing() {
+        let dir = tempdir().unwrap();
+        let (mut server, path) = server_at(&dir);
+        for bad in [serde_json::Value::Null, serde_json::json!({"count": 1}), serde_json::json!({"count": "x", "dnd": true})] {
+            assert!(matches!(server.notify_command("notifications.set", &bad), Some(Err(_))), "{bad}");
+        }
+        let mut late = connect_subscribed(&mut server, &path, &["notifications"]);
+        assert!(drain_events(&mut late).is_empty(), "a rejected update must not become the replayed state");
+    }
+
+    #[test]
+    fn dnd_and_panel_reach_notify_as_control_events() {
+        let dir = tempdir().unwrap();
+        let (mut server, path) = server_at(&dir);
+        let mut notify = connect_subscribed(&mut server, &path, &["notify.control"]);
+
+        assert!(matches!(server.notify_command("notify.dnd", &serde_json::Value::Null), Some(Ok(None))));
+        assert!(matches!(server.notify_command("notify.dnd", &serde_json::json!({"mode": "off"})), Some(Ok(None))));
+        assert!(matches!(server.notify_command("notify.panel", &serde_json::json!({"mode": "open"})), Some(Ok(None))));
+        assert_eq!(
+            drain_events(&mut notify),
+            vec![
+                ("notify.control".to_string(), serde_json::json!({"dnd": "toggle"})),
+                ("notify.control".to_string(), serde_json::json!({"dnd": "off"})),
+                ("notify.control".to_string(), serde_json::json!({"panel": "open"})),
+            ]
+        );
+    }
+
+    #[test]
+    fn control_commands_fail_loudly_when_notify_is_not_listening() {
+        let dir = tempdir().unwrap();
+        let (mut server, path) = server_at(&dir);
+        assert_eq!(server.notify_command("notify.dnd", &serde_json::Value::Null), Some(Err("notify is not running".into())));
+        // A bar subscribed to `notifications` is not a listener for control events.
+        let _bar = connect_subscribed(&mut server, &path, &["notifications"]);
+        assert_eq!(server.notify_command("notify.panel", &serde_json::Value::Null), Some(Err("notify is not running".into())));
+    }
+
+    #[test]
+    fn bad_modes_and_foreign_commands_are_handled() {
+        let dir = tempdir().unwrap();
+        let (mut server, path) = server_at(&dir);
+        let mut notify = connect_subscribed(&mut server, &path, &["notify.control"]);
+        let r = server.notify_command("notify.dnd", &serde_json::json!({"mode": "maybe"}));
+        assert_eq!(r, Some(Err("mode must be on, off or toggle".into())));
+        assert!(drain_events(&mut notify).is_empty(), "nothing is sent for a rejected request");
+        assert!(server.notify_command("config.reload", &serde_json::Value::Null).is_none(), "not ours");
+    }
+
+    /// The real notify client against the real server: the wire format, the
+    /// handshake order, the relay, the replay and the reconnect all have to agree.
+    #[test]
+    fn real_notify_client_and_real_server_agree() {
+        use std::time::{Duration, Instant};
+        use veil_ipc::notify::{Control, DndMode, NotificationsState};
+        use veil_notify::ipc::{Incoming, Ipc, IpcConfig};
+
+        let dir = tempdir().unwrap();
+        let (mut server, path) = server_at(&dir);
+        let ipc = Ipc::spawn(IpcConfig {
+            socket: path.clone(),
+            ping: Duration::from_millis(100),
+            retry_min: Duration::from_millis(20),
+            retry_max: Duration::from_millis(50),
+        })
+        .unwrap();
+
+        // Drive the server like the compositor tick does, until `done` or 3 s pass.
+        let pump = |server: &mut IpcServer, mut done: Box<dyn FnMut(&mut IpcServer) -> bool>| {
+            let end = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < end {
+                for (cid, msg) in server.poll_incoming() {
+                    if let Some(ClientMessage::Cmd { cmd, args, .. }) =
+                        server.process_message(cid, msg, serde_json::json!({"p": 1}), serde_json::json!({"c": 2}))
+                    {
+                        let _ = server.notify_command(&cmd, &args);
+                    }
+                }
+                if done(server) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        };
+
+        // The client connects, says hello and subscribes to notify.control.
+        assert!(pump(&mut server, Box::new(|s| s.has_subscriber("notify.control"))), "notify never subscribed");
+        assert!(matches!(ipc.incoming.recv_timeout(Duration::from_secs(2)), Ok(Incoming::Connected { .. })));
+        assert_eq!(server.client_name(*server.clients.keys().next().unwrap()).as_deref(), Some("notify"));
+
+        // A bar subscribes; notify publishes; the bar sees the bell state.
+        let mut bar = connect_subscribed(&mut server, &path, &["notifications"]);
+        ipc.publish(NotificationsState { count: 4, dnd: false });
+        assert!(pump(&mut server, Box::new(|s| s.notifications.is_some())), "the state never arrived");
+        assert_eq!(
+            drain_events(&mut bar),
+            vec![("notifications".to_string(), serde_json::json!({"count": 4, "dnd": false}))]
+        );
+
+        // `veil ctl notify.dnd` (no arguments) reaches notify as a toggle.
+        server.notify_command("notify.dnd", &serde_json::Value::Null).unwrap().unwrap();
+        let got = ipc.incoming.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(got, Incoming::Control(Control { dnd: Some(DndMode::Toggle), panel: None }));
+
+        // A bar that starts later is told the current bell state straight away.
+        let mut late = connect_subscribed(&mut server, &path, &["notifications"]);
+        assert_eq!(drain_events(&mut late).len(), 1);
     }
 
     #[test]

@@ -5308,9 +5308,13 @@ fn ipc_command(
                     mark_dirty_full(state);
                     Ok(None)
                 }
+                // notify owns the D-Bus name: stopping it makes every sender fail.
+                "notify" => Err("notify is a persistent service and cannot be toggled; use notify.panel or notify.dnd".into()),
                 other => Err(format!("component '{other}' is not available yet")),
             }
         }
+        // Bell state in, control events out; see IpcServer::notify_command.
+        c::NOTIFICATIONS_SET | c::NOTIFY_DND | c::NOTIFY_PANEL => state.ipc.notify_command(cmd, args).unwrap_or(Ok(None)),
         c::COMPONENT_RESTART => {
             let name = str_arg("name").filter(|n| !n.is_empty()).ok_or("restart needs a component name")?;
             state.supervisor.restart_component(name, Instant::now())?;

@@ -5,7 +5,7 @@
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -37,6 +37,10 @@ pub enum UiInputEvent {
     Press { x: f64, y: f64, output: String },
     /// Vertical scroll: negative is up, positive is down.
     Scroll { x: f64, y: f64, dy: f64, output: String },
+    /// Right mouse button (the left one is `Press`).
+    PressRight { x: f64, y: f64, output: String },
+    /// The pointer left the surface of `output`.
+    Leave { output: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +52,18 @@ pub enum SurfacePosition {
 
 /// Everything a layer-shell client chooses about its surface. `new` covers
 /// the bar's needs; tests and other components use `with_options`.
+/// Which outputs get a surface.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OutputFilter {
+    /// Every output (a bar).
+    #[default]
+    All,
+    /// Only the first output the compositor announces (a toast on a primary monitor).
+    First,
+    /// Only the output with this name.
+    Named(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct LayerOptions {
     pub namespace: String,
@@ -57,6 +73,10 @@ pub struct LayerOptions {
     pub size: (u32, u32),
     pub exclusive_zone: i32,
     pub keyboard: KeyboardInteractivity,
+    /// Margins (top, right, bottom, left), measured from the compositor's usable
+    /// area, so a bar's exclusive zone is already excluded.
+    pub margin: (i32, i32, i32, i32),
+    pub output: OutputFilter,
 }
 
 struct OutputSurface {
@@ -71,6 +91,7 @@ struct OutputSurface {
 }
 
 pub struct LayerShellClient {
+    conn: Connection,
     queue: EventQueue<ClientState>,
     state: ClientState,
     pub input_rx: Receiver<UiInputEvent>,
@@ -97,6 +118,8 @@ impl LayerShellClient {
                 size: (0, height),
                 exclusive_zone: if exclusive { height as i32 } else { 0 },
                 keyboard: KeyboardInteractivity::None,
+                margin: (0, 0, 0, 0),
+                output: OutputFilter::All,
             },
             None,
         )
@@ -146,6 +169,7 @@ impl LayerShellClient {
         };
 
         let mut client = Self {
+            conn,
             queue,
             state,
             input_rx: rx,
@@ -192,6 +216,47 @@ impl LayerShellClient {
             s.layer_surface.set_exclusive_zone(exclusive_zone);
             s.layer_surface.commit();
         }
+    }
+
+    /// Margins (top, right, bottom, left) on every surface.
+    pub fn set_margin(&mut self, margin: (i32, i32, i32, i32)) {
+        self.state.opts.margin = margin;
+        for s in &self.state.surfaces {
+            s.layer_surface.set_margin(margin.0, margin.1, margin.2, margin.3);
+            s.layer_surface.commit();
+        }
+    }
+
+    /// Restrict pointer input on `output`'s surface to `rects` (x, y, width,
+    /// height in surface coordinates). An empty slice makes the whole surface
+    /// click-through. Commits by itself; unconfigured surfaces are skipped.
+    pub fn set_input_region(&mut self, output: &str, rects: &[(i32, i32, i32, i32)]) {
+        for s in self.state.surfaces.iter().filter(|s| s.name == output && s.configured) {
+            match Region::new(&self.state.compositor) {
+                Ok(region) => {
+                    for &(x, y, w, h) in rects {
+                        if w > 0 && h > 0 {
+                            region.add(x, y, w, h);
+                        }
+                    }
+                    s.layer_surface.wl_surface().set_input_region(Some(region.wl_region()));
+                    s.layer_surface.commit();
+                }
+                Err(e) => tracing::warn!("input region for {output}: {e}"),
+            }
+        }
+    }
+
+    /// Names of the outputs that have a surface (as the compositor reports them).
+    pub fn output_names(&self) -> Vec<String> {
+        self.state.surfaces.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// The Wayland socket's fd, so a caller can `poll(2)` it together with its
+    /// other sources instead of waking on a timer. Valid while `self` lives.
+    pub fn wayland_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.conn.backend().poll_fd().as_raw_fd()
     }
 
     pub fn take_reconfigured(&mut self) -> bool {
@@ -275,6 +340,13 @@ impl ClientState {
             .info(output)
             .and_then(|i| i.name)
             .unwrap_or_default();
+        match &self.opts.output {
+            OutputFilter::All => {}
+            OutputFilter::First if !self.surfaces.is_empty() => return,
+            OutputFilter::First => {}
+            OutputFilter::Named(want) if *want != name => return,
+            OutputFilter::Named(_) => {}
+        }
         let surface = self.compositor.create_surface(qh);
         let layer_surface = self.layer_shell.create_layer_surface(
             qh,
@@ -288,6 +360,8 @@ impl ClientState {
         layer_surface.set_exclusive_zone(self.opts.exclusive_zone);
         layer_surface.set_keyboard_interactivity(self.opts.keyboard);
         layer_surface.set_size(self.opts.size.0, self.opts.size.1);
+        let (mt, mr, mb, ml) = self.opts.margin;
+        layer_surface.set_margin(mt, mr, mb, ml);
         layer_surface.commit();
 
         let pool = match SlotPool::new(8 * 1024 * 1024, &self.shm) {
@@ -393,6 +467,10 @@ impl PointerHandler for ClientState {
                         output: self.hover.clone(),
                     });
                 }
+                PointerEventKind::Leave { .. } => {
+                    let output = self.output_name_of(&ev.surface);
+                    let _ = self.input_tx.send(UiInputEvent::Leave { output });
+                }
                 PointerEventKind::Motion { .. } => {
                     self.mouse_x = ev.position.0;
                     self.mouse_y = ev.position.1;
@@ -417,6 +495,13 @@ impl PointerHandler for ClientState {
                             output: self.hover.clone(),
                         });
                     }
+                }
+                PointerEventKind::Press { button: 273, .. } => {
+                    let _ = self.input_tx.send(UiInputEvent::PressRight {
+                        x: self.mouse_x,
+                        y: self.mouse_y,
+                        output: self.hover.clone(),
+                    });
                 }
                 PointerEventKind::Press { button: 272, .. } => {
                     // Left mouse button

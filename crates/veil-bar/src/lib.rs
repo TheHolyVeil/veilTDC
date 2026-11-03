@@ -196,6 +196,8 @@ impl App {
                     actions.extend(self.bar.on_scroll(&output, x as f32, dy as f32))
                 }
                 UiInputEvent::Motion { .. } => {}
+                // The bar has no right-click or hover-leave behaviour (yet).
+                UiInputEvent::PressRight { .. } | UiInputEvent::Leave { .. } => {}
             }
         }
         for a in actions {

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub mod bar;
+pub mod notify;
 pub use bar::{BarSettings, CustomWidget, WeatherSettings};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -37,6 +38,8 @@ pub mod topics {
     pub const VOLUME: &str = "volume";
     pub const BRIGHTNESS: &str = "brightness";
     pub const NOTIFICATIONS: &str = "notifications";
+    /// Master to `notify` only: do-not-disturb and panel requests. See [`crate::notify::Control`].
+    pub const NOTIFY_CONTROL: &str = "notify.control";
 }
 
 /// Standard command names.
@@ -55,6 +58,12 @@ pub mod commands {
     pub const SESSION_SUSPEND: &str = "session.suspend";
     pub const SESSION_REBOOT: &str = "session.reboot";
     pub const SESSION_POWEROFF: &str = "session.poweroff";
+    /// `notify` publishes the bell state; the master rebroadcasts it as the `notifications` event.
+    pub const NOTIFICATIONS_SET: &str = "notifications.set";
+    /// `{"mode": "on"|"off"|"toggle"}`, default toggle.
+    pub const NOTIFY_DND: &str = "notify.dnd";
+    /// `{"mode": "open"|"close"|"toggle"}`, default toggle.
+    pub const NOTIFY_PANEL: &str = "notify.panel";
 }
 
 /// Messages sent from Client to Compositor.
@@ -255,6 +264,16 @@ mod tests {
         assert_eq!(res2, Some(msg2));
 
         assert!(fb.next_frame::<ClientMessage>().unwrap().is_none());
+    }
+
+    #[test]
+    fn notification_wire_names_are_stable() {
+        // Shell components, `veil ctl` and keybinds spell these out; they are a contract.
+        assert_eq!(topics::NOTIFICATIONS, "notifications");
+        assert_eq!(topics::NOTIFY_CONTROL, "notify.control");
+        assert_eq!(commands::NOTIFICATIONS_SET, "notifications.set");
+        assert_eq!(commands::NOTIFY_DND, "notify.dnd");
+        assert_eq!(commands::NOTIFY_PANEL, "notify.panel");
     }
 
     #[test]

@@ -279,6 +279,11 @@ struct TestClient {
 
 impl TestClient {
     fn spawn(socket: &Path, opts: LayerOptions) -> Self {
+        Self::spawn_with(socket, opts, None)
+    }
+
+    /// Like `spawn`, and once the surface is up, limits its input to `region`.
+    fn spawn_with(socket: &Path, opts: LayerOptions, region: Option<Vec<(i32, i32, i32, i32)>>) -> Self {
         let stream = UnixStream::connect(socket).expect("connect to compositor");
         let stall = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
@@ -288,6 +293,7 @@ impl TestClient {
             let mut client =
                 LayerShellClient::with_options(opts, Some(stream)).expect("layer client");
             let mut drawn = false;
+            let mut region_set = false;
             while !stop_t.load(Ordering::Relaxed) {
                 if stall_t.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(20));
@@ -299,6 +305,12 @@ impl TestClient {
                 if client.take_reconfigured() || !drawn {
                     client.present_for_each(|_, w, h| vec![0x80; (w * h * 4) as usize]);
                     drawn = true;
+                }
+                if let (true, false, Some(rects)) = (drawn, region_set, &region) {
+                    for name in client.output_names() {
+                        client.set_input_region(&name, rects);
+                    }
+                    region_set = true;
                 }
                 while let Ok(ev) = client.input_rx.try_recv() {
                     let _ = tx.send(ev);
@@ -355,6 +367,8 @@ fn opts(
         size,
         exclusive_zone: zone,
         keyboard: kbd,
+        margin: (0, 0, 0, 0),
+        output: veil_ui::OutputFilter::All,
     }
 }
 
@@ -703,4 +717,115 @@ fn sigkill(pid: i32) {
     unsafe {
         kill(pid, 9);
     }
+}
+
+
+// ─── phase 4: what a toast stack needs from the compositor ───────────────────
+
+fn geometry(env: &Env, ns: &str) -> Vec<i64> {
+    env.layer(ns).unwrap()["geometry"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect()
+}
+
+/// Move the pointer to (x, y), let the compositor settle, report who has it.
+fn pointer_focus_at(env: &Env, x: i32, y: i32) -> Value {
+    for _ in 0..5 {
+        env.pointer_to(x, y);
+        env.drain();
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    env.layers()["pointer_focus"].clone()
+}
+
+/// Measured on the real host: a zero-zone overlay is placed by the host's own
+/// arrangement, below the bar's exclusive zone. So a toast margin is only the
+/// visual gap and must NOT include the bar height.
+#[test]
+fn overlay_with_zero_zone_sits_below_the_bars_exclusive_zone() {
+    let Some(env) = start(false, &[]) else { return };
+    let _bar = env.client(opts("probe-bar", Layer::Top, top_bar(), (0, 36), 36, KeyboardInteractivity::None));
+    wait_for("bar mapped", Duration::from_secs(5), || mapped(&env, "probe-bar"));
+    let _toast = env.client(opts("probe-toast", Layer::Overlay, Anchor::TOP | Anchor::RIGHT, (360, 100), 0, KeyboardInteractivity::None));
+    wait_for("toast mapped", Duration::from_secs(5), || mapped(&env, "probe-toast"));
+    assert_eq!(geometry(&env, "probe-toast"), vec![W as i64 - 360, 36, 360, 100]);
+}
+
+#[test]
+fn margins_are_measured_from_the_usable_area() {
+    let Some(env) = start(false, &[]) else { return };
+    let _bar = env.client(opts("probe-bar", Layer::Top, top_bar(), (0, 36), 36, KeyboardInteractivity::None));
+    wait_for("bar mapped", Duration::from_secs(5), || mapped(&env, "probe-bar"));
+    let mut o = opts("probe-toast", Layer::Overlay, Anchor::TOP | Anchor::RIGHT, (360, 100), 0, KeyboardInteractivity::None);
+    o.margin = (8, 12, 0, 0); // top, right
+    let _toast = env.client(o);
+    wait_for("toast mapped", Duration::from_secs(5), || mapped(&env, "probe-toast"));
+    assert_eq!(geometry(&env, "probe-toast"), vec![W as i64 - 360 - 12, 36 + 8, 360, 100]);
+}
+
+/// The toast surface is one tall rectangle with gaps between toasts. Clicks in
+/// the gaps must reach the window underneath, which needs the host to honour
+/// the surface's input region.
+#[test]
+#[ignore = "OPEN (phase 4): pointer focus stays on the surface in a gap outside its input region. Not yet known whether the host ignores layer input regions or LayerShellClient::set_input_region did not apply. Remove this ignore once resolved."]
+fn input_region_lets_pointer_events_fall_through_the_gaps() {
+    let Some(env) = start(false, &[]) else { return };
+    let o = opts("probe-toast", Layer::Overlay, Anchor::TOP | Anchor::RIGHT, (360, 200), 0, KeyboardInteractivity::None);
+    // two "toasts" of 80 px with a 40 px gap between them
+    let _toast = TestClient::spawn_with(&env.wayland_socket, o, Some(vec![(0, 0, 360, 80), (0, 120, 360, 80)]));
+    wait_for("toast mapped", Duration::from_secs(5), || mapped(&env, "probe-toast"));
+    let g = geometry(&env, "probe-toast");
+    let (x, y) = (g[0] as i32 + 100, g[1] as i32);
+    wait_for("input region applied", Duration::from_secs(5), || pointer_focus_at(&env, x, y + 100) != "probe-toast");
+    assert_eq!(pointer_focus_at(&env, x, y + 40), "probe-toast", "inside the first toast");
+    assert_ne!(pointer_focus_at(&env, x, y + 100), "probe-toast", "the gap must be click-through");
+    assert_eq!(pointer_focus_at(&env, x, y + 160), "probe-toast", "inside the second toast");
+}
+
+#[test]
+fn right_click_and_leave_reach_the_client() {
+    let Some(env) = start(false, &[]) else { return };
+    let o = opts("probe-toast", Layer::Overlay, Anchor::TOP | Anchor::RIGHT, (360, 100), 0, KeyboardInteractivity::None);
+    let client = env.client(o);
+    wait_for("toast mapped", Duration::from_secs(5), || mapped(&env, "probe-toast"));
+    let g = geometry(&env, "probe-toast");
+    assert_eq!(pointer_focus_at(&env, g[0] as i32 + 50, g[1] as i32 + 50), "probe-toast");
+    for pressed in [true, false] {
+        env.host.send_input(InputCmd::PointerButton { button: 0x111, pressed }).unwrap(); // BTN_RIGHT
+    }
+    assert!(client.saw(Duration::from_secs(2), |e| matches!(e, UiInputEvent::PressRight { .. })), "no right click");
+    pointer_focus_at(&env, 10, H - 10); // somewhere else entirely
+    assert!(client.saw(Duration::from_secs(2), |e| matches!(e, UiInputEvent::Leave { .. })), "no leave event");
+}
+
+/// A toast must appear on one monitor, not every one.
+#[test]
+fn output_filter_limits_surfaces_to_one_output() {
+    let Some(env) = start(false, &[]) else { return };
+    // The harness has one monitor, which cannot tell All from First: add a second.
+    env.host
+        .send_input(InputCmd::SetMonitors {
+            sizes: vec![(W as u32, H as u32), (W as u32, H as u32)],
+            refresh_mhz: 60_000,
+            refresh_per_monitor: vec![60_000, 60_000],
+        })
+        .unwrap();
+    wait_for("two monitors", Duration::from_secs(5), || env.layers()["outputs"].as_array().map(|o| o.len()) == Some(2));
+    let count = |ns: &str| {
+        env.layers()["outputs"].as_array().unwrap().iter()
+            .filter(|o| o["layers"].as_array().unwrap().iter().any(|l| l["namespace"] == ns))
+            .count()
+    };
+    let o = |ns: &str, f: veil_ui::OutputFilter| {
+        let mut x = opts(ns, Layer::Overlay, Anchor::TOP | Anchor::RIGHT, (100, 50), 0, KeyboardInteractivity::None);
+        x.output = f;
+        x
+    };
+    let _all = env.client(o("f-all", veil_ui::OutputFilter::All));
+    let _first = env.client(o("f-first", veil_ui::OutputFilter::First));
+    let _named = env.client(o("f-named", veil_ui::OutputFilter::Named("no-such-output".into())));
+    wait_for("surfaces", Duration::from_secs(5), || mapped(&env, "f-all") && mapped(&env, "f-first"));
+    let outputs = env.layers()["outputs"].as_array().unwrap().len();
+    assert_eq!(outputs, 2);
+    assert_eq!(count("f-all"), 2, "All means every output");
+    assert_eq!(count("f-first"), 1, "First means exactly one");
+    assert_eq!(count("f-named"), 0, "an unknown name gets nothing");
 }

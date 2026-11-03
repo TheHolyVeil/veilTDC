@@ -37,3 +37,5 @@ mimalloc           = { workspace = true }
 
 [dev-dependencies]
 tempfile           = { workspace = true }
+# Real notify client against the real IPC server (one end-to-end test in ipc.rs).
+veil-notify        = { path = "../veil-notify" }

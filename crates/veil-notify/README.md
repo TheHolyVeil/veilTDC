@@ -3,15 +3,15 @@
 The Veil notification service (phase 4 of the Veil Shell Architecture).
 Scope and decisions live in `Veil_Shell.md`, section 11, Phase 4.
 
-## State: step 3 of 7 (data, timing, geometry, D-Bus service)
+## State: step 4 of 7 (data, timing, geometry, D-Bus, compositor IPC)
 
 | Step | What | State |
 | --- | --- | --- |
 | 1 | `text`, `markup`, `model`, `store`, `rate` | done |
 | 2 | `timers` (expiry state machine), `layout` (toast stack geometry) | done |
-| 3 | `dbus` (zbus 6 service, signals, name queueing), `ids` | done, 72 tests total |
-| 4 | IPC wiring, host relay, bell fix in `veil-bar` | next |
-| 5 | toasts | |
+| 3 | `dbus` (zbus 6 service, signals, name queueing), `ids` | done |
+| 4 | `ipc` client, host relay (`veil-host`), bell fix (`veil-bar`), shared payloads (`veil-ipc`) | done, 79 tests here |
+| 5 | toasts | next |
 | 6 | history panel | |
 | 7 | supervisor and `veil shell notify` registration | |
 
@@ -53,6 +53,12 @@ main loop only through channels. Try it without any UI:
 - **D-Bus handlers stay cheap**: parse, sanitise, allocate an id, `try_send` into
   a bounded channel (256). A full queue drops the event, it never blocks D-Bus
   or grows memory.
+- **IPC** (`ipc.rs`): publishes the bell as `notifications.set`, receives
+  `notify.control` (dnd, panel), `palette` and `config`. The reader thread blocks
+  on the socket; the only periodic wakeup is the ping. The ping is sent when due
+  even during a burst of traffic (the supervisor restarts a component silent for
+  10 s). Only changed states are sent. On reconnect the latest state is re-sent.
+  The master relays, since clients cannot publish events themselves.
 - **Rate limiter table is bounded** (256 apps, then one shared bucket).
 - **Timers**: only the newest `max_visible` toasts count down; hidden ones are
   paused, never expired unseen. Hover pauses all of them. Critical and timeout 0

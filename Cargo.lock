@@ -5273,6 +5273,7 @@ dependencies = [
  "tracing-subscriber",
  "veil-config",
  "veil-ipc",
+ "veil-notify",
  "veil-palette",
  "veil-render",
  "veil-text",
@@ -5317,6 +5318,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "veil-ipc",
  "zbus 6.2.1",
 ]
 

@@ -1,8 +1,10 @@
 //! Notifications: a bell with the unread count. Click opens the history.
 //!
-//! Driven by the `notifications` IPC event (`{"count": n, "dnd": bool}`).
-//! `veil-notify` (phase 4) publishes it; until then the bell just shows
-//! zero.
+//! Driven by the `notifications` IPC event (`{"count": n, "dnd": bool}`),
+//! which `veil-notify` publishes. The click asks `notify` to toggle its history
+//! panel (`notify.panel`). It must not use `component.toggle`: notify is a
+//! persistent service that owns the D-Bus name, and stopping it would make
+//! every `notify-send` fail until it is back.
 
 use std::time::Instant;
 use tiny_skia::Pixmap;
@@ -65,7 +67,7 @@ impl Widget for NotificationsWidget {
     }
 
     fn on_click(&mut self, _x: f32) -> Option<Action> {
-        Some(Action::Ipc { cmd: "component.toggle".into(), args: serde_json::json!({ "name": "notify" }) })
+        Some(Action::Ipc { cmd: veil_ipc::commands::NOTIFY_PANEL.into(), args: serde_json::json!({ "mode": "toggle" }) })
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -76,6 +78,18 @@ impl Widget for NotificationsWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn click_toggles_the_panel_and_never_the_service() {
+        let mut w = NotificationsWidget::new();
+        match w.on_click(0.0) {
+            Some(Action::Ipc { cmd, args }) => {
+                assert_eq!(cmd, "notify.panel");
+                assert_eq!(args, serde_json::json!({ "mode": "toggle" }));
+            }
+            _ => panic!("the bell must send an IPC command"),
+        }
+    }
 
     #[test]
     fn label_follows_count_and_dnd() {

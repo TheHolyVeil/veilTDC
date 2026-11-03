@@ -42,8 +42,10 @@ pub struct OutputSize {
 pub struct LayoutConfig {
     pub width: u32,
     pub gap: u32,
-    /// Distance from the top edge of the output. Set it to the bar height plus
-    /// the desired gap, so toasts clear the bar.
+    /// Gap below the top of the compositor's usable area. The host already
+    /// places a zero-zone overlay below the bar's exclusive zone (measured in
+    /// `crates/veil/tests/layer_shell.rs`), so this is only the visual gap:
+    /// do not add the bar height.
     pub margin_top: u32,
     pub margin_right: u32,
     pub margin_bottom: u32,
@@ -170,10 +172,11 @@ mod tests {
     }
 
     #[test]
-    fn surface_clears_the_bar() {
-        let c = LayoutConfig { margin_top: 40 + 8, ..cfg() };
-        let s = stack(&c, OUT, &[(1, 80)], 0);
-        assert_eq!(s.surface.unwrap().y, 48, "bar height 40 plus an 8 px gap");
+    fn surface_is_placed_relative_to_the_usable_area() {
+        // `surface` is relative to the usable area's top-right corner: the host
+        // has already moved that corner below the bar, so only the gap counts.
+        let s = stack(&cfg(), OUT, &[(1, 80)], 0);
+        assert_eq!(s.surface.unwrap().y, 8);
     }
 
     #[test]
