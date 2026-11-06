@@ -9,6 +9,7 @@
 //! "authenticating…"; on success the event loop quits, the UI (and its DRM
 //! master) is dropped, and the real PAM session + exec happens in spawn.rs.
 
+mod display;
 mod session;
 mod spawn;
 mod state;
@@ -334,6 +335,12 @@ fn main() {
     } else {
         None
     };
+
+    // Multi-monitor: choose the best output + mode before Slint's backend
+    // initialises (it reads SLINT_DRM_OUTPUT/SLINT_DRM_MODE at creation).
+    if bare_tty {
+        display::configure_slint_output();
+    }
 
     let ui = match LoginWindow::new() {
         Ok(ui) => ui,

@@ -118,6 +118,20 @@ pub struct Layout {
     pub split_ratio: f32,
     /// Which algorithm `rects()` uses. `toggle_mode()` flips it.
     pub mode: LayoutMode,
+    /// Scroll mode only: x of the viewport's left edge in strip space. This
+    /// IS state now (it used to be derived from `focused`, which made every
+    /// focus change — including a mouse click — snap the clicked column to
+    /// the left edge). Moved only by `sync_view`, and only when the focused
+    /// column would otherwise be off-screen.
+    pub view_x: i32,
+    /// Set by click-to-focus so the next `sync_view` doesn't scroll to the
+    /// clicked column. Consumed (cleared) by `sync_view`.
+    pub skip_reveal: bool,
+    /// "Fake fullscreen": the focused window fills the whole work area
+    /// (bar/layer-shell zones stay visible, no xdg Fullscreen state sent).
+    /// Follows `focused`; every other window is parked off-screen at its
+    /// normal size so toggling doesn't resize them.
+    pub zoomed: bool,
 }
 
 impl Default for Layout {
@@ -127,18 +141,71 @@ impl Default for Layout {
             flip: false,
             split_ratio: 0.5,
             mode: LayoutMode::Dwindle,
+            view_x: 0,
+            skip_reveal: false,
+            zoomed: false,
         }
     }
 }
 
 impl Layout {
     /// Compute a rect for each of `n` windows filling `w`×`h`. Dispatches on
-    /// `self.mode`; see `rects_dwindle`/`rects_scroll`.
+    /// `self.mode`; see `rects_dwindle`/`rects_scroll`. Scroll mode reads
+    /// `view_x`, so call `sync_view` first whenever `focused`/`n`/`w` may
+    /// have changed.
     pub fn rects(&self, n: usize, w: u32, h: u32) -> Vec<Rect> {
-        match self.mode {
+        let mut rects = match self.mode {
             LayoutMode::Dwindle => self.rects_dwindle(n, w, h),
             LayoutMode::Scroll => self.rects_scroll(n, w, h),
+        };
+        if self.zoomed && n > 0 {
+            let f = self.focused.min(n - 1);
+            for (i, r) in rects.iter_mut().enumerate() {
+                if i == f {
+                    *r = Rect { x: 0, y: 0, w, h };
+                } else {
+                    // Parked: right edge at x=0, so `contains`/blit see
+                    // nothing, and the size is untouched (no client resize).
+                    r.x = -(r.w as i32);
+                }
+            }
         }
+        rects
+    }
+
+    /// Scroll mode: keep `view_x` valid, and (when `reveal`) scroll the
+    /// minimum amount needed to bring the focused column fully into view.
+    /// `reveal = false` is for click-focus: the column you clicked is already
+    /// where you clicked it, moving the strip under the cursor is the bug.
+    /// No-op (and `view_x` reset) outside Scroll mode.
+    pub fn sync_view(&mut self, n: usize, w: u32) {
+        let reveal = !std::mem::take(&mut self.skip_reveal);
+        if self.mode != LayoutMode::Scroll || n == 0 {
+            self.view_x = 0;
+            return;
+        }
+        let col_w = self.col_w(w);
+        let vw = w as i32;
+        if reveal && !self.zoomed {
+            let left = self.focused.min(n - 1) as i32 * col_w;
+            let right = left + col_w;
+            if left < self.view_x {
+                self.view_x = left;
+            } else if right > self.view_x + vw {
+                self.view_x = right - vw;
+            }
+        }
+        self.view_x = self.view_x.clamp(0, (n as i32 * col_w - vw).max(0));
+    }
+
+    fn col_w(&self, w: u32) -> i32 {
+        let ratio = self.split_ratio.clamp(MIN_RATIO, MAX_RATIO);
+        (((w as f32) * ratio).round().max(1.0)) as i32
+    }
+
+    /// Fake-fullscreen the focused window, or put it back.
+    pub fn toggle_zoom(&mut self) {
+        self.zoomed = !self.zoomed;
     }
 
     /// Switch between `Dwindle` and `Scroll`. Deliberately just these two —
@@ -155,8 +222,8 @@ impl Layout {
 
     /// Horizontal scrolling strip: every window gets a fixed-width column
     /// (`split_ratio` of output width, same clamp/keybinds as dwindle's
-    /// primary-pane ratio), positioned left-to-right by index, scrolled so
-    /// the focused column is left-aligned in the viewport. Columns off to
+    /// primary-pane ratio), positioned left-to-right by index and offset by
+    /// `view_x` (see `sync_view`). Columns off to
     /// either side simply have rects outside `[0,w)` — `blit()` in
     /// server.rs already clips to the composite buffer bounds for every
     /// blit regardless of mode, so an off-screen rect is a correct, safe
@@ -165,15 +232,12 @@ impl Layout {
         if n == 0 {
             return Vec::new();
         }
-        let ratio = self.split_ratio.clamp(MIN_RATIO, MAX_RATIO);
-        let col_w = ((w as f32) * ratio).round().max(1.0) as u32;
-        let focused = self.focused.min(n - 1);
-        let offset = focused as i32 * col_w as i32;
+        let col_w = self.col_w(w);
         (0..n)
             .map(|i| Rect {
-                x: i as i32 * col_w as i32 - offset,
+                x: i as i32 * col_w - self.view_x,
                 y: 0,
-                w: col_w,
+                w: col_w as u32,
                 h,
             })
             .collect()
@@ -325,6 +389,16 @@ impl Layout {
     /// there's no window that way.
     pub fn focus(&mut self, rects: &[Rect], dir: Dir) {
         if rects.is_empty() {
+            return;
+        }
+        if self.zoomed {
+            // Everything but the focused window is parked off-screen, so
+            // geometric search is meaningless: step through windows instead.
+            let cur = self.focused.min(rects.len() - 1);
+            self.focused = match dir {
+                Dir::Left | Dir::Up => cur.saturating_sub(1),
+                Dir::Right | Dir::Down => (cur + 1).min(rects.len() - 1),
+            };
             return;
         }
         let cur = rects[self.focused.min(rects.len() - 1)];
@@ -641,39 +715,62 @@ mod tests {
         assert_eq!(l.mode, LayoutMode::Dwindle);
     }
 
-    #[test]
-    fn scroll_mode_focused_column_left_aligned() {
-        let mut l = Layout {
+    fn scroll() -> Layout {
+        Layout {
             mode: LayoutMode::Scroll,
             ..Default::default()
-        };
-        let r = l.rects(5, 100, 80);
-        assert_eq!(r.len(), 5);
-        // focused defaults to 0 — its column should sit exactly at x=0.
-        assert_eq!(
-            r[0],
-            Rect {
-                x: 0,
-                y: 0,
-                w: 50,
-                h: 80
-            }
-        ); // split_ratio 0.5 → col_w 50
-        assert_eq!(
-            r[1],
-            Rect {
-                x: 50,
-                y: 0,
-                w: 50,
-                h: 80
-            }
-        );
+        }
+    }
 
-        l.focused = 2;
+    #[test]
+    fn scroll_mode_starts_at_origin() {
+        let mut l = scroll();
+        l.sync_view(5, 100);
         let r = l.rects(5, 100, 80);
-        assert_eq!(r[2].x, 0); // now column 2 is the one left-aligned
-        assert_eq!(r[0].x, -100); // columns before it scroll off to the left
-        assert_eq!(r[4].x, 100); // columns after it sit further right
+        assert_eq!(r[0], Rect { x: 0, y: 0, w: 50, h: 80 });
+        assert_eq!(r[1].x, 50);
+    }
+
+    #[test]
+    fn scroll_mode_scrolls_minimally_to_reveal_focus() {
+        let mut l = scroll();
+        l.focused = 2; // col 100..150, viewport 0..100 -> scroll by 50
+        l.sync_view(5, 100);
+        let r = l.rects(5, 100, 80);
+        assert_eq!(r[2].x, 50);
+        assert_eq!(r[1].x, 0); // previous column still visible
+        l.focused = 1; // already fully visible: no movement
+        l.sync_view(5, 100);
+        assert_eq!(l.rects(5, 100, 80)[2].x, 50);
+    }
+
+    #[test]
+    fn click_focus_does_not_scroll() {
+        let mut l = scroll();
+        l.focused = 2;
+        l.sync_view(5, 100);
+        let before = l.view_x;
+        l.skip_reveal = true;
+        l.focused = 0; // click on a partly-visible left column: strip stays put
+        l.sync_view(5, 100);
+        assert_eq!(l.view_x, before);
+        assert!(!l.skip_reveal, "flag is consumed");
+    }
+
+    #[test]
+    fn zoom_fills_focused_and_parks_the_rest() {
+        let mut l = Layout::default();
+        l.focused = 1;
+        l.toggle_zoom();
+        let r = l.rects(3, 100, 80);
+        assert_eq!(r[1], Rect { x: 0, y: 0, w: 100, h: 80 });
+        for i in [0, 2] {
+            assert!(!r[i].contains(0, 0) && r[i].x + r[i].w as i32 <= 0);
+        }
+        l.focus(&r, Dir::Right);
+        assert_eq!(l.focused, 2);
+        l.toggle_zoom();
+        assert_ne!(l.rects(3, 100, 80)[1].w, 100);
     }
 
     #[test]
@@ -706,17 +803,16 @@ mod tests {
 
     #[test]
     fn scroll_mode_focus_navigates_and_autoscrolls() {
-        // focus() is untouched/reused as-is for Scroll mode — this proves it
-        // still does the right thing when rects are a strict left-to-right
-        // strip instead of dwindle's 2D layout.
-        let mut l = Layout {
-            mode: LayoutMode::Scroll,
-            ..Default::default()
-        };
+        let mut l = scroll();
+        l.sync_view(5, 100);
         let r = l.rects(5, 100, 80);
         l.focus(&r, Dir::Right);
         assert_eq!(l.focused, 1);
-        let r = l.rects(5, 100, 80); // viewport re-derived from new focused
-        assert_eq!(r[1].x, 0); // auto-scrolled so column 1 is now left-aligned
+        l.sync_view(5, 100);
+        let r = l.rects(5, 100, 80);
+        assert_eq!(r[1].x, 50);
+        l.focus(&r, Dir::Right);
+        l.sync_view(5, 100);
+        assert_eq!(l.rects(5, 100, 80)[2].x, 50); // scrolled just enough
     }
 }

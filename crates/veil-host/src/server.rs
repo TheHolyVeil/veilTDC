@@ -870,6 +870,7 @@ impl XdgShellHandler for State {
             .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
             .count();
         self.monitors[idx].layout.focused = n.saturating_sub(1);
+        self.monitors[idx].layout.zoomed = false;
         relayout(self);
     }
 
@@ -2446,6 +2447,7 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
         ResizeGrow => state.monitors[idx].layout.resize_grow(),
         ResizeShrink => state.monitors[idx].layout.resize_shrink(),
         ToggleLayout => state.monitors[idx].layout.toggle_mode(),
+        ToggleFakeFullscreen => state.monitors[idx].layout.toggle_zoom(),
         ToggleFullscreen => {
             let focused = state.monitors[idx].layout.focused;
             let focused_wl = state
@@ -2943,6 +2945,7 @@ fn relayout_monitor(state: &mut State, idx: usize) {
     // rects depend on it for viewport position — both are what caused
     // windows to visibly jump/shrink/shift left on fullscreen toggle).
     // The fullscreen window's rect is simply overridden afterward.
+    state.monitors[idx].layout.sync_view(n, zone_w);
     let mut rects = state.monitors[idx].layout.rects(n, zone_w, tile_h);
     for r in rects.iter_mut() {
         r.x += zone_x;
@@ -4704,6 +4707,8 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                 if let Some(t_idx) = toplevel_at(state, idx, px, py) {
                     if t_idx != state.monitors[idx].layout.focused {
                         state.monitors[idx].layout.focused = t_idx;
+                        // Clicking must never scroll the strip under the cursor.
+                        state.monitors[idx].layout.skip_reveal = true;
                         relayout(state);
                         refocus_keyboard(state);
                     }
@@ -5030,6 +5035,7 @@ impl XwmHandler for State {
             .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
             .count();
         self.monitors[idx].layout.focused = n.saturating_sub(1);
+        self.monitors[idx].layout.zoomed = false;
         // Only if already paired with a wl_surface (usually is, by this
         // point) — if not yet, it'll pick up focus on the next natural
         // refocus_keyboard call (prune tick, next window open/close, etc).

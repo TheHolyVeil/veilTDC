@@ -142,7 +142,8 @@ keybinds = {
 	swap = "s", -- Alt+S (swap with neighbor)
 	rotate = "r", -- Alt+R (rotate split axis)
 	close = "q", -- Alt+Q (close window)
-	fullscreen = "f", -- Alt+F (fullscreen the focused window)
+	fullscreen = "g", -- Alt+G (real fullscreen: covers the bar, client gets fullscreen state)
+	fake_fullscreen = "f", -- Alt+F (focused window fills the work area, bar stays)
 	resize_grow = "=", -- Alt+= (grow primary pane)
 	resize_shrink = "-",
 	toggle_layout = "w", --Switch between Dwindle and scroll window management, scroll has no window cap.

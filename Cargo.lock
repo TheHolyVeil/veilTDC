@@ -5299,6 +5299,7 @@ dependencies = [
 name = "veil-login"
 version = "0.1.0"
 dependencies = [
+ "drm 0.15.0",
  "image",
  "libc",
  "pam-client2",

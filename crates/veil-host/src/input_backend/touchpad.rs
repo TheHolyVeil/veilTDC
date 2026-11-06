@@ -24,11 +24,19 @@ pub const BTN_TOOL_DOUBLETAP: u16 = 0x14d;
 pub const BTN_TOOL_TRIPLETAP: u16 = 0x14e;
 pub const BTN_TOOL_QUADTAP: u16 = 0x14f;
 
-/// Pointer pixels per millimetre of finger travel, before gain.
-const PX_PER_MM: f32 = 18.0;
-/// Gain grows with speed (mm per report) up to this multiple.
-const GAIN_PER_MM: f32 = 1.2;
-const GAIN_MAX: f32 = 2.5;
+/// Pointer acceleration, driven by finger speed in mm/s (not mm per report,
+/// which depended on the pad's report rate). Slow = precise, fast = flick
+/// across the screen. Smoothstep between the two, so there's no knee.
+/// Tune these first if it still feels off.
+const PX_PER_MM_SLOW: f32 = 12.0;
+const PX_PER_MM_FAST: f32 = 56.0;
+const SPEED_LO_MM_S: f32 = 20.0;
+const SPEED_HI_MM_S: f32 = 300.0;
+/// Speed smoothing (weight of the newest sample) — kills report jitter.
+const SPEED_ALPHA: f32 = 0.5;
+/// Clamp for the time between reports (batched reads give dt ~ 0).
+const DT_MIN: f32 = 0.004;
+const DT_MAX: f32 = 0.05;
 /// Two-finger scroll: one wheel notch (v120 = 120) per this many mm.
 const MM_PER_NOTCH: f32 = 4.0;
 /// Emit scroll once at least this much of a notch has built up (v120 units).
@@ -69,6 +77,8 @@ pub struct Touchpad {
     scroll_acc_mm: f32,
     rem_x: f32,
     rem_y: f32,
+    prev_t: Option<Instant>,
+    speed: f32,
 }
 
 impl Touchpad {
@@ -93,6 +103,8 @@ impl Touchpad {
             scroll_acc_mm: 0.0,
             rem_x: 0.0,
             rem_y: 0.0,
+            prev_t: None,
+            speed: 0.0,
         }
     }
 
@@ -126,6 +138,7 @@ impl Touchpad {
                     self.travelled_mm = 0.0;
                     self.peak_fingers = 0;
                     self.scroll_acc_mm = 0.0;
+                    self.speed = 0.0;
                     self.last = None;
                 } else {
                     let quick = self
@@ -153,6 +166,7 @@ impl Touchpad {
             self.last = None;
             self.rem_x = 0.0;
             self.rem_y = 0.0;
+            self.speed = 0.0;
             self.peak_fingers = self.peak_fingers.max(after);
         }
         true
@@ -177,6 +191,11 @@ impl Touchpad {
 
     /// SYN_REPORT: turn what accumulated this frame into outputs.
     pub fn sync(&mut self, out: &mut Vec<Out>) {
+        self.sync_at(out, Instant::now());
+    }
+
+    /// `sync` with an explicit clock (tests).
+    pub fn sync_at(&mut self, out: &mut Vec<Out>, now: Instant) {
         if self.pending_tap {
             self.pending_tap = false;
             out.push(Out::Tap);
@@ -185,18 +204,31 @@ impl Touchpad {
         if !(self.touching && fingers >= 1 && self.have_x && self.have_y) {
             return;
         }
+        let prev_t = self.prev_t.replace(now);
         let Some((lx, ly)) = self.last.replace((self.x, self.y)) else {
             return; // first report of a touch: just remember where it is
         };
+        let dt = prev_t
+            .map_or(DT_MAX, |t| now.saturating_duration_since(t).as_secs_f32())
+            .clamp(DT_MIN, DT_MAX);
         let dx_mm = (self.x - lx) as f32 / self.res_x;
         let dy_mm = (self.y - ly) as f32 / self.res_y;
         self.travelled_mm += dx_mm.hypot(dy_mm);
 
         match fingers {
             1 => {
-                let gain = (1.0 + dx_mm.hypot(dy_mm) * GAIN_PER_MM).min(GAIN_MAX);
-                let fx = self.rem_x + dx_mm * PX_PER_MM * gain;
-                let fy = self.rem_y + dy_mm * PX_PER_MM * gain;
+                let inst = dx_mm.hypot(dy_mm) / dt;
+                self.speed = if self.speed == 0.0 {
+                    inst
+                } else {
+                    self.speed + SPEED_ALPHA * (inst - self.speed)
+                };
+                let t = ((self.speed - SPEED_LO_MM_S) / (SPEED_HI_MM_S - SPEED_LO_MM_S))
+                    .clamp(0.0, 1.0);
+                let t = t * t * (3.0 - 2.0 * t);
+                let px_per_mm = PX_PER_MM_SLOW + (PX_PER_MM_FAST - PX_PER_MM_SLOW) * t;
+                let fx = self.rem_x + dx_mm * px_per_mm;
+                let fy = self.rem_y + dy_mm * px_per_mm;
                 let (ix, iy) = (fx.trunc(), fy.trunc());
                 self.rem_x = fx - ix;
                 self.rem_y = fy - iy;
@@ -231,7 +263,9 @@ mod tests {
         tp.abs(ABS_X, x);
         tp.abs(ABS_Y, y);
         let mut out = Vec::new();
-        tp.sync(&mut out);
+        // Fake 8 ms-per-report clock (125 Hz) so speed is deterministic.
+        let now = tp.prev_t.map_or_else(Instant::now, |t| t + Duration::from_millis(8));
+        tp.sync_at(&mut out, now);
         out
     }
 
@@ -262,7 +296,7 @@ mod tests {
         let t = Instant::now();
         touch(&mut tp, t, 1);
         frame(&mut tp, 500, 500);
-        // 10 units = 1 mm right, 1 mm down => about PX_PER_MM px (+ gain).
+        // 10 units = 1 mm right, 1 mm down => ~25 px at 125 mm/s.
         let out = frame(&mut tp, 510, 510);
         match out.as_slice() {
             [Out::Motion(dx, dy)] => {
@@ -281,7 +315,7 @@ mod tests {
         let t = Instant::now();
         touch(&mut tp, t, 1);
         frame(&mut tp, 500, 500);
-        // 1 unit = 0.1 mm = ~1.8 px: never lose the remainder.
+        // 1 unit = 0.1 mm = ~1.2 px (slow zone): never lose the remainder.
         let mut total = 0;
         for i in 1..=20 {
             for o in frame(&mut tp, 500 + i, 500) {
@@ -290,7 +324,7 @@ mod tests {
                 }
             }
         }
-        assert!(total >= 30, "total={total}");
+        assert!(total >= 20, "total={total}");
     }
 
     #[test]
@@ -388,5 +422,42 @@ mod tests {
         let mut tp = pad();
         assert!(!tp.key(0x110, true, Instant::now())); // BTN_LEFT: caller's job
         assert!(!tp.abs(0x35, 1)); // ABS_MT_POSITION_X: ignored, not ours
+    }
+}
+
+#[cfg(test)]
+mod accel_tests {
+    use super::*;
+
+    #[test]
+    fn fast_flick_travels_much_farther_than_slow_drag() {
+        // Same 20 mm of travel: 8 ms/report at 0.2 mm vs 2.5 mm per report.
+        let run = |step: i32| {
+            let mut tp = Touchpad::new(10.0, 10.0);
+            let t = Instant::now();
+            tp.key(BTN_TOUCH, true, t);
+            tp.key(BTN_TOOL_FINGER, true, t);
+            let mut now = t;
+            let mut total = 0;
+            let mut x = 100;
+            for i in 0..=(200 / step) {
+                tp.abs(ABS_X, x);
+                tp.abs(ABS_Y, 100);
+                let mut out = Vec::new();
+                now += Duration::from_millis(8);
+                tp.sync_at(&mut out, now);
+                if i > 0 {
+                    for o in out {
+                        if let Out::Motion(dx, _) = o {
+                            total += dx;
+                        }
+                    }
+                }
+                x += step;
+            }
+            total
+        };
+        let (slow, fast) = (run(2), run(25));
+        assert!(fast > slow * 3, "slow={slow} fast={fast}");
     }
 }

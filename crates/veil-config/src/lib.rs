@@ -220,6 +220,9 @@ pub enum Action {
     /// a client's own fullscreen request, just initiated from a keybind
     /// instead of waiting for the app to ask).
     ToggleFullscreen,
+    /// "Fake fullscreen": the focused window fills the whole work area
+    /// (bar stays, no client fullscreen state).
+    ToggleFakeFullscreen,
     /// Hot-reload config file on demand.
     ReloadConfig,
     /// Open (or close) the wallpaper chooser overlay.
@@ -253,6 +256,7 @@ impl Action {
             Self::ResizeShrink => "resize shrink".to_string(),
             Self::ToggleLayout => "toggle layout mode".to_string(),
             Self::ToggleFullscreen => "toggle fullscreen".to_string(),
+            Self::ToggleFakeFullscreen => "toggle fake fullscreen".to_string(),
             Self::ReloadConfig => "reload config".to_string(),
             Self::WallpaperChooser => "wallpaper chooser".to_string(),
             Self::SwitchWorkspace(n) => format!("switch to workspace {n}"),
@@ -316,7 +320,8 @@ impl Default for Keybinds {
                 ('=', Action::ResizeGrow),
                 ('-', Action::ResizeShrink),
                 ('w', Action::ToggleLayout),
-                ('f', Action::ToggleFullscreen),
+                ('f', Action::ToggleFakeFullscreen),
+                ('g', Action::ToggleFullscreen),
                 ('c', Action::ReloadConfig),
                 ('y', Action::WallpaperChooser),
             ]
@@ -354,7 +359,7 @@ fn bind_key(s: &str) -> Option<char> {
 }
 
 /// (Lua field name, Action): order here is the help-menu display order.
-const KEYBIND_FIELDS: [(&str, Action); 18] = [
+const KEYBIND_FIELDS: [(&str, Action); 19] = [
     ("focus_left", Action::FocusLeft),
     ("focus_right", Action::FocusRight),
     ("focus_up", Action::FocusUp),
@@ -366,6 +371,7 @@ const KEYBIND_FIELDS: [(&str, Action); 18] = [
     ("resize_shrink", Action::ResizeShrink),
     ("toggle_layout", Action::ToggleLayout),
     ("fullscreen", Action::ToggleFullscreen),
+    ("fake_fullscreen", Action::ToggleFakeFullscreen),
     ("reload_config", Action::ReloadConfig),
     ("wallpaper_chooser", Action::WallpaperChooser),
     ("volume_up", Action::VolumeUp),

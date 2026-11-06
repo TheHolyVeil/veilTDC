@@ -10,6 +10,7 @@ edition = "2021"
 name = "velogin"
 path = "src/main.rs"
 
+
 [dependencies]
 slint = { workspace = true, features = [
     "std",
@@ -25,6 +26,7 @@ image       = { workspace = true, features = ["png", "jpeg"] }
 uzers       = { workspace = true }
 thiserror   = { workspace = true }
 libc        = { workspace = true }
+drm         = { workspace = true }
 
 [build-dependencies]
 slint-build = { workspace = true }
