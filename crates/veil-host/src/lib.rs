@@ -69,6 +69,7 @@ pub struct HostConfig {
     pub theme_mode: veil_config::ThemeMode,
     pub font: veil_config::FontSettings,
     pub bar: veil_config::BarConfig,
+    pub notify: veil_config::NotifyConfig,
     pub shell: ShellOptions,
 }
 
@@ -94,6 +95,7 @@ impl Default for HostConfig {
             theme_mode: veil_config::ThemeMode::Dark,
             font: veil_config::FontSettings::default(),
             bar: veil_config::BarConfig::default(),
+            notify: veil_config::NotifyConfig::default(),
             shell: ShellOptions::default(),
         }
     }
@@ -134,6 +136,7 @@ impl Host {
                     config.theme_mode,
                     config.font,
                     config.bar,
+                    config.notify,
                     config.shell,
                 ) {
                     eprintln!("[veil-host] server exited: {e}");

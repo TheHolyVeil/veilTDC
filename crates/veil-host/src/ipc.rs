@@ -555,6 +555,7 @@ mod tests {
             ping: Duration::from_millis(100),
             retry_min: Duration::from_millis(20),
             retry_max: Duration::from_millis(50),
+            waker: None,
         })
         .unwrap();
 

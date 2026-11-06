@@ -66,6 +66,14 @@ impl ToastTimers {
         ToastTimers { cfg: TimerConfig { max_visible: cfg.max_visible.max(1), ..cfg }, entries: Vec::new(), hovered: false, last: now, expired: Vec::new() }
     }
 
+    /// Switch settings on a running clock (a config reload). Toasts already
+    /// on screen keep their remaining time; only the visible cap and the
+    /// default for later toasts change.
+    pub fn set_config(&mut self, cfg: TimerConfig, now: Instant) {
+        self.advance_to(now);
+        self.cfg = TimerConfig { max_visible: cfg.max_visible.max(1), ..cfg };
+    }
+
     fn first_visible(&self) -> usize {
         self.entries.len().saturating_sub(self.cfg.max_visible)
     }

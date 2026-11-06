@@ -427,6 +427,12 @@ pub struct State {
     pub bar_dirty: bool,
     pub last_volume_poll: Instant,
     pub bar: veil_config::BarConfig,
+    /// `notify = { ... }` — see `veil_config::NotifyConfig`.
+    pub notify: veil_config::NotifyConfig,
+    /// The `notify` section changed on a config reload: broadcast it.
+    pub notify_dirty: bool,
+    /// `veil shell notify` has been started for this session.
+    pub notify_started: bool,
     /// `<mod_key>+D` app launcher — `Some` while the modal is open. See
     /// `crate::launcher`. Not itself a `keybinds` config entry, same as help.
     pub launcher: Option<Launcher>,
@@ -2285,6 +2291,13 @@ pub fn reload_config(state: &mut State) {
     if bar_settings_of(&state.bar) != bar_settings_of(&new_cfg.bar) {
         state.bar_dirty = true;
     }
+    if state.notify != new_cfg.notify {
+        state.notify_dirty = true;
+        if state.notify_started && !new_cfg.notify.shell {
+            tracing::info!("notify.shell = false: the running notification daemon stays until the session ends");
+        }
+    }
+    state.notify = new_cfg.notify;
     state.bar = new_cfg.bar;
     state.fps_cfg = new_cfg.fps;
     set_wallpaper_config(state, new_cfg.wallpaper.clone());
@@ -3547,6 +3560,16 @@ fn request_wallpaper(state: &mut State) {
 /// config.lua's `font = { ... }` as the text engine's own config type.
 /// The shell bar's settings as they go over IPC. Components never link Lua,
 /// so this typed form is all the bar ever sees of `bar = { ... }`.
+/// What `veil shell notify` needs from the `notify` section; `shell` is the
+/// host's own business and is not sent.
+pub fn notify_settings_json(n: &veil_config::NotifyConfig) -> serde_json::Value {
+    serde_json::json!({
+        "timeout": n.timeout_ms,
+        "max_visible": n.max_visible,
+        "dnd_critical": n.dnd_critical,
+    })
+}
+
 pub fn bar_settings_of(b: &veil_config::BarConfig) -> veil_ipc::BarSettings {
     veil_ipc::BarSettings {
         position: b.position.label().to_string(),
@@ -5375,6 +5398,16 @@ fn ipc_pump(state: &mut State) -> bool {
         }
     }
 
+    // The notification daemon owns org.freedesktop.Notifications, so it starts
+    // with the session whenever the config allows, whether or not the shell
+    // bar is on. If another daemon already owns the name it just queues.
+    if state.shell_ready && state.notify.shell && !state.notify_started {
+        state.notify_started = true;
+        if let Err(e) = state.supervisor.start_component("notify", now) {
+            tracing::warn!("shell: notify did not start: {e}");
+        }
+    }
+
     for (cid, msg) in state.ipc.poll_incoming() {
         busy = true;
         match &msg {
@@ -5402,6 +5435,7 @@ fn ipc_pump(state: &mut State) -> bool {
         let config = serde_json::json!({
             "font": state.text.config().to_json(),
             "bar": bar_settings_of(&state.bar).to_json(),
+            "notify": notify_settings_json(&state.notify),
         });
         if let Some(ClientMessage::Cmd { id, cmd, args }) =
             state.ipc.process_message(cid, msg, palette, config)
@@ -5467,6 +5501,16 @@ fn ipc_pump(state: &mut State) -> bool {
         busy = true;
     }
 
+    // The notify section changed: only that section goes out.
+    if state.notify_dirty {
+        state.notify_dirty = false;
+        state.ipc.broadcast(
+            topics::CONFIG,
+            serde_json::json!({ "notify": notify_settings_json(&state.notify) }),
+        );
+        busy = true;
+    }
+
     // Events, only on change. Each monitor has its own workspaces, so the
     // payload carries one (active, occupied) entry per monitor, in monitor
     // order; the bar picks its own by output name (`veil-host-<n>`).
@@ -5525,6 +5569,7 @@ pub fn run(
     theme_mode: veil_config::ThemeMode,
     font: veil_config::FontSettings,
     bar: veil_config::BarConfig,
+    notify: veil_config::NotifyConfig,
     shell_opts: crate::ShellOptions,
 ) -> io::Result<()> {
     let composite_interval = composite_interval_for(fps, 60_000);
@@ -5736,6 +5781,9 @@ pub fn run(
         bar_dirty: false,
         last_volume_poll: Instant::now(),
         bar,
+        notify,
+        notify_dirty: false,
+        notify_started: false,
         // No anchor client to spawn into (`veil-host start`) → open straight
         // to the launcher instead of an empty screen with no hint of what to press.
         launcher: if spawn.is_none() {
