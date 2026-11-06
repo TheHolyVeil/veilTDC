@@ -60,6 +60,12 @@ fn start(shell_bar: bool, trusted: &[&str]) -> Option<Env> {
             shell: shell_bar,
             ..Default::default()
         },
+        // These tests are about the bar; keep the notification daemon (and the
+        // session bus it wants) out of them.
+        notify: veil_config::NotifyConfig {
+            shell: false,
+            ..Default::default()
+        },
         shell: ShellOptions {
             ipc_socket: Some(ipc_path.clone()),
             shell_exe: Some(PathBuf::from(env!("CARGO_BIN_EXE_veil"))),

@@ -535,6 +535,7 @@ mod tests {
     fn notify_round_trip_carries_everything() {
         let bus = bus_or_skip!();
         let svc = Service::spawn(cfg(&bus), IdGen::new(1)).unwrap();
+        expect_name(&svc, NameState::Owner);
         let p = proxy(&client(&bus));
         let mut hints = Hint::new();
         hints.insert("urgency", Variant::new(2u8));
@@ -559,6 +560,7 @@ mod tests {
     fn replaces_id_works_across_connections() {
         let bus = bus_or_skip!();
         let svc = Service::spawn(cfg(&bus), IdGen::new(1)).unwrap();
+        expect_name(&svc, NameState::Owner);
         // Two connections, like two `notify-send` runs.
         let (a, b) = (proxy(&client(&bus)), proxy(&client(&bus)));
         let none = Hint::new();
@@ -580,6 +582,7 @@ mod tests {
     fn close_notification_needs_a_known_id() {
         let bus = bus_or_skip!();
         let svc = Service::spawn(cfg(&bus), IdGen::new(1)).unwrap();
+        expect_name(&svc, NameState::Owner);
         let (a, b) = (proxy(&client(&bus)), proxy(&client(&bus)));
         let id = notify(&a, 0, "mine", &Hint::new()).unwrap();
         assert!(matches!(next_event(&svc), Event::Notify { .. }));
@@ -595,6 +598,7 @@ mod tests {
         use futures_lite::StreamExt;
         let bus = bus_or_skip!();
         let svc = Service::spawn(cfg(&bus), IdGen::new(1)).unwrap();
+        expect_name(&svc, NameState::Owner);
         let p = proxy(&client(&bus));
         let id = notify(&p, 0, "x", &Hint::new()).unwrap();
         let (mut closed, mut action) = block_on(async {

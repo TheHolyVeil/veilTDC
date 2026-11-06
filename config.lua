@@ -101,6 +101,18 @@ bar = {
 	},
 }
 
+-- Notifications. The supervised veil-notify owns org.freedesktop.Notifications
+-- and draws the toasts (top right) and the history panel behind the bar's bell.
+-- `shell = false` stops Veil starting it, for when you run another daemon
+-- (veil-notify queues behind an existing owner of the name rather than
+-- taking it, so the other daemon wins either way).
+notify = {
+	shell = true,         -- start veil-notify with the session
+	timeout = 5000,       -- ms for toasts whose app set none; 0 = until dismissed (500..3600000)
+	max_visible = 5,      -- toasts on screen at once, 1..10; the rest wait
+	dnd_critical = true,  -- critical notifications still show under do-not-disturb
+}
+
 -- App binds (mod_key + key). Each one also appears as a clickable tile on the
 -- bar, in the order listed. Format: { key, command }; "enter" = Return.
 apps = {

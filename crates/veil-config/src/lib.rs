@@ -789,6 +789,29 @@ impl Default for BarConfig {
     }
 }
 
+/// `notify = { ... }` — the supervised notification daemon (`veil shell notify`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NotifyConfig {
+    /// Start the supervised `veil shell notify` with the session. Turn it off
+    /// to run a different notification daemon: veil-notify queues behind an
+    /// existing owner of the D-Bus name, so the other daemon wins, but there is
+    /// nothing gained by running both.
+    pub shell: bool,
+    /// How long a toast stays when the app sent no timeout, in milliseconds.
+    /// 0 keeps it until dismissed. Otherwise clamped to 500..=3_600_000.
+    pub timeout_ms: u32,
+    /// Toasts on screen at once; the rest wait their turn. Clamped to 1..=10.
+    pub max_visible: u32,
+    /// Show critical notifications even under do-not-disturb.
+    pub dnd_critical: bool,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self { shell: true, timeout_ms: 5000, max_visible: 5, dnd_critical: true }
+    }
+}
+
 /// How a wallpaper is fitted to the output (`fit` in Lua).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WallpaperFit {
@@ -947,6 +970,26 @@ fn parse_font(gl: &mlua::Table, default: &FontSettings) -> FontSettings {
     }
 }
 
+fn parse_notify(gl: &mlua::Table, default: &NotifyConfig) -> NotifyConfig {
+    let Ok(nt) = gl.get::<mlua::Table>("notify") else {
+        return default.clone();
+    };
+    let shell = get_bool(&nt, "shell", default.shell);
+    let dnd_critical = get_bool(&nt, "dnd_critical", default.dnd_critical);
+    let timeout = match nt.get::<mlua::Value>("timeout") {
+        Ok(mlua::Value::Integer(n)) if n >= 0 => n as u64,
+        Ok(mlua::Value::Number(n)) if n >= 0.0 => n as u64,
+        _ => u64::from(default.timeout_ms),
+    };
+    let timeout_ms = if timeout == 0 { 0 } else { timeout.clamp(500, 3_600_000) as u32 };
+    let max_visible = match nt.get::<mlua::Value>("max_visible") {
+        Ok(mlua::Value::Integer(n)) if n > 0 => (n as u64).min(10) as u32,
+        Ok(mlua::Value::Number(n)) if n >= 1.0 => (n as u64).min(10) as u32,
+        _ => default.max_visible,
+    };
+    NotifyConfig { shell, timeout_ms, max_visible: max_visible.clamp(1, 10), dnd_critical }
+}
+
 fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
     let Ok(bt) = gl.get::<mlua::Table>("bar") else {
         return default.clone();
@@ -1077,6 +1120,8 @@ pub struct VeilConfig {
     pub font: FontSettings,
     /// `bar = { ... }` config — see `BarConfig`.
     pub bar: BarConfig,
+    /// `notify = { ... }` config — see `NotifyConfig`.
+    pub notify: NotifyConfig,
     /// Static wallpaper, if configured.
     pub wallpaper: Option<WallpaperConfig>,
 }
@@ -1101,6 +1146,7 @@ impl Default for VeilConfig {
             theme_mode: ThemeMode::Dark,
             font: FontSettings::default(),
             bar: BarConfig::default(),
+            notify: NotifyConfig::default(),
             wallpaper: None,
         }
     }
@@ -1114,7 +1160,7 @@ impl Default for VeilConfig {
 const TOP_KEYS: &[&str] = &[
     "quality", "fps", "clipboard_sync", "refresh", "cage_timeout_secs", "input",
     "gpu_render", "gpu_power", "output", "background", "theme", "theme_mode",
-    "keybinds", "apps", "font", "bar", "wallpaper",
+    "keybinds", "apps", "font", "bar", "notify", "wallpaper",
 ];
 const FONT_KEYS: &[&str] = &["family", "mono", "icons", "fallback", "size", "weight"];
 const WALLPAPER_KEYS: &[&str] = &["engine", "paths", "path", "interval", "shuffle", "fit"];
@@ -1122,6 +1168,7 @@ const BAR_KEYS: &[&str] = &[
     "enabled", "position", "shell", "height", "left", "center", "right", "widgets",
 ];
 const WIDGET_KEYS: &[&str] = &["clock", "disk", "weather", "custom"];
+const NOTIFY_KEYS: &[&str] = &["shell", "timeout", "max_visible", "dnd_critical"];
 
 /// Keys a `keybinds` table accepts (also valid at top level when there is no
 /// `keybinds` table, because the parser falls back to the globals).
@@ -1227,6 +1274,9 @@ fn lint_config(gl: &mlua::Table, builtin: &std::collections::HashSet<String>) ->
     }
     if let Ok(t) = gl.get::<mlua::Table>("wallpaper") {
         lint_table("wallpaper", &t, WALLPAPER_KEYS, &mut out);
+    }
+    if let Ok(t) = gl.get::<mlua::Table>("notify") {
+        lint_table("notify", &t, NOTIFY_KEYS, &mut out);
     }
     if let Ok(bar) = gl.get::<mlua::Table>("bar") {
         lint_table("bar", &bar, BAR_KEYS, &mut out);
@@ -1380,6 +1430,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
             .map(|s| ThemeMode::from_str(&s))
             .unwrap_or(d.theme_mode),
         bar: parse_bar(&gl, &d.bar),
+        notify: parse_notify(&gl, &d.notify),
         font: parse_font(&gl, &d.font),
         wallpaper: parse_wallpaper(&gl),
     })
@@ -1752,5 +1803,65 @@ mod lint_tests {
     fn the_shipped_config_has_no_warnings() {
         // keeps ./config.lua honest as the parser grows
         assert_eq!(lint(include_str!("../../../config.lua")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_misspelled_notify_key_is_reported() {
+        assert!(lint("notify = { shell = true, max_visible = 3 }").is_empty());
+        let w = lint("notify = { timeuot = 3000 }");
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("notify.timeuot"), "{w:?}");
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+
+    fn parse(src: &str) -> NotifyConfig {
+        let lua = mlua::Lua::new();
+        lua.load(src).exec().unwrap();
+        parse_notify(&lua.globals(), &NotifyConfig::default())
+    }
+
+    #[test]
+    fn no_notify_table_keeps_defaults_and_runs_the_daemon() {
+        let d = parse("");
+        assert_eq!(d, NotifyConfig::default());
+        assert!(d.shell && d.dnd_critical);
+        assert_eq!((d.timeout_ms, d.max_visible), (5000, 5));
+    }
+
+    #[test]
+    fn every_key_is_read() {
+        let n = parse("notify = { shell = false, timeout = 8000, max_visible = 3, dnd_critical = false }");
+        assert_eq!(n, NotifyConfig { shell: false, timeout_ms: 8000, max_visible: 3, dnd_critical: false });
+    }
+
+    #[test]
+    fn a_partial_table_keeps_the_other_defaults() {
+        let n = parse("notify = { timeout = 2000 }");
+        assert_eq!(n, NotifyConfig { timeout_ms: 2000, ..NotifyConfig::default() });
+    }
+
+    #[test]
+    fn timeout_zero_means_never_and_the_rest_is_clamped() {
+        assert_eq!(parse("notify = { timeout = 0 }").timeout_ms, 0);
+        assert_eq!(parse("notify = { timeout = 10 }").timeout_ms, 500);
+        assert_eq!(parse("notify = { timeout = 99999999 }").timeout_ms, 3_600_000);
+        assert_eq!(parse("notify = { timeout = 2500.0 }").timeout_ms, 2500);
+    }
+
+    #[test]
+    fn max_visible_is_clamped_to_one_through_ten() {
+        assert_eq!(parse("notify = { max_visible = 0 }").max_visible, 5);
+        assert_eq!(parse("notify = { max_visible = 1 }").max_visible, 1);
+        assert_eq!(parse("notify = { max_visible = 99 }").max_visible, 10);
+    }
+
+    #[test]
+    fn wrong_types_fall_back_to_the_defaults() {
+        let n = parse(r#"notify = { shell = "yes", timeout = "soon", max_visible = -2 }"#);
+        assert_eq!(n, NotifyConfig::default());
     }
 }

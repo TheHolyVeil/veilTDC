@@ -311,6 +311,20 @@ impl App {
                 self.relayout_all = true;
             }
         }
+        if let Some(n) = config.get("notify") {
+            let mut timers = self.cfg.engine.timers;
+            if let Some(ms) = n.get("timeout").and_then(Value::as_u64) {
+                // 0 means "until dismissed".
+                timers.default_timeout = (ms > 0).then(|| Duration::from_millis(ms));
+            }
+            if let Some(v) = n.get("max_visible").and_then(Value::as_u64) {
+                timers.max_visible = (v as usize).clamp(1, 10);
+            }
+            let dnd_critical = n.get("dnd_critical").and_then(Value::as_bool).unwrap_or(self.cfg.engine.dnd_critical);
+            self.cfg.engine.timers = timers;
+            self.cfg.engine.dnd_critical = dnd_critical;
+            self.engine.set_config(timers, dnd_critical, Instant::now());
+        }
     }
 
     /// Run what the engine says the outside world must be told.

@@ -100,6 +100,15 @@ impl Core {
         core
     }
 
+    /// Apply the `notify` settings from a config (re)load to a running core.
+    /// Toasts already showing keep their timers; the history size and the
+    /// rate limit are fixed for the life of the process.
+    pub fn set_config(&mut self, timers: TimerConfig, dnd_critical: bool, now: Instant) {
+        self.cfg.timers = timers;
+        self.cfg.dnd_critical = dnd_critical;
+        self.timers.set_config(timers, now);
+    }
+
     // ----- what the app reads
 
     /// Toasts to show, newest first (top to bottom).
@@ -710,5 +719,63 @@ mod tests {
         c.on_notify(n(2).build(), false, at(t0, 6000));
         assert!(c.take_effects().contains(&Effect::Closed { id: 1, reason: CloseReason::Expired }));
         assert_eq!(ids(&c), vec![2]);
+    }
+
+    #[test]
+    fn set_config_changes_the_default_timeout_for_later_toasts() {
+        let t0 = Instant::now();
+        let mut c = core(t0);
+        let timers = TimerConfig { default_timeout: Some(Duration::from_secs(2)), ..TimerConfig::default() };
+        c.set_config(timers, true, t0);
+        c.on_notify(n(1).build(), false, t0);
+        c.on_tick(at(t0, 1999), 0);
+        assert_eq!(ids(&c), vec![1]);
+        c.on_tick(at(t0, 2000), 0);
+        assert!(ids(&c).is_empty());
+    }
+
+    #[test]
+    fn set_config_none_keeps_toasts_until_dismissed() {
+        let t0 = Instant::now();
+        let mut c = core(t0);
+        c.set_config(TimerConfig { default_timeout: None, ..TimerConfig::default() }, true, t0);
+        c.on_notify(n(1).build(), false, t0);
+        c.on_tick(at(t0, 3_600_000), 0);
+        assert_eq!(ids(&c), vec![1]);
+    }
+
+    #[test]
+    fn set_config_keeps_the_time_a_showing_toast_already_used() {
+        let t0 = Instant::now();
+        let mut c = core(t0);
+        c.on_notify(n(1).build(), false, t0); // 5 s default
+        c.set_config(TimerConfig { default_timeout: Some(Duration::from_secs(60)), ..TimerConfig::default() }, true, at(t0, 4000));
+        c.on_tick(at(t0, 5000), 0);
+        assert!(ids(&c).is_empty(), "the toast already running still ends on its original 5 s");
+    }
+
+    #[test]
+    fn set_config_lowers_the_visible_cap() {
+        let t0 = Instant::now();
+        let mut c = core(t0);
+        for id in 1..=3 {
+            c.on_notify(n(id).build(), false, t0);
+        }
+        assert_eq!(ids(&c), vec![3, 2, 1]);
+        c.set_config(TimerConfig { max_visible: 1, ..TimerConfig::default() }, true, t0);
+        assert_eq!(ids(&c), vec![3]);
+        assert_eq!(c.hidden_count(), 2);
+    }
+
+    #[test]
+    fn set_config_can_stop_critical_bypassing_dnd() {
+        let t0 = Instant::now();
+        let mut c = core(t0);
+        c.on_control(Control { dnd: Some(DndMode::On), panel: None }, t0);
+        c.on_notify(N { urgency: Some(2), ..n(1) }.build(), false, t0);
+        assert_eq!(ids(&c), vec![1], "critical passes under DND by default");
+        c.set_config(TimerConfig::default(), false, t0);
+        c.on_notify(N { urgency: Some(2), ..n(2) }.build(), false, t0);
+        assert_eq!(ids(&c), vec![1], "the second critical is now held back");
     }
 }
