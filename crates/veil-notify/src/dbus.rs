@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +37,7 @@ use zbus::OwnedVariant;
 
 use crate::ids::IdGen;
 use crate::model::{Hints, Limits, Notification, NotifyArgs, RawImage};
+use crate::waker::Waker;
 
 pub const BUS_NAME: &str = "org.freedesktop.Notifications";
 pub const OBJECT_PATH: &str = "/org/freedesktop/Notifications";
@@ -90,11 +92,13 @@ pub struct ServiceConfig {
     pub queue_depth: usize,
     /// How often a queued daemon checks whether it has become the owner.
     pub name_poll: Duration,
+    /// Poked after every event queued for the main loop.
+    pub waker: Option<Arc<Waker>>,
 }
 
 impl Default for ServiceConfig {
     fn default() -> Self {
-        ServiceConfig { limits: Limits::default(), bus_address: None, queue_depth: 256, name_poll: Duration::from_secs(2) }
+        ServiceConfig { limits: Limits::default(), bus_address: None, queue_depth: 256, name_poll: Duration::from_secs(2), waker: None }
     }
 }
 
@@ -173,12 +177,17 @@ struct Notifications {
     tx: Sender<Event>,
     ids: IdGen,
     limits: Limits,
+    waker: Option<Arc<Waker>>,
 }
 
 impl Notifications {
     fn send(&self, ev: Event) {
         match self.tx.try_send(ev) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(w) = &self.waker {
+                    w.wake();
+                }
+            }
             Err(TrySendError::Full(_)) => tracing::warn!("notification queue full, dropping an event"),
             Err(TrySendError::Disconnected(_)) => tracing::debug!("main loop is gone, dropping an event"),
         }
@@ -282,7 +291,12 @@ impl Drop for Service {
 }
 
 fn run(cfg: ServiceConfig, ids: IdGen, tx: Sender<Event>, out_rx: Receiver<Out>) {
-    let iface = Notifications { tx: tx.clone(), ids, limits: cfg.limits.clone() };
+    let iface = Notifications { tx: tx.clone(), ids, limits: cfg.limits.clone(), waker: cfg.waker.clone() };
+    let wake = || {
+        if let Some(w) = &cfg.waker {
+            w.wake();
+        }
+    };
     let builder = match &cfg.bus_address {
         Some(addr) => zbus::connection::Builder::address(addr.as_str()),
         None => zbus::connection::Builder::session(),
@@ -302,6 +316,7 @@ fn run(cfg: ServiceConfig, ids: IdGen, tx: Sender<Event>, out_rx: Receiver<Out>)
         Err(e) => {
             tracing::warn!("notification service unavailable: {e}");
             let _ = tx.send(Event::Unavailable(e.to_string()));
+            wake();
             return;
         }
     };
@@ -309,6 +324,7 @@ fn run(cfg: ServiceConfig, ids: IdGen, tx: Sender<Event>, out_rx: Receiver<Out>)
         tracing::warn!("{BUS_NAME} is owned by another daemon; waiting for it to exit");
     }
     let _ = tx.send(Event::Name(state));
+    wake();
 
     loop {
         // Only a queued daemon needs to wake up on its own; an owner sleeps until told something.
@@ -341,6 +357,7 @@ fn run(cfg: ServiceConfig, ids: IdGen, tx: Sender<Event>, out_rx: Receiver<Out>)
                     state = NameState::Owner;
                     tracing::info!("took over {BUS_NAME}");
                     let _ = tx.send(Event::Name(state));
+                    wake();
                 }
             }
         }

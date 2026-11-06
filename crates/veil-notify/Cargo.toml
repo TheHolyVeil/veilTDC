@@ -6,17 +6,21 @@ description = "Veil notification service: data model, markup sanitiser, history 
 
 # Steps 1 and 2 are pure logic. Step 3 adds the D-Bus service (zbus, driven by
 # one worker thread, same pattern as veil-bar's media widget). Step 4 adds
-# veil-ipc (the compositor connection). veil-ui joins in step 5.
+# veil-ipc (the compositor connection). Step 5 adds veil-ui (layer surfaces, drawing).
 [dependencies]
 serde             = { workspace = true }
 serde_json        = { workspace = true }
 thiserror         = { workspace = true }
 tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
 libc              = { workspace = true }
 zbus              = { workspace = true }
 crossbeam-channel = { workspace = true }
 futures-lite      = { workspace = true }
 veil-ipc          = { path = "../veil-ipc" }
+veil-ui           = { path = "../veil-ui" }
+veil-palette      = { path = "../veil-palette" }
+tiny-skia         = { workspace = true }
 
 [dev-dependencies]
 tempfile   = { workspace = true }

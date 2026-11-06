@@ -3,7 +3,7 @@
 The Veil notification service (phase 4 of the Veil Shell Architecture).
 Scope and decisions live in `Veil_Shell.md`, section 11, Phase 4.
 
-## State: step 4 of 7 (data, timing, geometry, D-Bus, compositor IPC)
+## State: step 5 of 7 (toasts work end to end)
 
 | Step | What | State |
 | --- | --- | --- |
@@ -11,9 +11,9 @@ Scope and decisions live in `Veil_Shell.md`, section 11, Phase 4.
 | 2 | `timers` (expiry state machine), `layout` (toast stack geometry) | done |
 | 3 | `dbus` (zbus 6 service, signals, name queueing), `ids` | done |
 | 4 | `ipc` client, host relay (`veil-host`), bell fix (`veil-bar`), shared payloads (`veil-ipc`) | done, 79 tests here |
-| 5 | toasts | next |
-| 6 | history panel | |
-| 7 | supervisor and `veil shell notify` registration | |
+| 5 | toasts: `engine`, `toast`, `wrap`, `layout`, `waker`, `app`; `veil shell notify` entry | done, 118 tests here + 3 end-to-end |
+| 6 | history panel | next |
+| 7 | supervisor registration (`shell.notify` config key), `notify.*` config keys | |
 
 No Wayland yet. Everything except `dbus` is deterministic and takes the clock as
 an argument. `dbus` runs one worker thread (`veil-notify-dbus`) and talks to the
@@ -65,9 +65,20 @@ main loop only through channels. Try it without any UI:
   never expire. A late `poll` replays expiries in order and charges a revealed
   toast only for the time it was actually visible. Mutators queue expiries, and
   `poll` is the only place they come out.
-- **Layout**: the toast surface is sized to the stack and its input region is
-  the toast rectangles only (`Stack::input_rects`); gaps and everything else
-  click through. The first toast is always shown, clamped to the screen.
+- **One layer surface per toast**, each its own Wayland connection, anchored
+  top-right with its stack position as the top margin. Gaps are real gaps, so
+  clicks fall through with no input-region tricks (the host's handling of input
+  regions is an open question, see the ignored test in `crates/veil/tests/layer_shell.rs`).
+  `margin_top` is only the visual gap: the host already places a zero-zone
+  overlay below the bar's exclusive zone (measured, same file). The first toast
+  is always shown; later ones only while the stack stays under `max_height`.
+- **The engine is I/O-free** (`engine.rs`): every rule about DND, replace, rate
+  limits, dismiss, actions, expiry and the bell is tested there with a fake
+  clock. `app.rs` only moves events in and effects out. Keep it that way.
+- **The loop sleeps in `poll(2)`** on the waker plus every toast's Wayland fd,
+  with a timeout from `Core::next_wake`; idle is zero wakeups. A pass that
+  changed anything runs again before sleeping: queued Wayland requests are not
+  sent until flushed and a pointer event may already be buffered.
 - **Untrusted image headers** are validated before any index is computed; all
   size arithmetic is checked.
 
@@ -86,8 +97,18 @@ rate limit 20 per 10 s per app, default timeout 5 s (clamped 0.5 s to 1 h),
   alternative is rendering real tags as text, which is worse.
 - `<br>` is accepted as a newline though the spec does not list it; apps send it.
 - Image scaling is nearest-neighbour. Good enough for a 128 px toast icon.
-- On a very short output the layout can hide a toast the timers still count as
-  visible, so it may expire unseen. Normal screens never hit this.
+- If the stack exceeds `max_height` (900 px) a toast the timers count as visible
+  is not shown and may expire unseen. Needs five very long toasts at once.
+- No "+n more" indicator for toasts beyond the visible five; they wait, and the
+  bell counts them. A history panel (step 6) is where they are listed.
+- `<i>` shows upright, and `image-path` / `app_icon` files are not drawn
+  (`image-data` is). Faux bold is the glyphs drawn twice 0.6 px apart.
+- Toasts show on the first output (`OutputFilter::First`). Following focus needs
+  the host to publish the focused output; it knows (`active_monitor_idx`), it
+  just is not in the `focus` event yet.
+- `notify.panel` currently only flips the engine's panel flag and marks
+  everything read, because there is no panel until step 6.
+- Settings are code defaults; the `notify.*` config keys come with step 7.
 
 ## Test
 

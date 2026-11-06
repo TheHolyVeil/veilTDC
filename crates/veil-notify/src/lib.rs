@@ -9,7 +9,12 @@
 //! - [`model`]: [`model::Notification`], hints, actions, image validation
 //! - [`store`]: bounded history, unread count, DND, atomic 0600 persistence
 //! - [`rate`]: per-app sliding-window limiter with an injected clock
+//! - [`app`]: the process: surfaces, the poll loop, effects out
+//! - [`engine`]: the notification logic (DND, rate limit, dismiss, expiry, bell) with no I/O
 //! - [`timers`]: toast expiry, visibility cap, hover pause, next wake-up time
+//! - [`panel`]: the history panel: layout, drawing, hit-testing
+//! - [`toast`]: one toast: measure, draw, hit-test
+//! - [`waker`]: the eventfd that lets background threads wake the main loop
 //! - [`wrap`]: word wrapping of styled text for toasts and the panel
 //! - [`layout`]: toast stack rectangles, input regions, click hit-testing
 //! - [`ids`]: the shared, persisted id counter
@@ -19,14 +24,19 @@
 //! Later steps add toasts (5), the history panel (6) and the
 //! `veil shell notify` entry (7).
 
+pub mod app;
 pub mod dbus;
+pub mod engine;
 pub mod ids;
 pub mod ipc;
 pub mod layout;
 pub mod markup;
 pub mod model;
+pub mod panel;
 pub mod rate;
 pub mod store;
 pub mod text;
 pub mod timers;
+pub mod toast;
+pub mod waker;
 pub mod wrap;

@@ -16,6 +16,7 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use serde_json::Value;
 use veil_ipc::notify::{Control, NotificationsState};
 use veil_ipc::{commands, topics, ClientMessage, FrameBuffer, ServerMessage, PROTOCOL_VERSION};
+
+use crate::waker::Waker;
 
 /// The name sent in `hello`; the supervisor matches it to the component.
 pub const COMPONENT_NAME: &str = "notify";
@@ -47,12 +50,14 @@ pub struct IpcConfig {
     pub ping: Duration,
     pub retry_min: Duration,
     pub retry_max: Duration,
+    /// Poked after every event queued for the main loop.
+    pub waker: Option<Arc<Waker>>,
 }
 
 impl Default for IpcConfig {
     fn default() -> Self {
         let socket = std::env::var("VEIL_IPC_SOCKET").map(PathBuf::from).unwrap_or_else(|_| veil_ipc::socket_path());
-        IpcConfig { socket, ping: Duration::from_secs(3), retry_min: Duration::from_secs(1), retry_max: Duration::from_secs(10) }
+        IpcConfig { socket, ping: Duration::from_secs(3), retry_min: Duration::from_secs(1), retry_max: Duration::from_secs(10), waker: None }
     }
 }
 
@@ -123,7 +128,7 @@ fn run(cfg: IpcConfig, rx: Receiver<Msg>, tx: Sender<Msg>, incoming: Sender<Inco
         generation += 1;
         match session(&cfg, stream, generation, &rx, &tx, &incoming, &mut wanted) {
             Ended::Shutdown => return,
-            Ended::Lost => emit(&incoming, Incoming::Disconnected),
+            Ended::Lost => emit(&incoming, cfg.waker.as_deref(), Incoming::Disconnected),
         }
         // A compositor that accepts and immediately drops must not spin us.
         if idle(&rx, cfg.retry_min, &mut wanted) {
@@ -219,7 +224,7 @@ fn session(
                         break Ended::Lost;
                     }
                 }
-                Ok(Msg::Frame(g, frame)) if g == generation => handle_frame(frame, incoming),
+                Ok(Msg::Frame(g, frame)) if g == generation => handle_frame(frame, incoming, cfg.waker.as_deref()),
                 Ok(Msg::Closed(g)) if g == generation => break Ended::Lost,
                 Ok(Msg::Frame(..) | Msg::Closed(_)) => {} // from a previous connection
                 Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break Ended::Shutdown,
@@ -270,16 +275,16 @@ fn read_frames(mut stream: UnixStream, generation: u64, tx: Sender<Msg>) {
     let _ = tx.send(Msg::Closed(generation));
 }
 
-fn handle_frame(frame: ServerMessage, incoming: &Sender<Incoming>) {
+fn handle_frame(frame: ServerMessage, incoming: &Sender<Incoming>, waker: Option<&Waker>) {
     match frame {
-        ServerMessage::Hello { palette, config, .. } => emit(incoming, Incoming::Connected { palette, config }),
+        ServerMessage::Hello { palette, config, .. } => emit(incoming, waker, Incoming::Connected { palette, config }),
         ServerMessage::Event { topic, data } => match topic.as_str() {
             topics::NOTIFY_CONTROL => match serde_json::from_value::<Control>(data) {
-                Ok(control) => emit(incoming, Incoming::Control(control)),
+                Ok(control) => emit(incoming, waker, Incoming::Control(control)),
                 Err(e) => tracing::debug!("notify: ignoring a malformed control event: {e}"),
             },
-            topics::PALETTE => emit(incoming, Incoming::Palette(data)),
-            topics::CONFIG => emit(incoming, Incoming::Config(data)),
+            topics::PALETTE => emit(incoming, waker, Incoming::Palette(data)),
+            topics::CONFIG => emit(incoming, waker, Incoming::Config(data)),
             _ => {}
         },
         ServerMessage::Reply { ok: false, error, .. } => {
@@ -289,9 +294,14 @@ fn handle_frame(frame: ServerMessage, incoming: &Sender<Incoming>) {
     }
 }
 
-fn emit(incoming: &Sender<Incoming>, ev: Incoming) {
+fn emit(incoming: &Sender<Incoming>, waker: Option<&Waker>, ev: Incoming) {
     match incoming.try_send(ev) {
-        Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+        Ok(()) => {
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => {}
         Err(TrySendError::Full(_)) => tracing::warn!("notify: IPC event queue full, dropping an event"),
     }
 }
@@ -312,6 +322,7 @@ mod tests {
             ping: Duration::from_millis(80),
             retry_min: Duration::from_millis(30),
             retry_max: Duration::from_millis(100),
+            waker: None,
         }
     }
 

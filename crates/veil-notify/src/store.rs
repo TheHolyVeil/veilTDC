@@ -50,11 +50,13 @@ pub struct Store {
     dnd: bool,
     cap: usize,
     dirty: bool,
+    /// Bumped on every change, so a view can tell when to redraw.
+    rev: u64,
 }
 
 impl Store {
     pub fn new(cap: usize) -> Store {
-        Store { items: VecDeque::new(), dnd: false, cap: cap.max(1), dirty: false }
+        Store { items: VecDeque::new(), dnd: false, cap: cap.max(1), dirty: false, rev: 0 }
     }
 
     /// Add `n`, replacing any entry with the same id (the replacement counts as
@@ -69,6 +71,7 @@ impl Store {
             }
         }
         self.dirty = true;
+        self.rev += 1;
         evicted
     }
 
@@ -79,7 +82,21 @@ impl Store {
     pub fn remove(&mut self, id: u32) -> Option<Notification> {
         let pos = self.items.iter().position(|n| n.id == id)?;
         self.dirty = true;
+        self.rev += 1;
         self.items.remove(pos)
+    }
+
+    /// Mark one entry read (the user dealt with it). Returns whether it changed.
+    pub fn mark_read(&mut self, id: u32) -> bool {
+        match self.items.iter_mut().find(|n| n.id == id && !n.read) {
+            Some(n) => {
+                n.read = true;
+                self.dirty = true;
+        self.rev += 1;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Drop everything; returns how many entries went.
@@ -88,6 +105,7 @@ impl Store {
         if n > 0 {
             self.items.clear();
             self.dirty = true;
+        self.rev += 1;
         }
         n
     }
@@ -116,6 +134,9 @@ impl Store {
             changed = true;
         }
         self.dirty |= changed;
+        if changed {
+            self.rev += 1;
+        }
         changed
     }
 
@@ -128,11 +149,24 @@ impl Store {
         let changed = self.dnd != on;
         self.dnd = on;
         self.dirty |= changed;
+        if changed {
+            self.rev += 1;
+        }
         changed
     }
 
     pub fn summary(&self) -> Summary {
         Summary { count: self.unread(), dnd: self.dnd }
+    }
+
+    /// A counter that changes whenever the history or DND does.
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    /// Whether anything changed since the last save, without clearing it.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     /// True once after any change that should reach the file.

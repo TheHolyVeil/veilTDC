@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 veil-host   = { path = "../veil-host" }
 veil-bar    = { path = "../veil-bar", optional = true }
+veil-notify = { path = "../veil-notify", optional = true }
 veil-ipc    = { path = "../veil-ipc" }
 veil-config = { path = "../veil-config" }
 serde_json  = { workspace = true }
@@ -18,7 +19,8 @@ mimalloc    = { workspace = true }
 
 [features]
 default = ["shell"]
-shell   = ["dep:veil-bar"]
+shell   = ["dep:veil-bar", "dep:veil-notify"]
 
 [dev-dependencies]
 veil-ui = { path = "../veil-ui" }
+tempfile = { workspace = true }

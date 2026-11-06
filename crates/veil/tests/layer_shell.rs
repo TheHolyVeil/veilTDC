@@ -829,3 +829,221 @@ fn output_filter_limits_surfaces_to_one_output() {
     assert_eq!(count("f-first"), 1, "First means exactly one");
     assert_eq!(count("f-named"), 0, "an unknown name gets nothing");
 }
+
+// ─── phase 4: the notify service end to end ──────────────────────────────────
+//
+// The real compositor, the real notify App on its own thread, a private
+// dbus-daemon (the session bus is never touched) and the real `notify-send`.
+
+/// A private session bus. Killed on drop.
+struct TestBus {
+    child: std::process::Child,
+    address: String,
+}
+
+impl TestBus {
+    fn start() -> Option<TestBus> {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take()?).read_line(&mut line).ok()?;
+        let address = line.trim().to_string();
+        (!address.is_empty()).then_some(TestBus { child, address })
+    }
+}
+
+impl Drop for TestBus {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+struct Rig {
+    env: Env,
+    bus: TestBus,
+    handle: veil_notify::app::Handle,
+    thread: Option<std::thread::JoinHandle<()>>,
+    _history: tempfile::TempDir,
+}
+
+impl Rig {
+    fn start() -> Option<Rig> {
+        let env = start(false, &[])?;
+        let Some(bus) = TestBus::start() else {
+            eprintln!("skipping: no dbus-daemon");
+            return None;
+        };
+        if std::process::Command::new("notify-send").arg("--version").output().is_err() {
+            eprintln!("skipping: no notify-send");
+            return None;
+        }
+        let history = tempfile::tempdir().unwrap();
+        let cfg = veil_notify::app::Config { history_path: history.path().join("h.json"), ..Default::default() };
+        let over = veil_notify::app::Overrides {
+            bus_address: Some(bus.address.clone()),
+            ipc_socket: Some(env.ipc_path.clone()),
+            wayland_socket: Some(env.wayland_socket.clone()),
+        };
+        let (tx, rx) = channel();
+        let thread = std::thread::spawn(move || match veil_notify::app::App::new(cfg, over) {
+            Ok((app, handle)) => {
+                tx.send(Some(handle)).ok();
+                let _ = app.run();
+            }
+            Err(e) => {
+                eprintln!("notify failed to start: {e}");
+                tx.send(None).ok();
+            }
+        });
+        let handle = rx.recv_timeout(Duration::from_secs(10)).ok().flatten()?;
+        let rig = Rig { env, bus, handle, thread: Some(thread), _history: history };
+        wait_for("notify owns the bus name", Duration::from_secs(8), || {
+            std::process::Command::new("dbus-send")
+                .args(["--print-reply", "--dest=org.freedesktop.Notifications", "/org/freedesktop/Notifications"])
+                .arg("org.freedesktop.Notifications.GetCapabilities")
+                .env("DBUS_SESSION_BUS_ADDRESS", &rig.bus.address)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        Some(rig)
+    }
+
+    fn cmd(&self, args: &[&str]) -> std::process::Command {
+        let mut c = std::process::Command::new("notify-send");
+        c.args(args).env("DBUS_SESSION_BUS_ADDRESS", &self.bus.address);
+        c
+    }
+
+    fn send(&self, args: &[&str]) {
+        assert!(self.cmd(args).output().unwrap().status.success(), "notify-send {args:?} failed");
+    }
+
+    /// Geometry [x, y, w, h] of every toast surface.
+    fn toasts(&self) -> Vec<[i64; 4]> {
+        let layers = self.env.layers();
+        let mut out = Vec::new();
+        for o in layers["outputs"].as_array().into_iter().flatten() {
+            for l in o["layers"].as_array().into_iter().flatten().filter(|l| l["namespace"] == "veil-notify") {
+                let g: Vec<i64> = l["geometry"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect();
+                out.push([g[0], g[1], g[2], g[3]]);
+            }
+        }
+        out.sort_by_key(|g| g[1]);
+        out
+    }
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        self.handle.stop();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The next IPC event within `within`, or `None`.
+fn next_event(ipc: &mut Ipc, within: Duration) -> Option<(String, Value)> {
+    let end = Instant::now() + within;
+    let mut buf = [0u8; 8192];
+    loop {
+        while let Some(m) = ipc.frames.next_frame::<ServerMessage>().unwrap() {
+            if let ServerMessage::Event { topic, data } = m {
+                return Some((topic, data));
+            }
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        ipc.stream.set_read_timeout(Some(left.max(Duration::from_millis(1)))).unwrap();
+        match ipc.stream.read(&mut buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => ipc.frames.push(&buf[..n]).unwrap(),
+        }
+    }
+}
+
+/// Skip `notifications` events until one with this state arrives.
+fn expect_bell(ipc: &mut Ipc, count: u64, dnd: bool) {
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut seen = Vec::new();
+    while let Some((topic, data)) = next_event(ipc, end.saturating_duration_since(Instant::now())) {
+        if topic == "notifications" {
+            if data["count"] == count && data["dnd"] == dnd {
+                return;
+            }
+            seen.push(data);
+        }
+    }
+    panic!("never saw the bell at count={count} dnd={dnd}; saw {seen:?}");
+}
+
+const BTN_RIGHT: u32 = 0x111;
+
+#[test]
+fn toasts_stack_below_each_other_and_expire_by_themselves() {
+    let Some(rig) = Rig::start() else { return };
+    rig.send(&["-t", "1500", "first"]);
+    rig.send(&["-t", "1500", "second"]);
+    wait_for("two toasts", Duration::from_secs(8), || rig.toasts().len() == 2);
+    let t = rig.toasts();
+    assert_eq!(t[0][0], W as i64 - 360 - 12, "right-aligned with the margin");
+    assert_eq!(t[0][2], 360);
+    assert_eq!(t[0][1], 8, "the first toast sits one margin below the top (no bar in this test)");
+    assert_eq!(t[1][1], t[0][1] + t[0][3] + 8, "the second sits exactly one gap below the first");
+    wait_for("both expired", Duration::from_secs(8), || rig.toasts().is_empty());
+}
+
+/// Right click dismisses, and the app is told: `notify-send --wait` only
+/// returns when it receives `NotificationClosed`.
+#[test]
+fn right_click_dismisses_and_the_sender_is_told() {
+    let Some(rig) = Rig::start() else { return };
+    let mut child = rig.cmd(&["--wait", "-t", "0", "stay"]).spawn().unwrap();
+    wait_for("the toast", Duration::from_secs(8), || rig.toasts().len() == 1);
+    let g = rig.toasts()[0];
+    assert_eq!(pointer_focus_at(&rig.env, g[0] as i32 + 50, g[1] as i32 + 30), "veil-notify");
+    assert!(child.try_wait().unwrap().is_none(), "notify-send --wait must still be waiting");
+    for pressed in [true, false] {
+        rig.env.host.send_input(InputCmd::PointerButton { button: BTN_RIGHT, pressed }).unwrap();
+    }
+    wait_for("toast dismissed", Duration::from_secs(5), || rig.toasts().is_empty());
+    wait_for("the sender was told", Duration::from_secs(5), || child.try_wait().unwrap().is_some());
+}
+
+/// The bell and DND through the real host: `notifications.set` relay, replay to
+/// a late subscriber, `notify.dnd` and `notify.panel` dispatch in `server.rs`.
+#[test]
+fn the_bell_and_dnd_work_through_the_real_host() {
+    let Some(rig) = Rig::start() else { return };
+    let mut events = rig.env.ipc();
+    events.send(&ClientMessage::Subscribe { topics: vec!["notifications".into()] });
+    expect_bell(&mut events, 0, false); // replayed to a late subscriber
+
+    rig.send(&["-t", "800", "hello"]);
+    expect_bell(&mut events, 1, false);
+    wait_for("it expired", Duration::from_secs(6), || rig.toasts().is_empty());
+
+    let mut ctl = rig.env.ipc();
+    ctl.cmd("notify.dnd", json!({ "mode": "on" })).unwrap();
+    expect_bell(&mut events, 1, true);
+    assert!(ctl.cmd("notify.dnd", json!({ "mode": "maybe" })).is_err(), "a bad mode is refused");
+
+    rig.send(&["quiet"]);
+    expect_bell(&mut events, 2, true);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(rig.toasts().is_empty(), "no toast under do-not-disturb");
+
+    rig.send(&["-u", "critical", "loud"]);
+    wait_for("critical bypasses DND", Duration::from_secs(6), || rig.toasts().len() == 1);
+
+    ctl.cmd("notify.panel", json!({})).unwrap();
+    expect_bell(&mut events, 0, true); // opening the panel reads everything
+}

@@ -5213,10 +5213,12 @@ version = "4.0.2"
 dependencies = [
  "mimalloc",
  "serde_json",
+ "tempfile",
  "veil-bar",
  "veil-config",
  "veil-host",
  "veil-ipc",
+ "veil-notify",
  "veil-ui",
 ]
 
@@ -5317,8 +5319,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tiny-skia 0.11.4",
  "tracing",
+ "tracing-subscriber",
  "veil-ipc",
+ "veil-palette",
+ "veil-ui",
  "zbus 6.2.1",
 ]
 

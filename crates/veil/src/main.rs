@@ -27,9 +27,16 @@ fn main() -> std::io::Result<()> {
                     }
                     return Ok(());
                 }
+                "notify" => {
+                    if let Err(e) = veil_notify::app::run_notify() {
+                        eprintln!("[veil shell notify] Error: {e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
                 other => {
                     eprintln!("Unknown shell component: {other}");
-                    eprintln!("Available components: bar");
+                    eprintln!("Available components: bar, notify");
                     std::process::exit(1);
                 }
             }

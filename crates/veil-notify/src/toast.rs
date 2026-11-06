@@ -173,18 +173,27 @@ fn accent_for(n: &Notification, theme: &Theme) -> Color {
     }
 }
 
-fn draw_lines(pm: &mut Pixmap, text: &mut TextSystem, lines: &[Line], x: f32, y: f32, size: f32, line_h: f32, color: Color) {
+/// Where and how a block of wrapped lines is drawn.
+struct Block {
+    x: f32,
+    y: f32,
+    size: f32,
+    line_h: f32,
+    color: Color,
+}
+
+fn draw_lines(pm: &mut Pixmap, text: &mut TextSystem, lines: &[Line], b: Block) {
     for (i, line) in lines.iter().enumerate() {
-        let ly = y + i as f32 * line_h;
-        let mut cx = x;
+        let ly = b.y + i as f32 * b.line_h;
+        let mut cx = b.x;
         for run in line {
-            let mut adv = text.draw(pm, &run.text, cx, ly, Role::UI, size, color);
+            let mut adv = text.draw(pm, &run.text, cx, ly, Role::UI, b.size, b.color);
             if run.style.bold {
-                text.draw(pm, &run.text, cx + BOLD_OFFSET, ly, Role::UI, size, color);
+                text.draw(pm, &run.text, cx + BOLD_OFFSET, ly, Role::UI, b.size, b.color);
                 adv += BOLD_OFFSET;
             }
             if run.style.underline {
-                fill_rect(pm, cx, ly + line_h - 2.0, adv, 1.0, color);
+                fill_rect(pm, cx, ly + b.line_h - 2.0, adv, 1.0, b.color);
             }
             cx += adv;
         }
@@ -233,8 +242,8 @@ pub fn draw(n: &Notification, l: &ToastLayout, st: &ToastStyle, theme: &Theme, t
     if !l.app.is_empty() {
         text.draw(&mut pm, &l.app, l.text_x, l.app_y, Role::UI, st.app_size, theme.text_dim);
     }
-    draw_lines(&mut pm, text, &l.summary, l.text_x, l.summary_y, st.summary_size, l.line_h.1, theme.text);
-    draw_lines(&mut pm, text, &l.body, l.text_x, l.body_y, st.body_size, l.line_h.2, theme.text);
+    draw_lines(&mut pm, text, &l.summary, Block { x: l.text_x, y: l.summary_y, size: st.summary_size, line_h: l.line_h.1, color: theme.text });
+    draw_lines(&mut pm, text, &l.body, Block { x: l.text_x, y: l.body_y, size: st.body_size, line_h: l.line_h.2, color: theme.text });
     if let (Some(img), Some(r)) = (&n.image, l.image) {
         draw_image(&mut pm, img, r);
     }
@@ -316,7 +325,7 @@ mod tests {
         let l = layout(&note("x", "y", &["a", "Reply", "b", "Archive", "c", "Mute"], None, false), &st, &mut text());
         assert_eq!(l.buttons.len(), 3);
         let r: Vec<_> = l.buttons.iter().map(|b| b.rect).collect();
-        assert!(r.iter().all(|r| r.w == r[0].w && r.y == r[0].y), "equal widths on one row");
+        assert!(r.iter().all(|x| x.w == r[0].w && x.y == r[0].y), "equal widths on one row");
         for pair in r.windows(2) {
             assert!(pair[0].x + pair[0].w as i32 <= pair[1].x, "overlap");
         }
