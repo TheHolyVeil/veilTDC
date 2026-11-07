@@ -1,0 +1,19 @@
+[package]
+name        = "veil-osd"
+version     = "0.1.0"
+edition     = "2021"
+description = "Supervised on-screen display (volume, brightness, messages) for Veil"
+
+[dependencies]
+veil-ui                = { path = "../veil-ui" }
+veil-text              = { path = "../veil-text" }
+veil-ipc               = { path = "../veil-ipc" }
+veil-palette           = { path = "../veil-palette" }
+tiny-skia              = { workspace = true }
+tracing                = { workspace = true }
+tracing-subscriber     = { workspace = true }
+libc                   = { workspace = true }
+serde_json             = { workspace = true }
+
+[dev-dependencies]
+tempfile               = { workspace = true }

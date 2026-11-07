@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 pub mod bar;
 pub mod notify;
+pub mod osd;
 pub use bar::{BarSettings, CustomWidget, WeatherSettings};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -38,6 +39,8 @@ pub mod topics {
     pub const VOLUME: &str = "volume";
     pub const BRIGHTNESS: &str = "brightness";
     pub const NOTIFICATIONS: &str = "notifications";
+    /// Compositor to `osd`: show a level or a message (see `osd::OsdEvent`).
+    pub const OSD: &str = "osd";
     /// Master to `notify` only: do-not-disturb and panel requests. See [`crate::notify::Control`].
     pub const NOTIFY_CONTROL: &str = "notify.control";
 }

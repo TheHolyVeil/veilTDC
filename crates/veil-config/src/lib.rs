@@ -818,6 +818,20 @@ impl Default for NotifyConfig {
     }
 }
 
+/// `osd = { ... }` — the supervised on-screen display (`veil shell osd`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OsdConfig {
+    /// Start the supervised `veil shell osd` with the session. Off, or while
+    /// it is down, the compositor draws its built-in OSD instead.
+    pub shell: bool,
+}
+
+impl Default for OsdConfig {
+    fn default() -> Self {
+        Self { shell: true }
+    }
+}
+
 /// How a wallpaper is fitted to the output (`fit` in Lua).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WallpaperFit {
@@ -996,6 +1010,13 @@ fn parse_notify(gl: &mlua::Table, default: &NotifyConfig) -> NotifyConfig {
     NotifyConfig { shell, timeout_ms, max_visible: max_visible.clamp(1, 10), dnd_critical }
 }
 
+fn parse_osd(gl: &mlua::Table, default: &OsdConfig) -> OsdConfig {
+    let Ok(ot) = gl.get::<mlua::Table>("osd") else {
+        return default.clone();
+    };
+    OsdConfig { shell: get_bool(&ot, "shell", default.shell) }
+}
+
 fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
     let Ok(bt) = gl.get::<mlua::Table>("bar") else {
         return default.clone();
@@ -1128,6 +1149,8 @@ pub struct VeilConfig {
     pub bar: BarConfig,
     /// `notify = { ... }` config — see `NotifyConfig`.
     pub notify: NotifyConfig,
+    /// `osd = { ... }` config — see `OsdConfig`.
+    pub osd: OsdConfig,
     /// Static wallpaper, if configured.
     pub wallpaper: Option<WallpaperConfig>,
 }
@@ -1153,6 +1176,7 @@ impl Default for VeilConfig {
             font: FontSettings::default(),
             bar: BarConfig::default(),
             notify: NotifyConfig::default(),
+            osd: OsdConfig::default(),
             wallpaper: None,
         }
     }
@@ -1166,7 +1190,7 @@ impl Default for VeilConfig {
 const TOP_KEYS: &[&str] = &[
     "quality", "fps", "clipboard_sync", "refresh", "cage_timeout_secs", "input",
     "gpu_render", "gpu_power", "output", "background", "theme", "theme_mode",
-    "keybinds", "apps", "font", "bar", "notify", "wallpaper",
+    "keybinds", "apps", "font", "bar", "notify", "osd", "wallpaper",
 ];
 const FONT_KEYS: &[&str] = &["family", "mono", "icons", "fallback", "size", "weight"];
 const WALLPAPER_KEYS: &[&str] = &["engine", "paths", "path", "interval", "shuffle", "fit"];
@@ -1175,6 +1199,7 @@ const BAR_KEYS: &[&str] = &[
 ];
 const WIDGET_KEYS: &[&str] = &["clock", "disk", "weather", "custom"];
 const NOTIFY_KEYS: &[&str] = &["shell", "timeout", "max_visible", "dnd_critical"];
+const OSD_KEYS: &[&str] = &["shell"];
 
 /// Keys a `keybinds` table accepts (also valid at top level when there is no
 /// `keybinds` table, because the parser falls back to the globals).
@@ -1283,6 +1308,9 @@ fn lint_config(gl: &mlua::Table, builtin: &std::collections::HashSet<String>) ->
     }
     if let Ok(t) = gl.get::<mlua::Table>("notify") {
         lint_table("notify", &t, NOTIFY_KEYS, &mut out);
+    }
+    if let Ok(t) = gl.get::<mlua::Table>("osd") {
+        lint_table("osd", &t, OSD_KEYS, &mut out);
     }
     if let Ok(bar) = gl.get::<mlua::Table>("bar") {
         lint_table("bar", &bar, BAR_KEYS, &mut out);
@@ -1437,6 +1465,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
             .unwrap_or(d.theme_mode),
         bar: parse_bar(&gl, &d.bar),
         notify: parse_notify(&gl, &d.notify),
+        osd: parse_osd(&gl, &d.osd),
         font: parse_font(&gl, &d.font),
         wallpaper: parse_wallpaper(&gl),
     })
@@ -1869,5 +1898,29 @@ mod notify_tests {
     fn wrong_types_fall_back_to_the_defaults() {
         let n = parse(r#"notify = { shell = "yes", timeout = "soon", max_visible = -2 }"#);
         assert_eq!(n, NotifyConfig::default());
+    }
+}
+
+#[cfg(test)]
+mod osd_tests {
+    use super::*;
+
+    fn parse(src: &str) -> OsdConfig {
+        let lua = mlua::Lua::new();
+        lua.load(src).exec().unwrap();
+        parse_osd(&lua.globals(), &OsdConfig::default())
+    }
+
+    #[test]
+    fn no_osd_table_runs_the_component() {
+        assert_eq!(parse(""), OsdConfig::default());
+        assert!(parse("").shell);
+    }
+
+    #[test]
+    fn shell_can_be_turned_off_and_a_missing_key_is_not_false() {
+        assert!(!parse("osd = { shell = false }").shell);
+        assert!(parse("osd = { }").shell);
+        assert!(parse(r#"osd = { shell = "no" }"#).shell);
     }
 }

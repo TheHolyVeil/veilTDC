@@ -1,6 +1,7 @@
-//! Volume / brightness keys, run off the compositor thread.
+//! Volume, brightness and media-player keys, run off the compositor thread.
 //!
-//! The helpers (`wpctl`, `amixer`, `pactl`, `brightnessctl`, `light`) are
+//! The helpers (`wpctl`, `amixer`, `pactl`, `brightnessctl`, `light`,
+//! `playerctl`) are
 //! external processes. Running them inline froze the whole compositor for as
 //! long as they took, and forever if one hung. Now a single worker thread owns
 //! them: the compositor sends a `MediaCmd`, keeps drawing, and later picks the
@@ -34,12 +35,22 @@ pub enum MediaCmd {
     VolumeQuery,
     BrightnessUp,
     BrightnessDown,
+    /// Media-player keys, sent to whichever player speaks MPRIS (Spotify,
+    /// browsers, mpv with mpris, ...) through `playerctl`.
+    PlayPause,
+    PlayerNext,
+    PlayerPrevious,
+    PlayerStop,
 }
 
 impl MediaCmd {
-    /// Steps (up/down) can be merged with identical neighbours; mute cannot.
+    /// Steps (up/down) can be merged with identical neighbours. Mute, queries
+    /// and player controls cannot: two Next presses mean two tracks.
     fn is_step(self) -> bool {
-        !matches!(self, MediaCmd::VolumeMute | MediaCmd::VolumeQuery)
+        matches!(
+            self,
+            MediaCmd::VolumeUp | MediaCmd::VolumeDown | MediaCmd::BrightnessUp | MediaCmd::BrightnessDown
+        )
     }
 }
 
@@ -141,6 +152,10 @@ fn run_cmd(cmd: MediaCmd, step: u32) -> OsdUpdate {
         MediaCmd::VolumeQuery => volume_query(),
         MediaCmd::BrightnessUp => brightness_step(true, step),
         MediaCmd::BrightnessDown => brightness_step(false, step),
+        MediaCmd::PlayPause => player("play-pause"),
+        MediaCmd::PlayerNext => player("next"),
+        MediaCmd::PlayerPrevious => player("previous"),
+        MediaCmd::PlayerStop => player("stop"),
     }
 }
 
@@ -299,6 +314,18 @@ fn read_pactl() -> Option<u8> {
     applied("pactl", &["get-sink-volume", "@DEFAULT_SINK@"]).and_then(|s| parse_pactl(&s))
 }
 
+// ----------------------------------------------------------------- player
+
+/// Send a transport command to the active MPRIS player. Silent on success (a
+/// track change is its own feedback); when nothing took it, say so, so a key
+/// that does nothing is never a mystery.
+fn player(action: &str) -> OsdUpdate {
+    if applied("playerctl", &[action]).is_some() {
+        return OsdUpdate { quiet: true, ..osd("MEDIA", "", None) };
+    }
+    osd("MEDIA", "NO PLAYER", None)
+}
+
 // ------------------------------------------------------------- brightness
 
 fn brightness_step(up: bool, step: u32) -> OsdUpdate {
@@ -420,6 +447,21 @@ mod tests {
         worker_loop(cmd_rx, osd_tx, |cmd, step| osd("T", format!("{cmd:?} {step}"), None));
         let got: Vec<String> = osd_rx.try_iter().map(|u| u.body).collect();
         assert_eq!(got, ["VolumeUp 20", "VolumeMute 5", "BrightnessDown 10"]);
+    }
+
+    #[test]
+    fn player_keys_are_never_merged() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (osd_tx, osd_rx) = mpsc::channel();
+        for _ in 0..3 {
+            cmd_tx.send(MediaCmd::PlayerNext).unwrap();
+        }
+        cmd_tx.send(MediaCmd::PlayPause).unwrap();
+        cmd_tx.send(MediaCmd::PlayPause).unwrap();
+        drop(cmd_tx);
+        worker_loop(cmd_rx, osd_tx, |cmd, step| osd("T", format!("{cmd:?} {step}"), None));
+        let got: Vec<String> = osd_rx.try_iter().map(|u| u.body).collect();
+        assert_eq!(got, ["PlayerNext 5", "PlayerNext 5", "PlayerNext 5", "PlayPause 5", "PlayPause 5"]);
     }
 
     #[test]

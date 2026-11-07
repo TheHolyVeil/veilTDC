@@ -95,6 +95,36 @@ impl FontConfig {
     }
 }
 
+/// A font chosen by path but not read yet. Parsing costs memory far out of
+/// proportion to the file (a 2.5 MB Nerd Font is about 50 MB parsed), so a role
+/// is loaded the first time a glyph needs it. A process that only ever draws
+/// UI text never pays for the mono or icon font.
+#[derive(Default)]
+struct LazyFont {
+    path: Option<PathBuf>,
+    /// `None` = not tried yet; `Some(None)` = tried and unreadable.
+    font: Option<Option<Arc<Font>>>,
+}
+
+impl LazyFont {
+    fn set(&mut self, path: Option<PathBuf>) {
+        *self = LazyFont { path, font: None };
+    }
+
+    fn get(&mut self) -> Option<Arc<Font>> {
+        if self.font.is_none() {
+            let loaded = self.path.as_deref().and_then(load_file).map(|r| r.0);
+            if loaded.is_none() {
+                if let Some(p) = &self.path {
+                    tracing::warn!("font {} could not be read", p.display());
+                }
+            }
+            self.font = Some(loaded);
+        }
+        self.font.clone().flatten()
+    }
+}
+
 /// A fallback family, loaded the first time a glyph needs it.
 struct FallbackSlot {
     name: String,
@@ -107,9 +137,9 @@ pub struct TextSystem {
     index: Option<Arc<FontIndex>>,
     /// A background scan that has not finished yet.
     pending: Option<mpsc::Receiver<FontIndex>>,
-    ui: Option<Arc<Font>>,
-    mono: Option<Arc<Font>>,
-    icons: Option<Arc<Font>>,
+    ui: LazyFont,
+    mono: LazyFont,
+    icons: LazyFont,
     resolved: [Option<PathBuf>; 3],
     fallback: Vec<FallbackSlot>,
     glyphs: HashMap<GlyphKey, Arc<CachedGlyph>>,
@@ -203,9 +233,9 @@ impl TextSystem {
             cfg,
             index: None,
             pending: None,
-            ui: None,
-            mono: None,
-            icons: None,
+            ui: LazyFont::default(),
+            mono: LazyFont::default(),
+            icons: LazyFont::default(),
             resolved: [None, None, None],
             fallback: Vec::new(),
             glyphs: HashMap::with_capacity(512),
@@ -275,9 +305,9 @@ impl TextSystem {
             .map(|n| FallbackSlot { name: n.clone(), font: None })
             .collect();
         if self.bitmap_only {
-            self.ui = None;
-            self.mono = None;
-            self.icons = None;
+            self.ui.set(None);
+            self.mono.set(None);
+            self.icons.set(None);
             self.resolved = [None, None, None];
             return;
         }
@@ -290,55 +320,55 @@ impl TextSystem {
             .or_else(|| ui.clone());
         let icons = self.resolve_role(self.cfg.icons.as_deref(), ICON_PREFS, ICON_PATHS, false);
 
-        self.resolved = [
-            ui.as_ref().map(|r| r.1.clone()),
-            mono.as_ref().map(|r| r.1.clone()),
-            icons.as_ref().map(|r| r.1.clone()),
-        ];
-        self.ui = ui.map(|r| r.0);
-        self.mono = mono.map(|r| r.0);
-        self.icons = icons.map(|r| r.0);
+        self.resolved = [ui.clone(), mono.clone(), icons.clone()];
+        self.ui.set(ui);
+        self.mono.set(mono);
+        self.icons.set(icons);
     }
 
-    fn resolve_role(
-        &self,
-        spec: Option<&str>,
-        prefs: &[&str],
-        paths: &[&str],
-        bold: bool,
-    ) -> Option<(Arc<Font>, PathBuf)> {
+    /// The mono font. When no mono font is installed it is the UI font's
+    /// file, so share that one parsed copy instead of parsing it twice.
+    fn mono_font(&mut self) -> Option<Arc<Font>> {
+        if self.mono.path.is_some() && self.mono.path == self.ui.path {
+            self.ui.get()
+        } else {
+            self.mono.get()
+        }
+    }
+
+    /// Pick the file for a role without reading it (see [`LazyFont`]).
+    fn resolve_role(&self, spec: Option<&str>, prefs: &[&str], paths: &[&str], bold: bool) -> Option<PathBuf> {
         if let Some(spec) = spec {
-            if let Some(found) = self.load_spec(spec, bold) {
+            if let Some(found) = self.spec_path(spec, bold) {
                 return Some(found);
             }
             tracing::warn!("font '{spec}' not found; using a default instead");
         }
         if let Some(idx) = &self.index {
             for family in prefs {
-                if let Some(found) = idx.find(family, bold).and_then(|e| load_file(&e.path)) {
-                    return Some(found);
+                if let Some(e) = idx.find(family, bold).filter(|e| e.path.is_file()) {
+                    return Some(e.path.clone());
                 }
             }
         }
-        paths.iter().find_map(|p| load_file(Path::new(p)))
+        paths.iter().map(Path::new).find(|p| p.is_file()).map(Path::to_path_buf)
     }
 
     /// A user-supplied font: absolute path, installed family, or (only if it
     /// really is that family) whatever `fc-match` says.
-    fn load_spec(&self, spec: &str, bold: bool) -> Option<(Arc<Font>, PathBuf)> {
+    fn spec_path(&self, spec: &str, bold: bool) -> Option<PathBuf> {
         let p = Path::new(spec);
         if p.is_absolute() {
-            return load_file(p);
+            return p.is_file().then(|| p.to_path_buf());
         }
-        if let Some(found) = self
-            .index
-            .as_ref()
-            .and_then(|i| i.find(spec, bold))
-            .and_then(|e| load_file(&e.path))
-        {
-            return Some(found);
+        if let Some(e) = self.index.as_ref().and_then(|i| i.find(spec, bold)).filter(|e| e.path.is_file()) {
+            return Some(e.path.clone());
         }
-        fc_match(spec).and_then(|p| load_file(&p))
+        fc_match(spec).filter(|p| p.is_file())
+    }
+
+    fn load_spec(&self, spec: &str, bold: bool) -> Option<(Arc<Font>, PathBuf)> {
+        self.spec_path(spec, bold).and_then(|p| load_file(&p))
     }
 
     fn fallback_font(&mut self, i: usize) -> Option<Arc<Font>> {
@@ -359,14 +389,14 @@ impl TextSystem {
     fn select_font(&mut self, ch: char, role: Role) -> Option<Arc<Font>> {
         let is_icon = matches!(ch as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD);
         if is_icon {
-            if let Some(f) = self.icons.clone().filter(|f| has_glyph(f, ch)) {
+            if let Some(f) = self.icons.get().filter(|f| has_glyph(f, ch)) {
                 return Some(f);
             }
         }
         let primary = match role {
-            Role::Icons => self.icons.clone().or_else(|| self.ui.clone()),
-            Role::Mono => self.mono.clone().or_else(|| self.ui.clone()),
-            Role::UI => self.ui.clone().or_else(|| self.mono.clone()),
+            Role::Icons => self.icons.get().or_else(|| self.ui.get()),
+            Role::Mono => self.mono_font().or_else(|| self.ui.get()),
+            Role::UI => self.ui.get().or_else(|| self.mono_font()),
         };
         if let Some(f) = primary.as_ref().filter(|f| has_glyph(f, ch)) {
             return Some(f.clone());
@@ -376,7 +406,8 @@ impl TextSystem {
                 return Some(f);
             }
         }
-        for f in [&self.icons, &self.ui, &self.mono].into_iter().flatten() {
+        let last_resort = [self.icons.get(), self.ui.get(), self.mono_font()];
+        for f in last_resort.iter().flatten() {
             if has_glyph(f, ch) {
                 return Some(f.clone());
             }
@@ -854,6 +885,26 @@ mod tests {
         assert_eq!(ts.resolved_paths()[0].as_deref(), Some(font.as_path()));
         assert_ne!(*ts.resolved_paths(), before);
         assert!(!ts.poll(), "and it is only applied once");
+    }
+
+    #[test]
+    fn only_the_roles_that_draw_are_parsed() {
+        let fonts = all_fonts();
+        if fonts.len() < 2 {
+            eprintln!("skipped: needs two installed fonts");
+            return;
+        }
+        let name = |i: usize| Some(fonts[i].display().to_string());
+        let cfg = FontConfig { family: name(0), mono: name(1), icons: name(1), ..Default::default() };
+        let mut ts = TextSystem::with_index(&cfg, None);
+        // Resolved by path, nothing parsed yet.
+        assert_eq!(ts.resolved_paths()[1].as_deref(), Some(fonts[1].as_path()));
+        assert!(ts.ui.font.is_none() && ts.mono.font.is_none() && ts.icons.font.is_none());
+        ts.measure("Volume 50%", Role::UI, 13.0);
+        assert!(ts.ui.font.is_some());
+        assert!(ts.mono.font.is_none() && ts.icons.font.is_none(), "UI text must not parse the mono or icon font");
+        ts.measure("1:23", Role::Mono, 13.0);
+        assert!(ts.mono.font.is_some() && ts.icons.font.is_none());
     }
 
     #[test]

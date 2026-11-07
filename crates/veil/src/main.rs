@@ -41,9 +41,16 @@ fn main() -> std::io::Result<()> {
                     }
                     return Ok(());
                 }
+                "osd" => {
+                    if let Err(e) = veil_osd::run_osd() {
+                        eprintln!("[veil shell osd] Error: {e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
                 other => {
                     eprintln!("Unknown shell component: {other}");
-                    eprintln!("Available components: bar, notify, power");
+                    eprintln!("Available components: bar, notify, power, osd");
                     std::process::exit(1);
                 }
             }

@@ -451,6 +451,11 @@ pub struct State {
     pub notify_dirty: bool,
     /// `veil shell notify` has been started for this session.
     pub notify_started: bool,
+    /// `osd = { ... }` — see `veil_config::OsdConfig`. (`osd` below is the
+    /// built-in fallback OSD.)
+    pub osd_cfg: veil_config::OsdConfig,
+    /// `veil shell osd` has been started for this session.
+    pub osd_started: bool,
     /// `<mod_key>+D` app launcher — `Some` while the modal is open. See
     /// `crate::launcher`. Not itself a `keybinds` config entry, same as help.
     pub launcher: Option<Launcher>,
@@ -539,9 +544,20 @@ impl State {
         progress: Option<u8>,
         duration: Duration,
     ) {
+        let (title, body) = (title.into(), body.into());
+        // A connected OSD component draws it; with none listening (starting,
+        // restarting, crashed, turned off) the built-in OSD below does, so a
+        // key press is never silent.
+        if self.ipc.has_subscriber(veil_ipc::topics::OSD) {
+            let output = format!("veil-host-{}", active_monitor_idx(self));
+            let ms = duration.as_millis().min(u128::from(u32::MAX)) as u32;
+            let ev = veil_ipc::osd::OsdEvent::new(&title, &body, progress, ms, &output);
+            self.ipc.broadcast(veil_ipc::topics::OSD, ev.to_json());
+            return;
+        }
         self.osd = Some(OsdNotification {
-            title: title.into(),
-            body: body.into(),
+            title,
+            body,
             progress,
             expires_at: Instant::now() + duration,
         });
@@ -2317,6 +2333,10 @@ pub fn reload_config(state: &mut State) {
             tracing::info!("notify.shell = false: the running notification daemon stays until the session ends");
         }
     }
+    if state.osd_started && !new_cfg.osd.shell {
+        tracing::info!("osd.shell = false: the running OSD stays until the session ends");
+    }
+    state.osd_cfg = new_cfg.osd;
     state.notify = new_cfg.notify;
     state.bar = new_cfg.bar;
     state.fps_cfg = new_cfg.fps;
@@ -4463,7 +4483,7 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                         return FilterResult::Forward;
                     }
 
-                    // Multimedia keys (volume, brightness)
+                    // Multimedia keys (volume, brightness, player)
                     let sym = keysym.modified_sym().raw();
                     match sym {
                         keysyms::KEY_XF86AudioRaiseVolume => {
@@ -4484,6 +4504,22 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                         }
                         keysyms::KEY_XF86MonBrightnessDown => {
                             st.media.send(crate::media::MediaCmd::BrightnessDown);
+                            return FilterResult::Intercept(());
+                        }
+                        keysyms::KEY_XF86AudioPlay | keysyms::KEY_XF86AudioPause => {
+                            st.media.send(crate::media::MediaCmd::PlayPause);
+                            return FilterResult::Intercept(());
+                        }
+                        keysyms::KEY_XF86AudioNext => {
+                            st.media.send(crate::media::MediaCmd::PlayerNext);
+                            return FilterResult::Intercept(());
+                        }
+                        keysyms::KEY_XF86AudioPrev => {
+                            st.media.send(crate::media::MediaCmd::PlayerPrevious);
+                            return FilterResult::Intercept(());
+                        }
+                        keysyms::KEY_XF86AudioStop => {
+                            st.media.send(crate::media::MediaCmd::PlayerStop);
                             return FilterResult::Intercept(());
                         }
                         _ => {}
@@ -5420,6 +5456,7 @@ fn ipc_command(
                     Ok(None)
                 }
                 // notify owns the D-Bus name: stopping it makes every sender fail.
+                "osd" => Err("osd is a persistent service and cannot be toggled".into()),
                 "notify" => Err("notify is a persistent service and cannot be toggled; use notify.panel or notify.dnd".into()),
                 other => Err(format!("component '{other}' is not available yet")),
             }
@@ -5513,6 +5550,15 @@ fn ipc_pump(state: &mut State) -> bool {
         state.notify_started = true;
         if let Err(e) = state.supervisor.start_component("notify", now) {
             tracing::warn!("shell: notify did not start: {e}");
+        }
+    }
+
+    // The OSD component: while it is connected the compositor sends it
+    // `osd` events; otherwise `show_osd` draws the built-in one.
+    if state.shell_ready && state.osd_cfg.shell && !state.osd_started {
+        state.osd_started = true;
+        if let Err(e) = state.supervisor.start_component("osd", now) {
+            tracing::warn!("shell: osd did not start: {e}");
         }
     }
 
@@ -5678,6 +5724,7 @@ pub fn run(
     font: veil_config::FontSettings,
     bar: veil_config::BarConfig,
     notify: veil_config::NotifyConfig,
+    osd_cfg: veil_config::OsdConfig,
     shell_opts: crate::ShellOptions,
 ) -> io::Result<()> {
     let composite_interval = composite_interval_for(fps, 60_000);
@@ -5896,6 +5943,8 @@ pub fn run(
         notify,
         notify_dirty: false,
         notify_started: false,
+        osd_cfg,
+        osd_started: false,
         // No anchor client to spawn into (`veil-host start`) → open straight
         // to the launcher instead of an empty screen with no hint of what to press.
         launcher: if spawn.is_none() {

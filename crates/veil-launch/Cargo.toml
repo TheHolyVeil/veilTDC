@@ -1,0 +1,10 @@
+[package]
+name        = "veil-launch"
+version     = "0.1.0"
+edition     = "2021"
+description = "Supervised on-demand app launcher for Veil"
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = { workspace = true }

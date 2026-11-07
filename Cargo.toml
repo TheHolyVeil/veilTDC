@@ -11,6 +11,8 @@ members = [
     "crates/veil-bar",
     "crates/veil-notify",
     "crates/veil-power",
+    "crates/veil-osd",
+    "crates/veil-launch",
     "crates/veil",
 ]
 resolver = "2"

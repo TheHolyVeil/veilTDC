@@ -243,6 +243,7 @@ pub fn run_cli() -> std::io::Result<()> {
     cfg.font = vcfg.font.clone();
     cfg.bar = vcfg.bar.clone();
     cfg.notify = vcfg.notify.clone();
+    cfg.osd = vcfg.osd.clone();
     cfg.fps = vcfg.fps; // 0 = match the display (resolved in SetMonitors)
     cfg.clipboard_sync = vcfg.clipboard_sync;
 

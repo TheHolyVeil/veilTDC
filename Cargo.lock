@@ -5219,6 +5219,7 @@ dependencies = [
  "veil-host",
  "veil-ipc",
  "veil-notify",
+ "veil-osd",
  "veil-power",
  "veil-ui",
 ]
@@ -5297,6 +5298,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "veil-launch"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "veil-login"
 version = "0.1.0"
 dependencies = [
@@ -5328,6 +5336,22 @@ dependencies = [
  "veil-palette",
  "veil-ui",
  "zbus 6.2.1",
+]
+
+[[package]]
+name = "veil-osd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tiny-skia 0.11.4",
+ "tracing",
+ "tracing-subscriber",
+ "veil-ipc",
+ "veil-palette",
+ "veil-text",
+ "veil-ui",
 ]
 
 [[package]]
