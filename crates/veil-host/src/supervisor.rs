@@ -293,6 +293,37 @@ impl Supervisor {
         }
     }
 
+    /// Stop a running component (e.g. on-demand dismissal).
+    pub fn stop_component(&mut self, name: &str) -> Result<(), String> {
+        let record = self
+            .components
+            .get_mut(name)
+            .ok_or_else(|| format!("Unknown component: {name}"))?;
+        if let Some(mut child) = record.child.take() {
+            kill_group(&mut child);
+        }
+        record.pid = None;
+        if record.state != SupervisorState::Disabled {
+            record.state = SupervisorState::Stopped;
+        }
+        Ok(())
+    }
+
+    /// Toggle an on-demand component: stop if running, start if stopped.
+    /// Returns `Ok(true)` if started, `Ok(false)` if stopped.
+    pub fn toggle_component(&mut self, name: &str, now: Instant) -> Result<bool, String> {
+        let is_running = self.components.get(name).is_some_and(|r| {
+            matches!(r.state, SupervisorState::Running { .. } | SupervisorState::Starting { .. })
+        });
+        if is_running {
+            self.stop_component(name)?;
+            Ok(false)
+        } else {
+            self.start_component(name, now)?;
+            Ok(true)
+        }
+    }
+
     /// `veil ctl restart <n>`: kill whatever is running, forget past crashes
     /// (this is also the way out of `Failed`), and start it again.
     pub fn restart_component(&mut self, name: &str, now: Instant) -> Result<(), String> {
@@ -586,5 +617,28 @@ mod tests {
         }
         assert_eq!(sup.take_failed(), vec!["bar".to_string()]);
         assert!(sup.take_failed().is_empty());
+    }
+
+    #[test]
+    fn test_toggle_component() {
+        let (exe, _) = fake_exe("toggle");
+        let mut sup = Supervisor::new();
+        sup.set_exe(exe);
+        let t0 = Instant::now();
+        assert_eq!(sup.get("power").unwrap().state, SupervisorState::Stopped);
+
+        // Toggle on
+        let started = sup.toggle_component("power", t0).unwrap();
+        assert!(started);
+        assert!(matches!(sup.get("power").unwrap().state, SupervisorState::Starting { .. }));
+        let pid = sup.get("power").unwrap().pid.unwrap() as i32;
+        assert!(alive(pid));
+
+        // Toggle off
+        let started2 = sup.toggle_component("power", t0).unwrap();
+        assert!(!started2);
+        assert_eq!(sup.get("power").unwrap().state, SupervisorState::Stopped);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!alive(pid));
     }
 }

@@ -792,8 +792,7 @@ mod tests {
 
     #[test]
     fn zoom_fills_focused_and_parks_the_rest() {
-        let mut l = Layout::default();
-        l.focused = 1;
+        let mut l = Layout { focused: 1, ..Default::default() };
         l.toggle_zoom();
         let r = l.rects(3, 100, 80);
         assert_eq!(r[1], Rect { x: 0, y: 0, w: 100, h: 80 });

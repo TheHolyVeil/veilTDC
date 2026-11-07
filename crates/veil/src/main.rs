@@ -34,9 +34,16 @@ fn main() -> std::io::Result<()> {
                     }
                     return Ok(());
                 }
+                "power" => {
+                    if let Err(e) = veil_power::run_power() {
+                        eprintln!("[veil shell power] Error: {e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
                 other => {
                     eprintln!("Unknown shell component: {other}");
-                    eprintln!("Available components: bar, notify");
+                    eprintln!("Available components: bar, notify, power");
                     std::process::exit(1);
                 }
             }

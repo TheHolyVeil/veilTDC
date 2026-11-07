@@ -81,7 +81,8 @@ use smithay::{
         selection::{SelectionHandler, SelectionSource, SelectionTarget},
         shell::xdg::{
             decoration::{XdgDecorationHandler, XdgDecorationState},
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+            PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
+            XdgShellState,
         },
         shm::{with_buffer_contents, ShmHandler, ShmState},
         socket::ListeningSocketSource,
@@ -199,6 +200,21 @@ impl Window {
                         s.states.set(xdg_toplevel::State::Fullscreen);
                     } else {
                         s.states.unset(xdg_toplevel::State::Fullscreen);
+                    }
+                    // We tile: tell the client, so toolkits that draw their
+                    // own shadows / rounded frames (Chromium, GTK) drop them
+                    // instead of painting them outside the box we gave it.
+                    for st in [
+                        xdg_toplevel::State::TiledLeft,
+                        xdg_toplevel::State::TiledRight,
+                        xdg_toplevel::State::TiledTop,
+                        xdg_toplevel::State::TiledBottom,
+                    ] {
+                        if fullscreen {
+                            s.states.unset(st);
+                        } else {
+                            s.states.set(st);
+                        }
                     }
                 });
                 t.send_configure();
@@ -368,6 +384,8 @@ pub struct State {
     pub(crate) output_mgmt: crate::output_management::OutputManagement,
     /// ext-idle-notify listeners + idle-inhibit tracking.
     pub(crate) idle_notify: crate::idle_notify::IdleNotify,
+    /// ext-background-effect-v1 tracking.
+    pub background_effect: crate::background_effect::BackgroundEffectState,
     /// One entry per physical display, side by side left-to-right in
     /// detection order (see `InputCmd::SetMonitors`). `monitors[0]` is what
     /// the old flat `output_w`/`output_h`/`pointer_pos`/`fullscreen`/
@@ -631,6 +649,7 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        self.background_effect.commit(surface);
         // Layer-shell surfaces (the bar etc.): arrange, initial configure,
         // exclusive-zone retile. Their buffers still go through the normal
         // cache below like any other surface.
@@ -3243,7 +3262,8 @@ fn composite_one_monitor(
             };
             draw_border(back, w, h, r, BORDER, color);
         }
-        blit_subtree(back, w, h, &state.surface_buffers, surf, (r.x, r.y));
+        let (gx, gy) = geometry_origin(surf);
+        blit_subtree(back, w, h, &state.surface_buffers, surf, (r.x - gx, r.y - gy));
         for (popup, off) in PopupManager::popups_for_surface(surf) {
             let ps = popup.wl_surface().clone();
             blit_subtree(
@@ -4184,6 +4204,21 @@ fn send_frame_callbacks(surface: &WlSurface, time: u32) {
     );
 }
 
+/// Top-left of an xdg toplevel's *window geometry* inside its buffer. Clients
+/// that draw client-side shadow/frame (Chromium) put the real window at a
+/// nonzero offset; the buffer must be drawn at `rect - this` so the geometry
+/// lands exactly on the tiled rect. (0, 0) when unset or not an xdg surface.
+fn geometry_origin(surf: &WlSurface) -> (i32, i32) {
+    with_states(surf, |s| {
+        s.cached_state
+            .get::<SurfaceCachedState>()
+            .current()
+            .geometry
+            .map(|g| (g.loc.x, g.loc.y))
+    })
+    .unwrap_or((0, 0))
+}
+
 /// Which live toplevel's tiled rect contains `(x, y)`, if any. Returns a
 /// live-order index — matches `layout_rects`/`layout.focused`, NOT a raw
 /// `toplevels` Vec index (see the `live_idx` mapping in `dispatch_action`
@@ -4294,10 +4329,13 @@ fn pick_focus(
             }
         }
 
-        // Toplevel root sits at its rect origin.
+        // Toplevel root: the buffer sits at rect origin minus its window
+        // geometry offset (see geometry_origin()).
         if let Some(buf) = state.surface_buffers.get(&root.id()) {
-            if xi >= r.x && yi >= r.y && xi < r.x + buf.w as i32 && yi < r.y + buf.h as i32 {
-                return Some((root.clone(), (r.x as f64, r.y as f64).into()));
+            let (gx, gy) = geometry_origin(root);
+            let (ox, oy) = (r.x - gx, r.y - gy);
+            if xi >= ox && yi >= oy && xi < ox + buf.w as i32 && yi < oy + buf.h as i32 {
+                return Some((root.clone(), (ox as f64, oy as f64).into()));
             }
         }
     }
@@ -4514,8 +4552,10 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                             return FilterResult::Intercept(());
                         }
                         if ch == 'p' {
-                            st.power_menu = Some(PowerMenu::new());
-                            mark_dirty_full(st);
+                            if st.supervisor.toggle_component("power", Instant::now()).is_err() {
+                                st.power_menu = Some(PowerMenu::new());
+                                mark_dirty_full(st);
+                            }
                             return FilterResult::Intercept(());
                         }
                         if let Some(action) = st.keybinds.action_for(ch) {
@@ -5373,8 +5413,10 @@ fn ipc_command(
                     Ok(None)
                 }
                 "power" => {
-                    state.power_menu = if state.power_menu.is_some() { None } else { Some(PowerMenu::new()) };
-                    mark_dirty_full(state);
+                    if state.supervisor.toggle_component("power", Instant::now()).is_err() {
+                        state.power_menu = if state.power_menu.is_some() { None } else { Some(PowerMenu::new()) };
+                        mark_dirty_full(state);
+                    }
                     Ok(None)
                 }
                 // notify owns the D-Bus name: stopping it makes every sender fail.
@@ -5387,6 +5429,26 @@ fn ipc_command(
         c::COMPONENT_RESTART => {
             let name = str_arg("name").filter(|n| !n.is_empty()).ok_or("restart needs a component name")?;
             state.supervisor.restart_component(name, Instant::now())?;
+            Ok(None)
+        }
+        c::SESSION_LOCK => {
+            spawn_command(&state.socket_name, "veil-lock");
+            Ok(None)
+        }
+        c::SESSION_LOGOUT => {
+            state.stop.store(true, Ordering::Relaxed);
+            Ok(None)
+        }
+        c::SESSION_SUSPEND => {
+            spawn_command(&state.socket_name, "systemctl suspend");
+            Ok(None)
+        }
+        c::SESSION_REBOOT => {
+            spawn_command(&state.socket_name, "systemctl reboot");
+            Ok(None)
+        }
+        c::SESSION_POWEROFF => {
+            spawn_command(&state.socket_name, "systemctl poweroff");
             Ok(None)
         }
         c::WALLPAPER_SET => {
@@ -5794,6 +5856,10 @@ pub fn run(
         layer_outputs: vec![output.clone()],
         output_mgmt: Default::default(),
         idle_notify: crate::idle_notify::IdleNotify::new(&dh),
+        background_effect: {
+            crate::background_effect::BackgroundEffectState::register_global(&dh);
+            crate::background_effect::BackgroundEffectState::new()
+        },
         layer_shell: LayerShellManager::new::<State>(&dh),
         ipc: IpcServer::new(),
         supervisor: Supervisor::new(),

@@ -113,6 +113,25 @@ pub fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color) 
     }
 }
 
+/// Stroke a circle outline.
+pub fn stroke_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color, width: f32) {
+    if r <= 0.0 || width <= 0.0 {
+        return;
+    }
+    let mut pb = PathBuilder::new();
+    pb.push_circle(cx, cy, r);
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint::default();
+        paint.set_color(color);
+        paint.anti_alias = true;
+        let stroke = Stroke {
+            width,
+            ..Default::default()
+        };
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+}
+
 /// Construct a rounded rectangle Path.
 pub fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
     let mut pb = PathBuilder::new();

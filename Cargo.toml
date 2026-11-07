@@ -10,6 +10,7 @@ members = [
     "crates/veil-ui",
     "crates/veil-bar",
     "crates/veil-notify",
+    "crates/veil-power",
     "crates/veil",
 ]
 resolver = "2"
@@ -32,7 +33,7 @@ tracing               = "0.1"
 tracing-subscriber    = { version = "0.3", features = ["env-filter"] }
 drm                   = "0.15"
 libseat               = "0.2"
-wayland-protocols     = { version = "0.32", features = ["server"] }
+wayland-protocols     = { version = "0.32", features = ["server", "staging"] }
 wayland-server        = "0.31"
 wl-clipboard-rs       = "0.9"
 mimalloc              = "0.1.52"
@@ -55,6 +56,7 @@ smithay-client-toolkit = "0.20"
 wayland-client        = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 crossbeam-channel     = "0.5"
+rustix                = "1"
 
 [profile.release]
 # opt-level "z" optimizes for SIZE and turns off most loop vectorization and
