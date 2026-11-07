@@ -12,6 +12,9 @@
 //!   4 → 2×2 grid
 //! A 5th+ window stacks on the last cell (we cap at 4 visually).
 
+/// How far left parked (zoomed-away) windows sit; bigger than any panel.
+const PARK_OFFSET: i32 = 100_000;
+
 /// A window rectangle in compositor pixel space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -22,6 +25,27 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// Shrink by `d` px on every side (never below 1x1).
+    pub fn inset(&self, d: i32) -> Rect {
+        let dd = d.max(0) as u32;
+        Rect {
+            x: self.x + d,
+            y: self.y + d,
+            w: self.w.saturating_sub(2 * dd).max(1),
+            h: self.h.saturating_sub(2 * dd).max(1),
+        }
+    }
+
+    /// Grow by `d` px on every side.
+    pub fn inflate(&self, d: u32) -> Rect {
+        Rect {
+            x: self.x - d as i32,
+            y: self.y - d as i32,
+            w: self.w + 2 * d,
+            h: self.h + 2 * d,
+        }
+    }
+
     fn center(&self) -> (i32, i32) {
         (self.x + self.w as i32 / 2, self.y + self.h as i32 / 2)
     }
@@ -164,9 +188,10 @@ impl Layout {
                 if i == f {
                     *r = Rect { x: 0, y: 0, w, h };
                 } else {
-                    // Parked: right edge at x=0, so `contains`/blit see
-                    // nothing, and the size is untouched (no client resize).
-                    r.x = -(r.w as i32);
+                    // Parked far off-screen (past any layer-shell zone
+                    // offset the caller adds), size untouched so the client
+                    // isn't resized.
+                    r.x = -(r.w as i32) - PARK_OFFSET;
                 }
             }
         }
@@ -715,6 +740,14 @@ mod tests {
         assert_eq!(l.mode, LayoutMode::Dwindle);
     }
 
+    #[test]
+    fn inset_and_inflate_round_trip_and_clamp() {
+        let r = Rect { x: 10, y: 20, w: 100, h: 50 };
+        assert_eq!(r.inset(4), Rect { x: 14, y: 24, w: 92, h: 42 });
+        assert_eq!(r.inset(4).inflate(4), r);
+        assert_eq!(Rect { x: 0, y: 0, w: 3, h: 3 }.inset(4).w, 1);
+    }
+
     fn scroll() -> Layout {
         Layout {
             mode: LayoutMode::Scroll,
@@ -765,7 +798,7 @@ mod tests {
         let r = l.rects(3, 100, 80);
         assert_eq!(r[1], Rect { x: 0, y: 0, w: 100, h: 80 });
         for i in [0, 2] {
-            assert!(!r[i].contains(0, 0) && r[i].x + r[i].w as i32 <= 0);
+            assert!(!r[i].contains(0, 0) && r[i].x + (r[i].w as i32) < -1000);
         }
         l.focus(&r, Dir::Right);
         assert_eq!(l.focused, 2);

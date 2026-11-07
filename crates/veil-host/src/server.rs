@@ -2871,6 +2871,10 @@ fn handle_wallpaper_chooser_key(
 /// three-column layout it implies (16/8/rest chars) is sized against this
 /// exact value.
 const BAR_HEIGHT: u32 = 12;
+/// Space between tiled windows, and between windows and the screen/bar edge.
+const GAP: u32 = 12;
+/// Border drawn in the gap around each window (needs 2*BORDER <= GAP).
+const BORDER: u32 = 6;
 
 /// Recompute the dwindle tiling and push each toplevel its new size. Call
 /// whenever the live window set or the output size changes. Also marks the
@@ -2945,11 +2949,20 @@ fn relayout_monitor(state: &mut State, idx: usize) {
     // rects depend on it for viewport position — both are what caused
     // windows to visibly jump/shrink/shift left on fullscreen toggle).
     // The fullscreen window's rect is simply overridden afterward.
-    state.monitors[idx].layout.sync_view(n, zone_w);
-    let mut rects = state.monitors[idx].layout.rects(n, zone_w, tile_h);
+    // Gaps: pull the work area in by half a gap, tile inside it, then pull
+    // every window in by another half — so windows sit GAP apart and GAP
+    // away from the edges (a browser no longer touches kitty).
+    let half = (GAP / 2) as i32;
+    let (lw, lh) = (
+        zone_w.saturating_sub(GAP).max(1),
+        tile_h.saturating_sub(GAP).max(1),
+    );
+    state.monitors[idx].layout.sync_view(n, lw);
+    let mut rects = state.monitors[idx].layout.rects(n, lw, lh);
     for r in rects.iter_mut() {
-        r.x += zone_x;
-        r.y += tile_y;
+        r.x += zone_x + half;
+        r.y += tile_y + half;
+        *r = r.inset(half);
     }
     if let Some(fs_i) = fs_idx {
         rects[fs_i] = Rect {
@@ -2989,10 +3002,29 @@ fn relayout_monitor(state: &mut State, idx: usize) {
                 h: state.monitors[idx].output_h,
             },
         };
-        mark_dirty_rect(state, idx, dirty_rect);
+        // The border lives just outside the window rect.
+        mark_dirty_rect(state, idx, dirty_rect.inflate(BORDER));
     } else {
         mark_dirty_full(state);
     }
+}
+
+/// Border strips just OUTSIDE `r` (never over window content, so translucent
+/// windows don't tint).
+fn draw_border(back: &mut [u8], w: u32, h: u32, r: Rect, t: u32, c: [u8; 4]) {
+    use crate::font5x7::fill_rect;
+    let ti = t as i32;
+    if r.x + r.w as i32 + ti <= 0
+        || r.y + r.h as i32 + ti <= 0
+        || r.x - ti >= w as i32
+        || r.y - ti >= h as i32
+    {
+        return; // entirely off-screen (parked/scrolled-away window)
+    }
+    fill_rect(back, w, h, r.x - ti, r.y - ti, r.w + 2 * t, t, c);
+    fill_rect(back, w, h, r.x - ti, r.y + r.h as i32, r.w + 2 * t, t, c);
+    fill_rect(back, w, h, r.x - ti, r.y, t, r.h, c);
+    fill_rect(back, w, h, r.x + r.w as i32, r.y, t, r.h, c);
 }
 
 /// Point the keyboard at whichever live toplevel is currently focused (or
@@ -3203,6 +3235,14 @@ fn composite_one_monitor(
             .get(i)
             .copied()
             .unwrap_or(Rect { x: 0, y: 0, w, h });
+        if m.fullscreen.is_none() {
+            let color = if i == m.layout.focused {
+                state.theme.accent
+            } else {
+                state.theme.text_dim
+            };
+            draw_border(back, w, h, r, BORDER, color);
+        }
         blit_subtree(back, w, h, &state.surface_buffers, surf, (r.x, r.y));
         for (popup, off) in PopupManager::popups_for_surface(surf) {
             let ps = popup.wl_surface().clone();
@@ -6403,6 +6443,21 @@ mod import_tests {
         let mut back = vec![200u8, 200, 200, 255];
         blit(&mut back, 1, 1, &buf([250, 250, 250, 128]), 0, 0);
         assert_eq!(back, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn border_hugs_the_outside_and_clips() {
+        let (w, h) = (10u32, 10u32);
+        let mut back = vec![0u8; (w * h * 4) as usize];
+        let r = Rect { x: 3, y: 3, w: 4, h: 4 };
+        draw_border(&mut back, w, h, r, 2, [9, 9, 9, 255]);
+        let px = |x: u32, y: u32| back[((y * w + x) * 4) as usize];
+        assert_eq!(px(1, 1), 9, "outer corner");
+        assert_eq!(px(8, 5), 9, "right strip");
+        assert_eq!(px(4, 4), 0, "window interior untouched");
+        assert_eq!(px(0, 0), 0);
+        // Partly off-screen must not panic.
+        draw_border(&mut back, w, h, Rect { x: -5, y: 8, w: 30, h: 30 }, 2, [1, 1, 1, 255]);
     }
 
     #[test]
