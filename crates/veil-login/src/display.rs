@@ -16,7 +16,7 @@ use drm::control::{connector, Device as ControlDevice, Mode, ModeTypeFlags};
 use drm::Device as DrmDevice;
 use std::os::fd::{AsFd, BorrowedFd};
 
-struct Card(std::fs::File);
+pub(crate) struct Card(pub(crate) std::fs::File);
 
 impl AsFd for Card {
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -49,6 +49,18 @@ pub struct Pick {
     pub mode: ModeInfo,
 }
 
+pub(crate) fn mode_infos(modes: &[Mode]) -> Vec<ModeInfo> {
+    modes
+        .iter()
+        .map(|m| ModeInfo {
+            w: m.size().0 as u32,
+            h: m.size().1 as u32,
+            mhz: mode_mhz(m),
+            preferred: m.mode_type().contains(ModeTypeFlags::PREFERRED),
+        })
+        .collect()
+}
+
 fn mode_mhz(m: &Mode) -> u32 {
     let (_, _, htotal) = m.hsync();
     let (_, _, vtotal) = m.vsync();
@@ -60,7 +72,7 @@ fn mode_mhz(m: &Mode) -> u32 {
 }
 
 /// Best mode of one output: the preferred resolution, at its top refresh.
-fn best_mode(modes: &[ModeInfo]) -> Option<(usize, &ModeInfo)> {
+pub(crate) fn best_mode(modes: &[ModeInfo]) -> Option<(usize, &ModeInfo)> {
     let base = modes
         .iter()
         .filter(|m| m.w * m.h > 0)
@@ -110,26 +122,37 @@ fn probe() -> Vec<Output> {
         let card = Card(file);
         let Ok(res) = card.resource_handles() else { continue };
         for h in res.connectors() {
-            let Ok(con) = card.get_connector(*h, false) else { continue };
+            // force_probe: don't trust the kernel's cached list. At boot a
+            // DP monitor can still be mid-EDID-read and report a stub list
+            // (9 modes, 720p preferred) instead of its real 27.
+            let Ok(con) = card.get_connector(*h, true) else { continue };
             if con.state() != connector::State::Connected {
                 continue;
             }
             outputs.push(Output {
                 name: format!("{}-{}", con.interface().as_str(), con.interface_id()),
-                modes: con
-                    .modes()
-                    .iter()
-                    .map(|m| ModeInfo {
-                        w: m.size().0 as u32,
-                        h: m.size().1 as u32,
-                        mhz: mode_mhz(m),
-                        preferred: m.mode_type().contains(ModeTypeFlags::PREFERRED),
-                    })
-                    .collect(),
+                modes: mode_infos(con.modes()),
             });
         }
     }
     outputs
+}
+
+/// Probe until the connector/mode counts stop changing (monitors that are
+/// still waking up report partial mode lists), up to ~2 s.
+fn probe_settled() -> Vec<Output> {
+    let sig = |o: &[Output]| o.iter().map(|x| (x.name.clone(), x.modes.len())).collect::<Vec<_>>();
+    let mut prev = probe();
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let cur = probe();
+        let stable = sig(&cur) == sig(&prev);
+        prev = cur;
+        if stable {
+            break;
+        }
+    }
+    prev
 }
 
 /// Probe, choose, and export `SLINT_DRM_OUTPUT` / `SLINT_DRM_MODE`. Call
@@ -140,7 +163,7 @@ pub fn configure_slint_output() {
     if std::env::var_os("SLINT_DRM_OUTPUT").is_some() {
         return;
     }
-    let outputs = probe();
+    let outputs = probe_settled();
     for o in &outputs {
         eprintln!("[velogin] display: {} ({} modes)", o.name, o.modes.len());
     }
@@ -164,6 +187,17 @@ pub fn configure_slint_output() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hardware check: `cargo test -p veil-login live_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_probe() {
+        let outs = probe();
+        for o in &outs {
+            eprintln!("{}: {:?}", o.name, o.modes.iter().map(|m| (m.w, m.h, m.mhz / 1000, m.preferred)).collect::<Vec<_>>());
+        }
+        eprintln!("pick: {:?}", choose(&outs));
+    }
 
     fn m(w: u32, h: u32, hz: u32, preferred: bool) -> ModeInfo {
         ModeInfo { w, h, mhz: hz * 1000, preferred }

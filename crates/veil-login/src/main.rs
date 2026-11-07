@@ -10,6 +10,7 @@
 //! master) is dropped, and the real PAM session + exec happens in spawn.rs.
 
 mod display;
+mod mirror;
 mod session;
 mod spawn;
 mod state;
@@ -554,9 +555,21 @@ fn main() {
     }
 
     // ── run greeter ─────────────────────────────────────────────────────────
+    // Mirror onto the other connected monitors (bare TTY only; best-effort).
+    let mirror = if bare_tty {
+        mirror::start(&ui)
+    } else {
+        None
+    };
     if let Err(e) = ui.run() {
         eprintln!("[velogin] event loop error: {e}");
         std::process::exit(1);
+    }
+
+    // Blank the extra monitors and drop our dup of the DRM master first, so
+    // the session that's about to start can take master cleanly.
+    if let Some(m) = mirror {
+        m.shutdown();
     }
 
     // Release the window/backend (DRM master) and logind greeter session before spawning.
