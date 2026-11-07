@@ -228,6 +228,14 @@ impl Layout {
         (((w as f32) * ratio).round().max(1.0)) as i32
     }
 
+    /// A window opened (`n` windows now): it takes focus. Fake fullscreen is
+    /// the user's decision, so it stays on: the new window takes over the
+    /// zoom (the others stay parked at their normal size) instead of the
+    /// zoomed window being tiled in half to make room.
+    pub fn window_opened(&mut self, n: usize) {
+        self.focused = n.saturating_sub(1);
+    }
+
     /// Fake-fullscreen the focused window, or put it back.
     pub fn toggle_zoom(&mut self) {
         self.zoomed = !self.zoomed;
@@ -803,6 +811,39 @@ mod tests {
         assert_eq!(l.focused, 2);
         l.toggle_zoom();
         assert_ne!(l.rects(3, 100, 80)[1].w, 100);
+    }
+
+    #[test]
+    fn a_new_window_does_not_unzoom_and_halve_the_old_one() {
+        for mode in [LayoutMode::Dwindle, LayoutMode::Scroll] {
+            let mut l = Layout { focused: 0, mode, ..Default::default() };
+            l.toggle_zoom();
+            // a second window opens on a zoomed first one
+            l.window_opened(2);
+            assert!(l.zoomed, "{mode:?}: fake fullscreen is the user's choice");
+            assert_eq!(l.focused, 1, "{mode:?}: the new window takes focus");
+            let r = l.rects(2, 100, 80);
+            let full = Rect { x: 0, y: 0, w: 100, h: 80 };
+            assert_eq!(r[1], full, "{mode:?}: the new window fills the area");
+            // the old one is parked off-screen at its normal size, never halved
+            assert!(r[0].x + (r[0].w as i32) < -1000, "{mode:?}");
+            assert_ne!(r[0].w, 100, "{mode:?}: parked at its tiled size");
+            // closing the new one by moving focus back restores the old one full-size
+            l.focused = 0;
+            assert_eq!(l.rects(1, 100, 80)[0], full, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_window_on_an_unzoomed_layout_just_takes_focus() {
+        let mut l = Layout::default();
+        l.window_opened(1);
+        assert!(!l.zoomed);
+        assert_eq!(l.focused, 0);
+        l.window_opened(3);
+        assert_eq!((l.focused, l.zoomed), (2, false));
+        l.window_opened(0);
+        assert_eq!(l.focused, 0, "no underflow");
     }
 
     #[test]

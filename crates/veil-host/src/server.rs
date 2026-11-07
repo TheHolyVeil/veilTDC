@@ -904,8 +904,9 @@ impl XdgShellHandler for State {
             .iter()
             .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
             .count();
-        self.monitors[idx].layout.focused = n.saturating_sub(1);
-        self.monitors[idx].layout.zoomed = false;
+        // Focus the new window. Fake fullscreen stays on, so it takes over the
+        // zoom instead of the zoomed window being tiled in half.
+        self.monitors[idx].layout.window_opened(n);
         relayout(self);
     }
 
@@ -5150,8 +5151,7 @@ impl XwmHandler for State {
             .iter()
             .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
             .count();
-        self.monitors[idx].layout.focused = n.saturating_sub(1);
-        self.monitors[idx].layout.zoomed = false;
+        self.monitors[idx].layout.window_opened(n);
         // Only if already paired with a wl_surface (usually is, by this
         // point) — if not yet, it'll pick up focus on the next natural
         // refocus_keyboard call (prune tick, next window open/close, etc).
