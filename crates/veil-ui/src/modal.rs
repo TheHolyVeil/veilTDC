@@ -345,7 +345,13 @@ impl State {
         let pixels = self.app.render(self.w, self.h);
         let (buffer, canvas) = pool.create_buffer(self.w as i32, self.h as i32, (self.w * 4) as i32, wl_shm::Format::Argb8888)?;
         let n = canvas.len().min(pixels.len());
-        canvas[..n].copy_from_slice(&pixels[..n]);
+        // tiny-skia gives premultiplied R,G,B,A; wl_shm Argb8888 is B,G,R,A in
+        // memory (little-endian). A straight copy swaps red and blue on screen.
+        let (dst_px, _) = canvas[..n].as_chunks_mut::<4>();
+        let (src_px, _) = pixels[..n].as_chunks::<4>();
+        for (dst, src) in dst_px.iter_mut().zip(src_px) {
+            *dst = [src[2], src[1], src[0], src[3]];
+        }
         canvas[n..].fill(0);
         let wl = ls.wl_surface();
         buffer.attach_to(wl).ok();

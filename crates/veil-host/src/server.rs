@@ -532,6 +532,9 @@ pub struct State {
     pub wallpaper: crate::wallpaper::WallpaperEngine,
     /// On-Screen Display (OSD) popup notification overlay.
     pub osd: Option<OsdNotification>,
+    /// Last seen (caps lock, num lock). `None` until the first key, which
+    /// seeds it without announcing anything.
+    pub lock_state: Option<(bool, bool)>,
 }
 
 /// Per-surface RGBA cache entry. We re-blit these every dirty tick.
@@ -4616,6 +4619,20 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                     FilterResult::Forward
                 },
             );
+            // Caps/Num Lock: announce a change in either, never the first
+            // sighting (which only seeds the state).
+            let m = kb.modifier_state();
+            let locks = (m.caps_lock, m.num_lock);
+            let prev = state.lock_state.replace(locks);
+            if let Some(prev) = prev.filter(|p| *p != locks) {
+                let onoff = |on| if on { "On" } else { "Off" };
+                if prev.0 != locks.0 {
+                    state.show_osd("Caps Lock", onoff(locks.0), None, Duration::from_millis(1500));
+                }
+                if prev.1 != locks.1 {
+                    state.show_osd("Num Lock", onoff(locks.1), None, Duration::from_millis(1500));
+                }
+            }
             if pressed {
                 if swallowed.is_some() {
                     state.suppressed_keys.insert(keycode);
@@ -6009,6 +6026,7 @@ pub fn run(
         clipboard_sync,
         wallpaper: crate::wallpaper::WallpaperEngine::new(),
         osd: None,
+        lock_state: None,
     };
 
     let mut data = LoopData { state, display };

@@ -14,7 +14,8 @@
 //!   can never change the level twice.
 //! - Volume is capped at 100% on every backend.
 //! - Key auto-repeat is coalesced: N queued presses in the same direction
-//!   become a single `5*N%` change.
+//!   become a single `5*N%` change (brightness), or N OSD updates and one
+//!   mixer write (volume, see `Runner`).
 //! - Every helper has a 2 s timeout and is killed if it overruns.
 
 use std::io::Read;
@@ -85,7 +86,11 @@ impl MediaWorker {
         let (osd_tx, osd_rx) = mpsc::channel::<OsdUpdate>();
         let spawned = std::thread::Builder::new()
             .name("veil-media".into())
-            .spawn(move || worker_loop(cmd_rx, osd_tx, run_cmd));
+            .spawn(move || {
+                let mut runner = Runner::new();
+                runner.refresh();
+                worker_loop(cmd_rx, osd_tx, |cmd, step, emit| runner.run(cmd, step, emit));
+            });
         match spawned {
             Ok(_) => Self {
                 tx: Some(cmd_tx),
@@ -114,7 +119,7 @@ impl MediaWorker {
 fn worker_loop(
     rx: mpsc::Receiver<MediaCmd>,
     tx: mpsc::Sender<OsdUpdate>,
-    runner: impl Fn(MediaCmd, u32) -> OsdUpdate,
+    mut runner: impl FnMut(MediaCmd, u32, &mut dyn FnMut(OsdUpdate)),
 ) {
     let mut pending: Option<MediaCmd> = None;
     loop {
@@ -138,8 +143,87 @@ fn worker_loop(
                 }
             }
         }
-        if tx.send(runner(first, STEP * n)).is_err() {
+        // The runner may emit several updates (one per coalesced press).
+        let mut alive = true;
+        runner(first, STEP * n, &mut |u| alive &= tx.send(u).is_ok());
+        if !alive {
             break;
+        }
+    }
+}
+
+const VOL_TITLE: &str = "VOLUME";
+/// A remembered volume is trusted this long after it was read or changed.
+const VOL_FRESH: Duration = Duration::from_secs(3);
+
+/// Owns what the worker remembers between commands. Volume keys answer from
+/// that memory: the OSD gets one update per press at once, and the mixer is
+/// set in the background to the latest value. (Before, every press ran
+/// `wpctl set-volume` then `wpctl get-volume` back to back before anything
+/// showed, and queued presses were merged into one jump.)
+struct Runner {
+    /// Last known sink (volume, muted), and when it was read or changed.
+    vol: Option<(u8, bool)>,
+    touched: Instant,
+    /// Targets for the setter thread, which applies only the newest.
+    apply: mpsc::Sender<u8>,
+}
+
+impl Runner {
+    fn new() -> Self {
+        let (apply, rx) = mpsc::channel::<u8>();
+        let _ = std::thread::Builder::new().name("veil-volume-set".into()).spawn(move || {
+            while let Ok(mut target) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    target = newer;
+                }
+                let _ = applied("wpctl", &["set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", &format!("{target}%")]);
+            }
+        });
+        Runner { vol: None, touched: Instant::now(), apply }
+    }
+
+    /// Read the sink now (`None` when `wpctl` is not usable).
+    fn refresh(&mut self) {
+        self.vol = read_wpctl();
+        self.touched = Instant::now();
+    }
+
+    fn run(&mut self, cmd: MediaCmd, step: u32, emit: &mut dyn FnMut(OsdUpdate)) {
+        let up = match cmd {
+            MediaCmd::VolumeUp => true,
+            MediaCmd::VolumeDown => false,
+            _ => {
+                let u = run_cmd(cmd, step);
+                // A background read can lag a key press the setter has not
+                // applied yet; do not let it overwrite the newer answer.
+                let stale_read = cmd == MediaCmd::VolumeQuery && self.touched.elapsed() < Duration::from_secs(1);
+                if u.volume.is_some() && !stale_read {
+                    self.vol = u.volume;
+                    self.touched = Instant::now();
+                }
+                return emit(u);
+            }
+        };
+        if self.vol.is_none() || self.touched.elapsed() > VOL_FRESH {
+            self.refresh();
+        }
+        // No PipeWire: the old path tries wpctl, then ALSA, then Pulse.
+        let Some((mut pct, muted)) = self.vol else {
+            let u = run_cmd(cmd, step);
+            self.vol = u.volume;
+            return emit(u);
+        };
+        for _ in 0..step / STEP {
+            let delta = STEP as i32 * if up { 1 } else { -1 };
+            pct = (i32::from(pct) + delta).clamp(0, 100) as u8;
+            let u = if muted { osd(VOL_TITLE, "MUTED", Some(0)) } else { pct_osd(VOL_TITLE, pct) };
+            emit(u.with_volume(Some((pct, muted))));
+        }
+        self.vol = Some((pct, muted));
+        self.touched = Instant::now();
+        if self.apply.send(pct).is_err() {
+            self.vol = None; // setter thread is gone: use the slow path next time
         }
     }
 }
@@ -444,7 +528,7 @@ mod tests {
         cmd_tx.send(MediaCmd::BrightnessDown).unwrap();
         drop(cmd_tx);
         // A fake runner: the test must never touch the real mixer.
-        worker_loop(cmd_rx, osd_tx, |cmd, step| osd("T", format!("{cmd:?} {step}"), None));
+        worker_loop(cmd_rx, osd_tx, |cmd, step, emit| emit(osd("T", format!("{cmd:?} {step}"), None)));
         let got: Vec<String> = osd_rx.try_iter().map(|u| u.body).collect();
         assert_eq!(got, ["VolumeUp 20", "VolumeMute 5", "BrightnessDown 10"]);
     }
@@ -459,7 +543,7 @@ mod tests {
         cmd_tx.send(MediaCmd::PlayPause).unwrap();
         cmd_tx.send(MediaCmd::PlayPause).unwrap();
         drop(cmd_tx);
-        worker_loop(cmd_rx, osd_tx, |cmd, step| osd("T", format!("{cmd:?} {step}"), None));
+        worker_loop(cmd_rx, osd_tx, |cmd, step, emit| emit(osd("T", format!("{cmd:?} {step}"), None)));
         let got: Vec<String> = osd_rx.try_iter().map(|u| u.body).collect();
         assert_eq!(got, ["PlayerNext 5", "PlayerNext 5", "PlayerNext 5", "PlayPause 5", "PlayPause 5"]);
     }
@@ -472,8 +556,29 @@ mod tests {
             cmd_tx.send(MediaCmd::VolumeDown).unwrap();
         }
         drop(cmd_tx);
-        worker_loop(cmd_rx, osd_tx, |_, step| osd("T", step.to_string(), None));
+        worker_loop(cmd_rx, osd_tx, |_, step, emit| emit(osd("T", step.to_string(), None)));
         let got: Vec<String> = osd_rx.try_iter().map(|u| u.body).collect();
         assert_eq!(got, ["100", "15"]);
+    }
+
+    #[test]
+    fn volume_keys_answer_from_memory_one_update_per_press() {
+        let (apply, setter) = mpsc::channel();
+        let mut r = Runner { vol: Some((50, false)), touched: Instant::now(), apply };
+        let mut got = Vec::new();
+        r.run(MediaCmd::VolumeUp, STEP * 2, &mut |u| got.push((u.progress, u.volume)));
+        assert_eq!(got, [(Some(55), Some((55, false))), (Some(60), Some((60, false)))]);
+        assert_eq!(setter.try_iter().collect::<Vec<_>>(), [60], "the mixer is set once, to the final value");
+
+        // Clamped at both ends, and a muted sink keeps reading MUTED.
+        r.vol = Some((98, false));
+        let mut top = Vec::new();
+        r.run(MediaCmd::VolumeUp, STEP, &mut |u| top.push(u.progress));
+        assert_eq!(top, [Some(100)]);
+        r.vol = Some((3, true));
+        let mut low = Vec::new();
+        r.run(MediaCmd::VolumeDown, STEP, &mut |u| low.push((u.body, u.progress)));
+        assert_eq!(low, [("MUTED".to_string(), Some(0))]);
+        assert_eq!(r.vol, Some((0, true)));
     }
 }
