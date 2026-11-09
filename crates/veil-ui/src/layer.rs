@@ -309,7 +309,7 @@ struct ClientState {
     layer_shell: LayerShell,
     opts: LayerOptions,
     surfaces: Vec<OutputSurface>,
-    pointer: Option<ThemedPointer>,
+    pointer: Option<ThemedPointer<()>>,
     input_tx: Sender<UiInputEvent>,
     mouse_x: f64,
     mouse_y: f64,
@@ -425,12 +425,13 @@ impl SeatHandler for ClientState {
     ) {
         if cap == Capability::Pointer && self.pointer.is_none() {
             let cs = self.compositor.create_surface(qh);
-            if let Ok(p) = self.seat_state.get_pointer_with_theme(
+            if let Ok(p) = self.seat_state.get_pointer_with_theme_and_data(
                 qh,
                 &seat,
                 self.shm.wl_shm(),
                 cs,
                 ThemeSpec::System,
+                (),
             ) {
                 self.pointer = Some(p);
             }
@@ -569,10 +570,5 @@ impl ProvidesRegistryState for ClientState {
     registry_handlers![OutputState, SeatState];
 }
 
-smithay_client_toolkit::delegate_compositor!(ClientState);
-smithay_client_toolkit::delegate_output!(ClientState);
-smithay_client_toolkit::delegate_seat!(ClientState);
-smithay_client_toolkit::delegate_pointer!(ClientState);
-smithay_client_toolkit::delegate_layer!(ClientState);
-smithay_client_toolkit::delegate_shm!(ClientState);
+smithay_client_toolkit::delegate_dispatch2!(ClientState);
 smithay_client_toolkit::delegate_registry!(ClientState);

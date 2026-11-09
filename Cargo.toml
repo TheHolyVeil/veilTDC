@@ -52,9 +52,11 @@ zbus                  = "6.2"
 ureq                  = "3.5"
 png                   = "0.18"
 futures-lite          = "2.6"
-tiny-skia             = "0.11"
+tiny-skia             = "0.12"
+# SVG icons only: no text shaping, system fonts or embedded raster images.
+resvg                 = { version = "0.49", default-features = false }
 fontdue               = "0.9"
-smithay-client-toolkit = "0.20"
+smithay-client-toolkit = "0.21"
 wayland-client        = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 crossbeam-channel     = "0.5"

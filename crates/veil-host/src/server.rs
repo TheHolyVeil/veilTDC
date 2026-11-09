@@ -456,6 +456,11 @@ pub struct State {
     pub osd_cfg: veil_config::OsdConfig,
     /// `veil shell osd` has been started for this session.
     pub osd_started: bool,
+    /// Open the launcher once the session is up (`veil-host start`, no app to
+    /// run). It must wait for the shell: the component needs the supervisor
+    /// and the real monitor sizes, and the built-in launcher is only the
+    /// fallback.
+    pub launcher_on_ready: bool,
     /// `<mod_key>+D` app launcher — `Some` while the modal is open. See
     /// `crate::launcher`. Not itself a `keybinds` config entry, same as help.
     pub launcher: Option<Launcher>,
@@ -4584,8 +4589,16 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                             return FilterResult::Intercept(());
                         }
                         if ch == 'd' {
-                            st.launcher = Some(Launcher::new());
-                            mark_dirty_full(st);
+                            // The built-in launcher is the fallback: it shows
+                            // when the component cannot start, and a second
+                            // press closes whichever is open.
+                            if st.launcher.is_some() {
+                                st.launcher = None;
+                                mark_dirty_full(st);
+                            } else if st.supervisor.toggle_component("launch", Instant::now()).is_err() {
+                                st.launcher = Some(Launcher::new());
+                                mark_dirty_full(st);
+                            }
                             return FilterResult::Intercept(());
                         }
                         if ch == 'p' {
@@ -5439,13 +5452,17 @@ fn ipc_command(
         }
         c::COMPONENT_TOGGLE => {
             let name = str_arg("name").filter(|n| !n.is_empty()).ok_or("toggle needs a component name")?;
-            // The launcher and power menu are still the built-in overlays
-            // (phase 5 replaces them with components, keeping these as the
-            // fallback). Anything else does not exist yet.
+            // The launcher and power menu are supervised components with the
+            // built-in overlays as the fallback. Anything else does not exist yet.
             match name {
                 "launch" => {
-                    state.launcher = if state.launcher.is_some() { None } else { Some(Launcher::new()) };
-                    mark_dirty_full(state);
+                    if state.launcher.is_some() {
+                        state.launcher = None;
+                        mark_dirty_full(state);
+                    } else if state.supervisor.toggle_component("launch", Instant::now()).is_err() {
+                        state.launcher = Some(Launcher::new());
+                        mark_dirty_full(state);
+                    }
                     Ok(None)
                 }
                 "power" => {
@@ -5559,6 +5576,16 @@ fn ipc_pump(state: &mut State) -> bool {
         state.osd_started = true;
         if let Err(e) = state.supervisor.start_component("osd", now) {
             tracing::warn!("shell: osd did not start: {e}");
+        }
+    }
+
+    // `veil-host start`: the launcher component, or the built-in one when the
+    // component cannot start.
+    if state.shell_ready && state.launcher_on_ready {
+        state.launcher_on_ready = false;
+        if state.supervisor.toggle_component("launch", now).is_err() {
+            state.launcher = Some(Launcher::new());
+            mark_dirty_full(state);
         }
     }
 
@@ -5945,13 +5972,11 @@ pub fn run(
         notify_started: false,
         osd_cfg,
         osd_started: false,
-        // No anchor client to spawn into (`veil-host start`) → open straight
-        // to the launcher instead of an empty screen with no hint of what to press.
-        launcher: if spawn.is_none() {
-            Some(Launcher::new())
-        } else {
-            None
-        },
+        // No anchor client to spawn into (`veil-host start`) → open the
+        // launcher once the shell is ready, instead of an empty screen with no
+        // hint of what to press.
+        launcher: None,
+        launcher_on_ready: spawn.is_none(),
         power_menu: None,
         wallpaper_chooser: None,
         media: crate::media::MediaWorker::spawn(),

@@ -14,6 +14,7 @@ veil-bar    = { path = "../veil-bar", optional = true }
 veil-notify = { path = "../veil-notify", optional = true }
 veil-power  = { path = "../veil-power", optional = true }
 veil-osd    = { path = "../veil-osd", optional = true }
+veil-launch = { path = "../veil-launch", optional = true }
 veil-ipc    = { path = "../veil-ipc" }
 veil-config = { path = "../veil-config" }
 serde_json  = { workspace = true }
@@ -21,7 +22,7 @@ mimalloc    = { workspace = true }
 
 [features]
 default = ["shell"]
-shell   = ["dep:veil-bar", "dep:veil-notify", "dep:veil-power", "dep:veil-osd"]
+shell   = ["dep:veil-bar", "dep:veil-notify", "dep:veil-power", "dep:veil-osd", "dep:veil-launch"]
 
 [dev-dependencies]
 veil-ui = { path = "../veil-ui" }

@@ -5,6 +5,14 @@ edition     = "2021"
 description = "Supervised on-demand app launcher for Veil"
 
 [dependencies]
+veil-ui                = { path = "../veil-ui" }
+veil-text              = { path = "../veil-text" }
+veil-palette           = { path = "../veil-palette" }
+tiny-skia              = { workspace = true }
+resvg                  = { workspace = true }
+tracing                = { workspace = true }
+tracing-subscriber     = { workspace = true }
+serde_json             = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
