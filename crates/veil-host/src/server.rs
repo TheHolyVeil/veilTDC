@@ -493,6 +493,11 @@ pub struct State {
     /// A layer commit damages old ∪ new, so a surface that moved or shrank
     /// leaves no stale pixels behind now that compositing is clipped.
     pub layer_rects: HashMap<ObjectId, Rect>,
+    /// Sector 2: per-layer-surface map/unmap fade state. Keyed by the
+    /// `wl_surface` ObjectId. Surfaces in an unmap fade stay here (and keep
+    /// their `surface_buffers` entry) until the fade completes; then both are
+    /// removed. See `blit_layers_animated` and the `layer_destroyed` hook.
+    pub layer_fades: HashMap<ObjectId, crate::anim::SurfaceFade>,
     /// Handle to the main calloop loop, set once the loop exists. The
     /// pre-commit hook in `new_surface` needs it to register an explicit-sync
     /// acquire-point source (S4); `None` before startup finishes, in which
@@ -1451,6 +1456,10 @@ impl WlrLayerShellHandler for State {
         if let Err(e) = mapped {
             tracing::warn!("layer-shell: could not map '{}': {e}", layer.namespace());
         }
+        // Sector 2: start a map fade (0 → 1) for this surface.
+        let surf_id = layer.wl_surface().id();
+        self.layer_fades.insert(surf_id, crate::anim::SurfaceFade::map(std::time::Instant::now()));
+        mark_dirty_full(self);
     }
 
     fn ack_configure(&mut self, surface: WlSurface, configure: LayerSurfaceConfigure) {
@@ -1838,15 +1847,77 @@ fn blit_layers(
     layers: &[WlrLayer],
     clip: Rect,
 ) {
+    blit_layers_animated(back, w, h, cache, output, layers, clip, &HashMap::new());
+}
+
+/// Like `blit_layers` but applies per-surface alpha from `fades` (Sector 2).
+/// Surfaces in an unmap fade are still present in `fades` even after their
+/// Wayland surface is gone; their `SurfaceBuf` is kept alive until the fade
+/// completes — this function draws them at their fading alpha so the
+/// compositor keeps its own independent reference to where they were.
+fn blit_layers_animated(
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+    cache: &HashMap<ObjectId, SurfaceBuf>,
+    output: &Output,
+    layers: &[WlrLayer],
+    clip: Rect,
+    fades: &HashMap<ObjectId, crate::anim::SurfaceFade>,
+) {
+    let now = std::time::Instant::now();
     let map = layer_map_for_output(output);
     for &layer in layers {
         for ls in map.layers_on(layer) {
             let Some(g) = map.layer_geometry(ls) else {
                 continue;
             };
-            blit_subtree(back, w, h, cache, ls.wl_surface(), (g.loc.x, g.loc.y), clip);
+            let id = ls.wl_surface().id();
+            let alpha = fades
+                .get(&id)
+                .map(|f| f.alpha.value(now))
+                .unwrap_or(1.0);
+            blit_with_global_alpha_subtree(back, w, h, cache, ls.wl_surface(), (g.loc.x, g.loc.y), clip, alpha);
         }
     }
+}
+
+/// Blit a surface tree with a global alpha. Wraps `blit_subtree` for the
+/// common mapped-layer case; unmapping surfaces use this directly since they
+/// are no longer in the layer map when their fade runs.
+fn blit_with_global_alpha_subtree(
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+    cache: &HashMap<ObjectId, SurfaceBuf>,
+    surface: &WlSurface,
+    origin: (i32, i32),
+    clip: Rect,
+    alpha: f32,
+) {
+    if alpha >= 1.0 {
+        blit_subtree(back, w, h, cache, surface, origin, clip);
+        return;
+    }
+    with_surface_tree_downward(
+        surface,
+        origin,
+        |surf, states, &parent_origin: &(i32, i32)| {
+            let here = if surf == surface {
+                parent_origin
+            } else {
+                let mut g = states.cached_state.get::<SubsurfaceCachedState>();
+                let loc = g.current().location;
+                (parent_origin.0 + loc.x, parent_origin.1 + loc.y)
+            };
+            if let Some(buf) = cache.get(&surf.id()) {
+                blit_with_global_alpha(back, w, h, buf, here.0, here.1, clip, alpha);
+            }
+            TraversalAction::DoChildren(here)
+        },
+        |_, _, _| {},
+        |_, _, _| true,
+    );
 }
 // drm_syncobj's manager/surface/timeline dispatch — smithay 0.7.0 uses the
 // classic Dispatch/GlobalDispatch pattern here (not Dispatch2, which is
@@ -2107,6 +2178,61 @@ fn blit(back: &mut [u8], back_w: u32, back_h: u32, src: &SurfaceBuf, x: i32, y: 
                 dp[2] = (sp[2] as u32 + dp[2] as u32 * inv / 255).min(255) as u8;
                 dp[3] = 255;
             }
+        }
+    }
+}
+
+/// Like [`blit`] but scales every pixel's effective alpha by `global_alpha ∈
+/// [0.0, 1.0]`. Used by the layer-surface map/unmap fade (Sector 2).
+///
+/// The surface buffer uses premultiplied ARGB (Wayland convention). To apply
+/// a global fade without un-premultiplying:
+///   effective_a = (src_a * global_alpha).round()
+///   out_rgb     = src_rgb * (global_alpha) + dst_rgb * (1 - effective_a/255)
+/// When `global_alpha == 1.0` this reduces to the same formula as `blit`.
+fn blit_with_global_alpha(
+    back: &mut [u8],
+    back_w: u32,
+    back_h: u32,
+    src: &SurfaceBuf,
+    x: i32,
+    y: i32,
+    clip: Rect,
+    global_alpha: f32,
+) {
+    // Fast path: nothing to draw.
+    if global_alpha <= 0.0 {
+        return;
+    }
+    // Fast path: fully opaque — delegate to the existing `blit`.
+    if global_alpha >= 1.0 {
+        blit(back, back_w, back_h, src, x, y, clip);
+        return;
+    }
+    let r = Rect { x, y, w: src.w, h: src.h }.intersect(&clip.clamp_to(back_w, back_h));
+    if r.is_empty() {
+        return;
+    }
+    let ga = global_alpha.clamp(0.0, 1.0);
+    let (sw, bw, rw) = (src.w as usize, back_w as usize, r.w as usize);
+    let sx0 = (r.x - x) as usize;
+    for dy in r.y..r.y + r.h as i32 {
+        let sy = (dy - y) as usize;
+        let s = &src.rgba[(sy * sw + sx0) * 4..][..rw * 4];
+        let d = &mut back[(dy as usize * bw + r.x as usize) * 4..][..rw * 4];
+        for (dp, sp) in d.as_chunks_mut::<4>().0.iter_mut().zip(s.as_chunks::<4>().0) {
+            let src_a = sp[3] as f32 * ga;
+            let eff_a = src_a as u32;
+            if eff_a == 0 {
+                continue;
+            }
+            // Scale premultiplied RGB channels by global_alpha so they stay
+            // correctly premultiplied against the new effective alpha.
+            let inv = 255 - eff_a;
+            dp[0] = ((sp[0] as f32 * ga) as u32 + dp[0] as u32 * inv / 255).min(255) as u8;
+            dp[1] = ((sp[1] as f32 * ga) as u32 + dp[1] as u32 * inv / 255).min(255) as u8;
+            dp[2] = ((sp[2] as f32 * ga) as u32 + dp[2] as u32 * inv / 255).min(255) as u8;
+            dp[3] = 255;
         }
     }
 }
@@ -3413,7 +3539,7 @@ fn composite_one_monitor(
 
     // Layer-shell Background + Bottom sit under every window.
     if let Some(out) = state.layer_outputs.get(idx) {
-        blit_layers(
+        blit_layers_animated(
             back,
             w,
             h,
@@ -3421,6 +3547,7 @@ fn composite_one_monitor(
             out,
             &[WlrLayer::Background, WlrLayer::Bottom],
             clip,
+            &state.layer_fades,
         );
     }
 
@@ -3535,7 +3662,7 @@ fn composite_one_monitor(
         } else {
             &[WlrLayer::Top, WlrLayer::Overlay]
         };
-        blit_layers(back, w, h, &state.surface_buffers, out, upper, clip);
+        blit_layers_animated(back, w, h, &state.surface_buffers, out, upper, clip, &state.layer_fades);
     }
 
     // Cursor on top — only on the monitor the pointer is actually over.
@@ -6184,6 +6311,7 @@ pub fn run(
         popup_grabs: Vec::new(),
         surface_buffers: HashMap::new(),
         layer_rects: HashMap::new(),
+        layer_fades: HashMap::new(),
         loop_handle: None, // set right after the event loop is created
         cursor_status: CursorImageStatus::default_named(),
         focus_cache: None,

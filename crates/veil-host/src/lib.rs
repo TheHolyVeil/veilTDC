@@ -10,6 +10,7 @@
 use std::sync::mpsc;
 use std::thread;
 
+pub mod anim;
 pub mod background_effect;
 pub mod cli;
 pub mod detile;
