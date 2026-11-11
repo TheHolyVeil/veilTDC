@@ -56,6 +56,14 @@ fn start(shell_bar: bool, trusted: &[&str]) -> Option<Env> {
         width: W as u32,
         height: H as u32,
         fps: 10,
+        // With no anchor command the compositor opens the real supervised
+        // launcher at startup. That process starts at an unpredictable moment
+        // (a debug build: 300+ ms), registers an exclusive overlay and can
+        // take the keyboard from whatever the test is checking — the cause of
+        // the intermittent "a healthy holder lost the grab". An anchor that
+        // exits at once keeps the launcher closed; the compositor keeps
+        // running when its anchor exits.
+        spawn: Some(vec!["true".to_string()]),
         bar: veil_config::BarConfig {
             shell: shell_bar,
             ..Default::default()
@@ -92,13 +100,7 @@ fn start(shell_bar: bool, trusted: &[&str]) -> Option<Env> {
     wait_for("compositor sockets", Duration::from_secs(5), || {
         env.wayland_socket.exists() && env.ipc_path.exists()
     });
-    // With no anchor command the compositor opens its launcher, a modal that
-    // swallows every click. Close it (Escape, evdev 1) so input reaches clients.
-    for pressed in [true, false] {
-        env.host
-            .send_input(InputCmd::Key { keycode: 1, mods: 0, pressed })
-            .unwrap();
-    }
+    // No launcher modal to dismiss: the anchor above keeps it from opening.
     Some(env)
 }
 
@@ -238,7 +240,13 @@ impl Ipc {
             if let Some(m) = self.frames.next_frame::<ServerMessage>().unwrap() {
                 return m;
             }
-            let n = self.stream.read(&mut buf).expect("ipc read");
+            // A signal (SIGCHLD from a reaped child, say) interrupts the read;
+            // that is not an IPC failure, so retry. Timeouts still panic.
+            let n = match self.stream.read(&mut buf) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("ipc read: {e}"),
+            };
             assert!(n > 0, "ipc closed");
             self.frames.push(&buf[..n]).unwrap();
         }
@@ -970,6 +978,9 @@ fn next_event(ipc: &mut Ipc, within: Duration) -> Option<(String, Value)> {
         }
         ipc.stream.set_read_timeout(Some(left.max(Duration::from_millis(1)))).unwrap();
         match ipc.stream.read(&mut buf) {
+            // A signal interrupted the read; that is not "no event". Retry
+            // with whatever time is left (the loop recomputes it).
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Ok(0) | Err(_) => return None,
             Ok(n) => ipc.frames.push(&buf[..n]).unwrap(),
         }

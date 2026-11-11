@@ -489,6 +489,10 @@ pub struct State {
     /// see `dismiss_popup_grabs_on_press`.
     pub popup_grabs: Vec<PopupSurface>,
     pub surface_buffers: HashMap<ObjectId, SurfaceBuf>,
+    /// Where each layer surface's buffer was last drawn (output pixels).
+    /// A layer commit damages old ∪ new, so a surface that moved or shrank
+    /// leaves no stale pixels behind now that compositing is clipped.
+    pub layer_rects: HashMap<ObjectId, Rect>,
     /// Handle to the main calloop loop, set once the loop exists. The
     /// pre-commit hook in `new_surface` needs it to register an explicit-sync
     /// acquire-point source (S4); `None` before startup finishes, in which
@@ -785,8 +789,26 @@ impl CompositorHandler for State {
                     self.surface_buffers
                         .insert(surface.id(), SurfaceBuf { rgba: dest, w, h });
                     match toplevel_rect_for(self, surface) {
-                        Some((m, r)) => mark_dirty_rect(self, m, r),
-                        None => mark_dirty_full(self), // subsurface/popup/cursor — no precise rect
+                        Some((m, r)) => {
+                            let d = surface_damage(r, surface, &[old_size, Some((w, h))]);
+                            mark_dirty_rect(self, m, d)
+                        }
+                        None => {
+                            // Not a root toplevel: a layer surface (precise
+                            // rect when known), or a subsurface/popup/cursor.
+                            let precise = match layer_monitor {
+                                Some(li) => layer_commit_damage(self, li, surface, Some((w, h))),
+                                None => false,
+                            };
+                            if !precise {
+                                if layer_monitor.is_some() {
+                                    CAUSE_LAYER.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    CAUSE_NONROOT.fetch_add(1, Ordering::Relaxed);
+                                }
+                                mark_dirty_full(self);
+                            }
+                        }
                     }
                 } else {
                     tracing::warn!(
@@ -813,10 +835,21 @@ impl CompositorHandler for State {
                 buffer.release();
             }
             Assign::Removed => {
-                self.surface_buffers.remove(&surface.id());
+                let old = self.surface_buffers.remove(&surface.id()).map(|b| (b.w, b.h));
                 match toplevel_rect_for(self, surface) {
-                    Some((m, r)) => mark_dirty_rect(self, m, r),
-                    None => mark_dirty_full(self),
+                    Some((m, r)) => {
+                        let d = surface_damage(r, surface, &[old]);
+                        mark_dirty_rect(self, m, d)
+                    }
+                    None => {
+                        let precise = match layer_monitor {
+                            Some(li) => layer_commit_damage(self, li, surface, None),
+                            None => false,
+                        };
+                        if !precise {
+                            mark_dirty_full(self);
+                        }
+                    }
                 }
             }
             Assign::None => {
@@ -824,6 +857,7 @@ impl CompositorHandler for State {
                 // subsurface offset change could affect area outside its own
                 // parent toplevel's last-known rect, and this is infrequent
                 // enough that precise tracking here isn't worth the risk.
+                CAUSE_NONE.fetch_add(1, Ordering::Relaxed);
                 mark_dirty_full(self);
             }
         }
@@ -863,9 +897,13 @@ impl CompositorHandler for State {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
-        if self.surface_buffers.remove(&surface.id()).is_some() {
+        self.layer_rects.remove(&surface.id());
+        if let Some(old) = self.surface_buffers.remove(&surface.id()) {
             match toplevel_rect_for(self, surface) {
-                Some((m, r)) => mark_dirty_rect(self, m, r),
+                Some((m, r)) => {
+                    let d = surface_damage(r, surface, &[Some((old.w, old.h))]);
+                    mark_dirty_rect(self, m, d)
+                }
                 None => mark_dirty_full(self),
             }
         }
@@ -1509,6 +1547,9 @@ fn layer_commit(state: &mut State, surface: &WlSurface) -> Option<usize> {
     }
     if zone_changed && idx < state.monitors.len() {
         relayout_monitor(state, idx);
+        // Other layer surfaces may have been re-arranged into new places by
+        // the zone change, and they are not damaged by their own commits.
+        mark_dirty_full(state);
     }
     Some(idx)
 }
@@ -1520,6 +1561,8 @@ fn rearrange_layers(state: &mut State) {
         layer_map_for_output(&output).arrange();
         relayout_monitor(state, idx);
     }
+    // Every layer surface may have moved without committing.
+    mark_dirty_full(state);
 }
 
 // ─── layer-shell keyboard ownership (sections 4, 6.1 and 15) ─────────────────
@@ -1784,7 +1827,8 @@ fn legacy_bar_visible(state: &State, idx: usize) -> bool {
     state.bar.enabled && !shell_bar_mapped(state, idx)
 }
 
-/// Blit the layer surfaces on the given layers, bottom-most layer first.
+/// Blit the layer surfaces on the given layers, bottom-most layer first,
+/// clipped to `clip`.
 fn blit_layers(
     back: &mut [u8],
     w: u32,
@@ -1792,6 +1836,7 @@ fn blit_layers(
     cache: &HashMap<ObjectId, SurfaceBuf>,
     output: &Output,
     layers: &[WlrLayer],
+    clip: Rect,
 ) {
     let map = layer_map_for_output(output);
     for &layer in layers {
@@ -1799,7 +1844,7 @@ fn blit_layers(
             let Some(g) = map.layer_geometry(ls) else {
                 continue;
             };
-            blit_subtree(back, w, h, cache, ls.wl_surface(), (g.loc.x, g.loc.y));
+            blit_subtree(back, w, h, cache, ls.wl_surface(), (g.loc.x, g.loc.y), clip);
         }
     }
 }
@@ -2032,28 +2077,24 @@ fn shm_to_rgba_into(
     Some((w as u32, h as u32))
 }
 
-/// Alpha-over blit `src` onto `back` at `(x, y)`. Clips to back bounds.
-fn blit(back: &mut [u8], back_w: u32, back_h: u32, src: &SurfaceBuf, x: i32, y: i32) {
-    let bw = back_w as i32;
-    let bh = back_h as i32;
-    let x0 = x.max(0);
-    let y0 = y.max(0);
-    let x1 = (x + src.w as i32).min(bw);
-    let y1 = (y + src.h as i32).min(bh);
-    if x0 >= x1 || y0 >= y1 {
+/// Alpha-over blit `src` onto `back` at `(x, y)`, limited to `clip` (and to
+/// the back buffer, whatever `clip` says). Damage-limited compositing passes
+/// the frame's damage rect here, so pixels outside it are never touched.
+fn blit(back: &mut [u8], back_w: u32, back_h: u32, src: &SurfaceBuf, x: i32, y: i32, clip: Rect) {
+    let r = Rect { x, y, w: src.w, h: src.h }.intersect(&clip.clamp_to(back_w, back_h));
+    if r.is_empty() {
         return;
     }
-    for dy in y0..y1 {
-        let sy = (dy - y) as u32;
-        let drow = (dy as u32 * back_w * 4) as usize;
-        let srow = (sy * src.w * 4) as usize;
-        for dx in x0..x1 {
-            let sx = (dx - x) as u32;
-            let di = drow + (dx as u32 * 4) as usize;
-            let si = srow + (sx * 4) as usize;
-            let a = src.rgba[si + 3] as u32;
+    let (sw, bw, rw) = (src.w as usize, back_w as usize, r.w as usize);
+    let sx0 = (r.x - x) as usize;
+    for dy in r.y..r.y + r.h as i32 {
+        let sy = (dy - y) as usize;
+        let s = &src.rgba[(sy * sw + sx0) * 4..][..rw * 4];
+        let d = &mut back[(dy as usize * bw + r.x as usize) * 4..][..rw * 4];
+        for (dp, sp) in d.as_chunks_mut::<4>().0.iter_mut().zip(s.as_chunks::<4>().0) {
+            let a = sp[3] as u32;
             if a == 255 {
-                back[di..di + 4].copy_from_slice(&src.rgba[si..si + 4]);
+                dp.copy_from_slice(sp);
             } else if a > 0 {
                 // S6: Wayland ARGB/ABGR is PREMULTIPLIED, so the source color
                 // already carries its alpha: out = src + dst * (1 - a).
@@ -2061,13 +2102,31 @@ fn blit(back: &mut [u8], back_w: u32, back_h: u32, src: &SurfaceBuf, x: i32, y: 
                 // by alpha twice and darkened every soft edge. `.min(255)`
                 // guards clients that send color > alpha (invalid, but seen).
                 let inv = 255 - a;
-                back[di] = (src.rgba[si] as u32 + back[di] as u32 * inv / 255).min(255) as u8;
-                back[di + 1] =
-                    (src.rgba[si + 1] as u32 + back[di + 1] as u32 * inv / 255).min(255) as u8;
-                back[di + 2] =
-                    (src.rgba[si + 2] as u32 + back[di + 2] as u32 * inv / 255).min(255) as u8;
-                back[di + 3] = 255;
+                dp[0] = (sp[0] as u32 + dp[0] as u32 * inv / 255).min(255) as u8;
+                dp[1] = (sp[1] as u32 + dp[1] as u32 * inv / 255).min(255) as u8;
+                dp[2] = (sp[2] as u32 + dp[2] as u32 * inv / 255).min(255) as u8;
+                dp[3] = 255;
             }
+        }
+    }
+}
+
+/// Paint the wallpaper (or the solid colour when there is none, or it is the
+/// wrong size mid-resize) into `buf`, inside `r` only. `r` must already be
+/// clamped to the `w`-wide buffer. A full-output `r` is the old whole-buffer
+/// fill; a smaller one restores just the damaged region.
+fn fill_background(buf: &mut [u8], wallpaper: Option<&[u8]>, bg: [u8; 4], w: u32, r: Rect) {
+    if r.is_empty() {
+        return;
+    }
+    let stride = w as usize * 4;
+    let (x0, rw) = (r.x as usize * 4, r.w as usize * 4);
+    let wp = wallpaper.filter(|wp| wp.len() == buf.len());
+    for y in r.y as usize..(r.y + r.h as i32) as usize {
+        let row = &mut buf[y * stride + x0..][..rw];
+        match wp {
+            Some(wp) => row.copy_from_slice(&wp[y * stride + x0..][..rw]),
+            None => row.as_chunks_mut::<4>().0.fill(bg),
         }
     }
 }
@@ -2093,15 +2152,13 @@ const ARROW: &[&[u8; 12]; 16] = &[
     b"     ####   ",
 ];
 
-fn draw_fallback_cursor(back: &mut [u8], back_w: u32, back_h: u32, x: i32, y: i32) {
+fn draw_fallback_cursor(back: &mut [u8], back_w: u32, back_h: u32, x: i32, y: i32, clip: Rect) {
+    let clip = clip.clamp_to(back_w, back_h);
     for (dy, row) in ARROW.iter().enumerate() {
         let py = y + dy as i32;
-        if py < 0 || py as u32 >= back_h {
-            continue;
-        }
         for (dx, &ch) in row.iter().enumerate() {
             let px = x + dx as i32;
-            if px < 0 || px as u32 >= back_w {
+            if !clip.contains(px, py) {
                 continue;
             }
             let rgb = match ch {
@@ -2121,7 +2178,8 @@ fn draw_fallback_cursor(back: &mut [u8], back_w: u32, back_h: u32, x: i32, y: i3
 }
 
 /// Walk `root`'s surface tree, blitting each surface's cached buffer
-/// into `back` at its accumulated subsurface offset (added to `origin`).
+/// into `back` at its accumulated subsurface offset (added to `origin`),
+/// clipped to `clip`.
 fn blit_subtree(
     back: &mut [u8],
     back_w: u32,
@@ -2129,6 +2187,7 @@ fn blit_subtree(
     cache: &HashMap<ObjectId, SurfaceBuf>,
     root: &WlSurface,
     origin: (i32, i32),
+    clip: Rect,
 ) {
     with_surface_tree_downward(
         root,
@@ -2144,7 +2203,7 @@ fn blit_subtree(
                 (parent_origin.0 + loc.x, parent_origin.1 + loc.y)
             };
             if let Some(buf) = cache.get(&surface.id()) {
-                blit(back, back_w, back_h, buf, here.0, here.1);
+                blit(back, back_w, back_h, buf, here.0, here.1, clip);
             }
             TraversalAction::DoChildren(here)
         },
@@ -3058,8 +3117,9 @@ fn relayout_monitor(state: &mut State, idx: usize) {
 }
 
 /// Border strips just OUTSIDE `r` (never over window content, so translucent
-/// windows don't tint).
-fn draw_border(back: &mut [u8], w: u32, h: u32, r: Rect, t: u32, c: [u8; 4]) {
+/// windows don't tint). Each strip is clipped to `clip`, so a border outside
+/// the frame's damage is left exactly as the previous frame drew it.
+fn draw_border(back: &mut [u8], w: u32, h: u32, r: Rect, t: u32, c: [u8; 4], clip: Rect) {
     use crate::font5x7::fill_rect;
     let ti = t as i32;
     if r.x + r.w as i32 + ti <= 0
@@ -3069,10 +3129,19 @@ fn draw_border(back: &mut [u8], w: u32, h: u32, r: Rect, t: u32, c: [u8; 4]) {
     {
         return; // entirely off-screen (parked/scrolled-away window)
     }
-    fill_rect(back, w, h, r.x - ti, r.y - ti, r.w + 2 * t, t, c);
-    fill_rect(back, w, h, r.x - ti, r.y + r.h as i32, r.w + 2 * t, t, c);
-    fill_rect(back, w, h, r.x - ti, r.y, t, r.h, c);
-    fill_rect(back, w, h, r.x + r.w as i32, r.y, t, r.h, c);
+    let clip = clip.clamp_to(w, h);
+    let strips = [
+        Rect { x: r.x - ti, y: r.y - ti, w: r.w + 2 * t, h: t },
+        Rect { x: r.x - ti, y: r.y + r.h as i32, w: r.w + 2 * t, h: t },
+        Rect { x: r.x - ti, y: r.y, w: t, h: r.h },
+        Rect { x: r.x + r.w as i32, y: r.y, w: t, h: r.h },
+    ];
+    for s in strips {
+        let s = s.intersect(&clip);
+        if !s.is_empty() {
+            fill_rect(back, w, h, s.x, s.y, s.w, s.h, c);
+        }
+    }
 }
 
 /// Point the keyboard at whichever live toplevel is currently focused (or
@@ -3185,6 +3254,61 @@ fn mark_dirty_rect(state: &mut State, monitor: usize, rect: Rect) {
     }
 }
 
+/// Damage for a root-surface buffer change: the tile plus everything the old
+/// and new buffers can cover. Client-side shadows reach past the tile (the
+/// surface is drawn at `tile - geometry_origin`), so damaging only the tile
+/// would leave those pixels stale now that compositing is clipped to damage.
+fn surface_damage(tile: Rect, surface: &WlSurface, sizes: &[Option<(u32, u32)>]) -> Rect {
+    let (gx, gy) = geometry_origin(surface);
+    sizes.iter().flatten().fold(tile, |d, &(w, h)| {
+        d.union(&Rect { x: tile.x - gx, y: tile.y - gy, w, h })
+    })
+}
+
+/// Where a layer surface's buffer is drawn, in output pixels: the arranged
+/// geometry's origin (the one `blit_layers` uses) with the buffer's own size.
+fn layer_surface_rect(
+    state: &State,
+    idx: usize,
+    surface: &WlSurface,
+    size: (u32, u32),
+) -> Option<Rect> {
+    let output = state.layer_outputs.get(idx)?;
+    let map = layer_map_for_output(output);
+    let ls = map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)?;
+    let g = map.layer_geometry(ls)?;
+    Some(Rect { x: g.loc.x, y: g.loc.y, w: size.0, h: size.1 })
+}
+
+/// Precise damage for a layer-surface buffer change: where it was last drawn
+/// ∪ where it is drawn now (`new_size` is `None` when the buffer was removed).
+/// Returns `false` when no rect is known (first commit, no geometry yet); the
+/// caller then damages the whole output, which is always safe.
+fn layer_commit_damage(
+    state: &mut State,
+    idx: usize,
+    surface: &WlSurface,
+    new_size: Option<(u32, u32)>,
+) -> bool {
+    let id = surface.id();
+    let old = state.layer_rects.get(&id).copied();
+    let new = new_size.and_then(|s| layer_surface_rect(state, idx, surface, s));
+    match new {
+        Some(r) => {
+            state.layer_rects.insert(id, r);
+        }
+        None => {
+            state.layer_rects.remove(&id);
+        }
+    }
+    match (old, new) {
+        (Some(o), Some(n)) => mark_dirty_rect(state, idx, o.union(&n)),
+        (Some(o), None) => mark_dirty_rect(state, idx, o),
+        (None, _) => return false,
+    }
+    true
+}
+
 /// Composite one monitor's live toplevels + popups + cursor (if active) +
 /// overlays into its own RGBA frame and ship it. Pulled out of
 /// `composite_and_send` so that function can stay a simple per-tick loop
@@ -3222,30 +3346,67 @@ fn composite_one_monitor(
     // single-threaded loop, but keeps the invariant obviously true rather
     // than relying on ordering elsewhere) accumulates for next tick instead
     // of being silently dropped.
-    let frame_damage = m
+    let mut frame_damage = m
         .damage
         .take()
         .unwrap_or(Rect { x: 0, y: 0, w, h })
         .clamp_to(w, h);
 
     let needed = (w as usize) * (h as usize) * 4;
-    if m.composite_buf.len() != needed {
-        m.composite_buf.resize(needed, 0);
-    }
 
-    // Background fill: one pass over the buffer as 4-byte RGBA pixels. Safe
-    // (no `align_to_mut`; `Vec<u8>` only guarantees 1-byte alignment) and it
-    // compiles to the same vectorised store loop in release builds.
-    // With a wallpaper layer of the right size this is a straight memcpy of
-    // the pre-scaled image; otherwise (none, or mid-resize until the loader
-    // thread catches up) fall back to the solid colour.
-    match &m.wallpaper {
-        Some(wp) if wp.len() == needed => m.composite_buf.copy_from_slice(wp),
-        _ => {
-            let bg = state.background;
-            m.composite_buf.as_chunks_mut::<4>().0.fill(bg);
+    // Damage-limited compositing: when only part of the output changed, take
+    // last frame's buffer back (it holds the whole previous frame) and repaint
+    // just the damage, instead of rebuilding every pixel. That is only sound
+    // when
+    //  - nothing drawn below ignores the clip. Help, launcher, power menu,
+    //    wallpaper chooser, OSD and the built-in bar alpha-blend straight
+    //    onto the buffer, so painting them again over kept pixels would
+    //    darken them every frame. While any is up, repaint everything.
+    //  - the render side has let go of last frame's Arc (S1 backpressure in
+    //    `composite_and_send` guarantees it; the `try_unwrap` is the check).
+    //  - the buffer is the right size. A resize marks full damage anyway.
+    // Anything else falls back to the old full repaint, which is always safe.
+    let unclipped_overlay = legacy_bar
+        || state.osd.is_some()
+        || (idx == active_idx
+            && (show_help || launcher_present || power_menu_present || wallpaper_chooser_present));
+    let covers_all = frame_damage.w >= w && frame_damage.h >= h;
+    let mut reused = false;
+    if !unclipped_overlay && !covers_all {
+        if let Some(prev) = m.prev_frame.take() {
+            match Arc::try_unwrap(prev) {
+                Ok(v) if v.len() == needed => {
+                    m.composite_buf = v;
+                    reused = true;
+                }
+                Ok(_) => {}
+                Err(arc) => m.prev_frame = Some(arc),
+            }
         }
     }
+    if !reused {
+        frame_damage = Rect { x: 0, y: 0, w, h };
+        if m.composite_buf.len() != needed {
+            m.composite_buf.resize(needed, 0);
+        }
+        let why = if unclipped_overlay {
+            &FULL_OVERLAY
+        } else if covers_all {
+            &FULL_DAMAGE
+        } else {
+            &FULL_NOREUSE
+        };
+        why.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FRAMES_PARTIAL.fetch_add(1, Ordering::Relaxed);
+    }
+    // Every draw below is limited to this. On a full repaint it is the whole
+    // output, which clips nothing.
+    let clip = frame_damage;
+
+    // Background: wallpaper (or solid colour) restored inside the damage only.
+    // A full-output damage rect is the old whole-buffer fill.
+    fill_background(&mut m.composite_buf, m.wallpaper.as_deref(), state.background, w, clip);
 
     let ws = m.active_workspace;
     let back = &mut m.composite_buf;
@@ -3259,6 +3420,7 @@ fn composite_one_monitor(
             &state.surface_buffers,
             out,
             &[WlrLayer::Background, WlrLayer::Bottom],
+            clip,
         );
     }
 
@@ -3289,10 +3451,10 @@ fn composite_one_monitor(
             } else {
                 state.theme.text_dim
             };
-            draw_border(back, w, h, r, BORDER, color);
+            draw_border(back, w, h, r, BORDER, color, clip);
         }
         let (gx, gy) = geometry_origin(surf);
-        blit_subtree(back, w, h, &state.surface_buffers, surf, (r.x - gx, r.y - gy));
+        blit_subtree(back, w, h, &state.surface_buffers, surf, (r.x - gx, r.y - gy), clip);
         for (popup, off) in PopupManager::popups_for_surface(surf) {
             let ps = popup.wl_surface().clone();
             blit_subtree(
@@ -3302,6 +3464,7 @@ fn composite_one_monitor(
                 &state.surface_buffers,
                 &ps,
                 (r.x + off.x, r.y + off.y),
+                clip,
             );
         }
     }
@@ -3327,10 +3490,10 @@ fn composite_one_monitor(
             .find(|t| t.wl_surface().as_ref() == Some(fs))
             .and_then(|t| t.wl_surface())
         {
-            blit_subtree(back, w, h, &state.surface_buffers, &surf, (0, 0));
+            blit_subtree(back, w, h, &state.surface_buffers, &surf, (0, 0), clip);
             for (popup, off) in PopupManager::popups_for_surface(&surf) {
                 let ps = popup.wl_surface().clone();
-                blit_subtree(back, w, h, &state.surface_buffers, &ps, (off.x, off.y));
+                blit_subtree(back, w, h, &state.surface_buffers, &ps, (off.x, off.y), clip);
             }
         }
     }
@@ -3355,6 +3518,7 @@ fn composite_one_monitor(
             &state.surface_buffers,
             &surf,
             (g.loc.x, g.loc.y),
+            clip,
         );
     }
 
@@ -3371,7 +3535,7 @@ fn composite_one_monitor(
         } else {
             &[WlrLayer::Top, WlrLayer::Overlay]
         };
-        blit_layers(back, w, h, &state.surface_buffers, out, upper);
+        blit_layers(back, w, h, &state.surface_buffers, out, upper, clip);
     }
 
     // Cursor on top — only on the monitor the pointer is actually over.
@@ -3387,13 +3551,13 @@ fn composite_one_monitor(
                 });
                 let cx = m.pointer_pos.0 as i32 - hotspot.x;
                 let cy = m.pointer_pos.1 as i32 - hotspot.y;
-                blit_subtree(back, w, h, &state.surface_buffers, cs, (cx, cy));
+                blit_subtree(back, w, h, &state.surface_buffers, cs, (cx, cy), clip);
             }
             CursorImageStatus::Named(_) => {
                 // Client wants a themed cursor (default arrow etc) — we don't
                 // load themes. Draw a tiny built-in arrow so the user can see
                 // where their pointer is.
-                draw_fallback_cursor(back, w, h, m.pointer_pos.0 as i32, m.pointer_pos.1 as i32);
+                draw_fallback_cursor(back, w, h, m.pointer_pos.0 as i32, m.pointer_pos.1 as i32, clip);
             }
             CursorImageStatus::Hidden => {}
         }
@@ -3508,6 +3672,9 @@ fn composite_one_monitor(
             reclaimed.reserve(needed);
             reclaimed
         }
+        // A partial frame took last frame's buffer back and repaints inside
+        // it next time too, so there is no spare to prepare.
+        None if reused => Vec::new(),
         // Render thread is still holding its reference (lagging) or this is
         // the first frame — fall back to a fresh allocation, same as before.
         _ => Vec::with_capacity(needed),
@@ -3530,6 +3697,22 @@ fn composite_one_monitor(
 /// `composite_one_monitor`, called once per entry in `state.monitors`.
 /// Composite attempts skipped by S1 backpressure since the last tick-trace line.
 static BP_SKIPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 6a trace counters, drained by the `VEIL_TICK_TRACE` line: frames that took
+/// the damage-limited path, and why the others fell back to a full repaint
+/// (unclipped overlay up / damage already covers the output / last frame's
+/// buffer not reusable).
+static FRAMES_PARTIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FULL_OVERLAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FULL_DAMAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FULL_NOREUSE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// What marked full damage, per commit (drained by the same trace line):
+/// a buffer-less state commit, a layer-shell surface, or a subsurface/popup.
+/// Full damage from input, focus or layout changes is whatever is left over.
+static CAUSE_NONE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CAUSE_LAYER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CAUSE_NONROOT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn composite_and_send(state: &mut State) {
     if !state.dirty {
@@ -4691,23 +4874,20 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             let ny = (gy - m.rect.y as f64).clamp(0.0, m.output_h.saturating_sub(1) as f64);
             state.monitors[idx].pointer_pos = (nx, ny);
 
-            // Recompositing itself always redraws the whole frame regardless
-            // of the damage rect (see composite_one_monitor) — `damage` here
-            // only controls how much of the ALREADY-correct recomposited
-            // buffer gets forwarded to the output backend. So a cursor-sized
-            // rect is exactly as correct as the whole screen, just far
-            // cheaper to blit. Margin is generous (not measured from the
-            // actual cursor surface/hotspot) to safely cover the built-in
-            // 12×16 fallback arrow and typical client cursor themes alike;
-            // an unusually large custom client cursor could in principle
-            // exceed it and leave a stale edge pixel behind — a cosmetic
-            // edge case, not a correctness or crash issue.
+            // composite_one_monitor repaints ONLY inside the damage rect (6a),
+            // so this rect must cover every pixel the cursor can occupy at
+            // the old and new position — pixels outside it are kept from the
+            // previous frame, not redrawn. The box is not measured from the
+            // real cursor surface/hotspot: it is 128×128 centred on the
+            // pointer, which covers the 12×16 fallback arrow and any themed
+            // cursor up to 64 px with a hotspot anywhere inside it. Over-damage
+            // is cheap now; under-damage leaves a ghost cursor.
             fn cursor_bbox(pos: (f64, f64)) -> Rect {
                 Rect {
-                    x: pos.0 as i32 - 16,
-                    y: pos.1 as i32 - 16,
-                    w: 64,
-                    h: 64,
+                    x: pos.0 as i32 - 64,
+                    y: pos.1 as i32 - 64,
+                    w: 128,
+                    h: 128,
                 }
             }
             if old_idx == idx {
@@ -6003,6 +6183,7 @@ pub fn run(
         popups: PopupManager::default(),
         popup_grabs: Vec::new(),
         surface_buffers: HashMap::new(),
+        layer_rects: HashMap::new(),
         loop_handle: None, // set right after the event loop is created
         cursor_status: CursorImageStatus::default_named(),
         focus_cache: None,
@@ -6369,11 +6550,27 @@ pub fn run(
                 if tick_n.is_multiple_of(120) {
                     let serial = data.state.frame_serial;
                     let bp = BP_SKIPS.swap(0, Ordering::Relaxed);
+                    let partial = FRAMES_PARTIAL.swap(0, Ordering::Relaxed);
+                    let f_overlay = FULL_OVERLAY.swap(0, Ordering::Relaxed);
+                    let f_damage = FULL_DAMAGE.swap(0, Ordering::Relaxed);
+                    let f_noreuse = FULL_NOREUSE.swap(0, Ordering::Relaxed);
+                    let c_none = CAUSE_NONE.swap(0, Ordering::Relaxed);
+                    let c_layer = CAUSE_LAYER.swap(0, Ordering::Relaxed);
+                    let c_nonroot = CAUSE_NONROOT.swap(0, Ordering::Relaxed);
                     eprintln!(
                         "[veil-tick] 120 ticks: frames_sent={} backpressure_skips={} \
+                         partial={} full(overlay={} damage={} noreuse={}) \
+                         full-causes(no-buffer-commit={} layer={} subsurface/popup={}) \
                          composite avg={:.2}ms max={:.2}ms (n={}) tick avg={:.2}ms max={:.2}ms",
                         serial.wrapping_sub(acc_serial),
                         bp,
+                        partial,
+                        f_overlay,
+                        f_damage,
+                        f_noreuse,
+                        c_none,
+                        c_layer,
+                        c_nonroot,
                         if acc_comp_n > 0 { acc_comp / acc_comp_n as f64 } else { 0.0 },
                         acc_comp_max,
                         acc_comp_n,
@@ -6578,6 +6775,8 @@ mod import_tests {
         assert!(!surface_size_ok(usize::MAX, usize::MAX));
     }
 
+    const FULL1: Rect = Rect { x: 0, y: 0, w: 1, h: 1 };
+
     fn buf(px: [u8; 4]) -> SurfaceBuf {
         SurfaceBuf { rgba: px.to_vec(), w: 1, h: 1 }
     }
@@ -6585,21 +6784,21 @@ mod import_tests {
     #[test]
     fn blit_opaque_transparent_and_premultiplied() {
         let mut back = vec![100u8, 100, 100, 255];
-        blit(&mut back, 1, 1, &buf([7, 8, 9, 255]), 0, 0);
+        blit(&mut back, 1, 1, &buf([7, 8, 9, 255]), 0, 0, FULL1);
         assert_eq!(back, [7, 8, 9, 255]);
 
         let mut back = vec![100u8, 100, 100, 255];
-        blit(&mut back, 1, 1, &buf([50, 50, 50, 0]), 0, 0);
+        blit(&mut back, 1, 1, &buf([50, 50, 50, 0]), 0, 0, FULL1);
         assert_eq!(back, [100, 100, 100, 255], "alpha 0 leaves dst alone");
 
         // premultiplied: out = src + dst * (255 - a) / 255 = 50 + 100 * 127 / 255
         let mut back = vec![100u8, 100, 100, 255];
-        blit(&mut back, 1, 1, &buf([50, 50, 50, 128]), 0, 0);
+        blit(&mut back, 1, 1, &buf([50, 50, 50, 128]), 0, 0, FULL1);
         assert_eq!(back, [99, 99, 99, 255]);
 
         // colour brighter than alpha (invalid but seen) clamps instead of wrapping
         let mut back = vec![200u8, 200, 200, 255];
-        blit(&mut back, 1, 1, &buf([250, 250, 250, 128]), 0, 0);
+        blit(&mut back, 1, 1, &buf([250, 250, 250, 128]), 0, 0, FULL1);
         assert_eq!(back, [255, 255, 255, 255]);
     }
 
@@ -6608,22 +6807,122 @@ mod import_tests {
         let (w, h) = (10u32, 10u32);
         let mut back = vec![0u8; (w * h * 4) as usize];
         let r = Rect { x: 3, y: 3, w: 4, h: 4 };
-        draw_border(&mut back, w, h, r, 2, [9, 9, 9, 255]);
+        draw_border(&mut back, w, h, r, 2, [9, 9, 9, 255], Rect { x: 0, y: 0, w, h });
         let px = |x: u32, y: u32| back[((y * w + x) * 4) as usize];
         assert_eq!(px(1, 1), 9, "outer corner");
         assert_eq!(px(8, 5), 9, "right strip");
         assert_eq!(px(4, 4), 0, "window interior untouched");
         assert_eq!(px(0, 0), 0);
         // Partly off-screen must not panic.
-        draw_border(&mut back, w, h, Rect { x: -5, y: 8, w: 30, h: 30 }, 2, [1, 1, 1, 255]);
+        draw_border(&mut back, w, h, Rect { x: -5, y: 8, w: 30, h: 30 }, 2, [1, 1, 1, 255], Rect { x: 0, y: 0, w, h });
     }
 
     #[test]
     fn blit_clips_to_the_back_buffer() {
         let mut back = vec![0u8; 2 * 2 * 4];
         let src = SurfaceBuf { rgba: vec![255; 3 * 3 * 4], w: 3, h: 3 };
-        blit(&mut back, 2, 2, &src, -1, -1); // overhangs top-left
-        blit(&mut back, 2, 2, &src, 5, 5); // entirely outside: no-op, no panic
+        blit(&mut back, 2, 2, &src, -1, -1, Rect { x: 0, y: 0, w: 2, h: 2 }); // overhangs top-left
+        blit(&mut back, 2, 2, &src, 5, 5, Rect { x: 0, y: 0, w: 2, h: 2 }); // entirely outside: no-op, no panic
         assert!(back.iter().all(|&b| b == 255));
+    }
+
+    #[test]
+    fn blit_leaves_pixels_outside_the_clip_alone() {
+        // 4x4 back buffer of 7s, an opaque 4x4 white source over all of it,
+        // clip = the 2x2 block at (1,1). Only that block may change.
+        let mut back = vec![7u8; 4 * 4 * 4];
+        let src = SurfaceBuf { rgba: vec![255; 4 * 4 * 4], w: 4, h: 4 };
+        blit(&mut back, 4, 4, &src, 0, 0, Rect { x: 1, y: 1, w: 2, h: 2 });
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let inside = (1..3).contains(&x) && (1..3).contains(&y);
+                let want = if inside { 255 } else { 7 };
+                assert_eq!(back[((y * 4 + x) * 4) as usize], want, "pixel ({x},{y})");
+            }
+        }
+        // A clip that sticks out of the buffer is cut to the buffer, no panic.
+        blit(&mut back, 4, 4, &src, 0, 0, Rect { x: -9, y: -9, w: 99, h: 99 });
+        assert!(back.iter().all(|&b| b == 255));
+        // An empty clip draws nothing.
+        let mut back = vec![7u8; 4 * 4 * 4];
+        blit(&mut back, 4, 4, &src, 0, 0, Rect { x: 2, y: 2, w: 0, h: 5 });
+        assert!(back.iter().all(|&b| b == 7));
+    }
+
+    #[test]
+    fn blit_with_offset_source_samples_the_right_pixels() {
+        // 2x1 source [A, B] placed at x=1 on a 4x1 back; clip covers x=2..3,
+        // so only B (source x=1) lands, at back x=2.
+        let mut back = vec![0u8; 4 * 4];
+        let src = SurfaceBuf { rgba: vec![10, 10, 10, 255, 20, 20, 20, 255], w: 2, h: 1 };
+        blit(&mut back, 4, 1, &src, 1, 0, Rect { x: 2, y: 0, w: 1, h: 1 });
+        assert_eq!(back, [0, 0, 0, 0, 0, 0, 0, 0, 20, 20, 20, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn fill_background_restores_only_the_damage() {
+        let (w, h) = (4u32, 3u32);
+        let n = (w * h * 4) as usize;
+        let bg = [1u8, 2, 3, 255];
+        let r = Rect { x: 1, y: 1, w: 2, h: 1 };
+
+        // Solid colour.
+        let mut buf = vec![9u8; n];
+        fill_background(&mut buf, None, bg, w, r);
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let want: [u8; 4] = if r.contains(x as i32, y as i32) { bg } else { [9; 4] };
+                assert_eq!(buf[i..i + 4], want, "solid ({x},{y})");
+            }
+        }
+
+        // Wallpaper: row slices must come from the matching wallpaper pixels.
+        let wp: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let mut buf = vec![9u8; n];
+        fill_background(&mut buf, Some(&wp), bg, w, r);
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                if r.contains(x as i32, y as i32) {
+                    assert_eq!(buf[i..i + 4], wp[i..i + 4], "wallpaper ({x},{y})");
+                } else {
+                    assert_eq!(buf[i..i + 4], [9; 4], "kept ({x},{y})");
+                }
+            }
+        }
+
+        // Wrong-size wallpaper (mid-resize) falls back to the solid colour.
+        let mut buf = vec![9u8; n];
+        fill_background(&mut buf, Some(&wp[..n - 4]), bg, w, Rect { x: 0, y: 0, w, h });
+        assert!(buf.as_chunks::<4>().0.iter().all(|p| *p == bg));
+
+        // Empty damage touches nothing.
+        let mut buf = vec![9u8; n];
+        fill_background(&mut buf, None, bg, w, Rect { x: 2, y: 2, w: 0, h: 0 });
+        assert!(buf.iter().all(|&b| b == 9));
+    }
+
+    #[test]
+    fn border_strips_are_clipped_to_the_damage() {
+        let (w, h) = (10u32, 10u32);
+        let mut back = vec![0u8; (w * h * 4) as usize];
+        let r = Rect { x: 3, y: 3, w: 4, h: 4 };
+        // Clip covers only the top-left corner of the border ring.
+        draw_border(&mut back, w, h, r, 2, [9, 9, 9, 255], Rect { x: 0, y: 0, w: 4, h: 4 });
+        let px = |x: u32, y: u32| back[((y * w + x) * 4) as usize];
+        assert_eq!(px(1, 1), 9, "corner inside the clip");
+        assert_eq!(px(8, 5), 0, "right strip is outside the clip");
+        assert_eq!(px(5, 8), 0, "bottom strip is outside the clip");
+    }
+
+    #[test]
+    fn fallback_cursor_respects_the_clip() {
+        let mut back = vec![0u8; 16 * 20 * 4];
+        // The arrow's tip pixel (0,0) is white; clip excludes it.
+        draw_fallback_cursor(&mut back, 16, 20, 2, 2, Rect { x: 3, y: 0, w: 13, h: 20 });
+        assert_eq!(back[((2 * 16 + 2) * 4) as usize], 0, "tip clipped away");
+        // Row 1 is "##": pixel (3,3) is inside the clip and white.
+        assert_eq!(back[((3 * 16 + 3) * 4) as usize], 255);
     }
 }

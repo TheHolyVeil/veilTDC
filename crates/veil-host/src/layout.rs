@@ -76,6 +76,26 @@ impl Rect {
         }
     }
 
+    /// Overlap of `self` and `other`; zero-sized (never negative) when they
+    /// do not touch. Damage-limited compositing clips every draw with this.
+    pub fn intersect(&self, other: &Rect) -> Rect {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = (self.x + self.w as i32).min(other.x + other.w as i32);
+        let y1 = (self.y + self.h as i32).min(other.y + other.h as i32);
+        Rect {
+            x: x0,
+            y: y0,
+            w: (x1 - x0).max(0) as u32,
+            h: (y1 - y0).max(0) as u32,
+        }
+    }
+
+    /// True when the rect covers no pixels.
+    pub fn is_empty(&self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
     /// Clip to `[0,0]..[max_w,max_h]` — defensive against a stale damage
     /// rect referencing dimensions from before an output resize.
     pub fn clamp_to(&self, max_w: u32, max_h: u32) -> Rect {
@@ -887,5 +907,48 @@ mod tests {
         l.focus(&r, Dir::Right);
         l.sync_view(5, 100);
         assert_eq!(l.rects(5, 100, 80)[2].x, 50); // scrolled just enough
+    }
+}
+
+#[cfg(test)]
+mod rect_clip_tests {
+    use super::Rect;
+
+    fn r(x: i32, y: i32, w: u32, h: u32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn intersect_of_overlapping_rects_is_the_overlap() {
+        assert_eq!(r(0, 0, 10, 10).intersect(&r(5, 5, 10, 10)), r(5, 5, 5, 5));
+        // Containment, either way round.
+        assert_eq!(r(0, 0, 10, 10).intersect(&r(2, 3, 4, 4)), r(2, 3, 4, 4));
+        assert_eq!(r(2, 3, 4, 4).intersect(&r(0, 0, 10, 10)), r(2, 3, 4, 4));
+        // Negative origins (a window dragged partly off-screen).
+        assert_eq!(r(-5, -5, 10, 10).intersect(&r(0, 0, 20, 20)), r(0, 0, 5, 5));
+    }
+
+    #[test]
+    fn intersect_of_disjoint_or_touching_rects_is_empty() {
+        assert!(r(0, 0, 10, 10).intersect(&r(10, 0, 5, 5)).is_empty(), "edges touch only");
+        assert!(r(0, 0, 10, 10).intersect(&r(50, 50, 5, 5)).is_empty());
+        assert!(r(0, 0, 10, 10).intersect(&r(-20, 0, 5, 5)).is_empty());
+    }
+
+    #[test]
+    fn intersect_is_commutative_and_never_grows() {
+        let a = r(-3, 4, 17, 9);
+        let b = r(2, -1, 8, 30);
+        assert_eq!(a.intersect(&b), b.intersect(&a));
+        let i = a.intersect(&b);
+        assert!(i.w <= a.w.min(b.w) && i.h <= a.h.min(b.h));
+    }
+
+    #[test]
+    fn union_then_intersect_with_output_stays_inside_it() {
+        // The shape of the damage path: accumulate, then clamp to the output.
+        let d = r(-10, -10, 30, 30).union(&r(1900, 1070, 40, 40)).clamp_to(1920, 1080);
+        assert_eq!(d, r(0, 0, 1920, 1080));
+        assert_eq!(d.intersect(&r(0, 0, 1920, 1080)), d);
     }
 }

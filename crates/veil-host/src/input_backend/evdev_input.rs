@@ -195,6 +195,8 @@ impl InputBackend for EvdevInput {
             .collect();
 
         let mut was_active = true;
+        // Maps the kernel's wall-clock event timestamps onto `Instant`s.
+        let clock = (std::time::Instant::now(), std::time::SystemTime::now());
 
         while running.load(Ordering::Relaxed) {
             let active = crate::seat::session_active();
@@ -278,7 +280,30 @@ impl InputBackend for EvdevInput {
             }
 
             // 200 ms cap so we still notice `running` being cleared by another path.
-            let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
+            // A touchscreen with a timer pending (long press, gliding page)
+            // shortens it so the timer fires on time.
+            let mut timeout_ms: i32 = 200;
+            if active {
+                let now = std::time::Instant::now();
+                for ts in touchscreens.iter().flatten() {
+                    if let Some(d) = ts.next_deadline(now) {
+                        timeout_ms = timeout_ms.min((d.as_millis() as i32).max(1));
+                    }
+                }
+            }
+            let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
+            if active {
+                let now = std::time::Instant::now();
+                let mut timer_out: Vec<touchscreen::Out> = Vec::new();
+                for ts in touchscreens.iter_mut().flatten() {
+                    ts.tick(now, &mut timer_out);
+                }
+                if !timer_out.is_empty() {
+                    let comp_w = geom.comp_w.load(Ordering::Relaxed) as i32;
+                    let comp_h = geom.comp_h.load(Ordering::Relaxed) as i32;
+                    emit_touch(&tx, timer_out, &mut cx, &mut cy, comp_w, comp_h);
+                }
+            }
             if n <= 0 {
                 continue;
             } // 0 = timeout, <0 = EINTR/error → re-check running
@@ -306,6 +331,12 @@ impl InputBackend for EvdevInput {
                 let mut tp_out: Vec<touchpad::Out> = Vec::new();
                 let mut ts_out: Vec<touchscreen::Out> = Vec::new();
                 let now = std::time::Instant::now();
+                // Output size in pixels: the touchscreen measures slop and
+                // scroll distance on screen, not in device units.
+                let touch_size = (
+                    geom.comp_w.load(Ordering::Relaxed),
+                    geom.comp_h.load(Ordering::Relaxed),
+                );
                 for ev in events {
                     // Touchpad-specific events (finger position, BTN_TOUCH,
                     // BTN_TOOL_*, SYN_REPORT) feed the touchpad state machine.
@@ -348,7 +379,11 @@ impl InputBackend for EvdevInput {
                             }
                             EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
                                 if active {
-                                    ts.sync(&mut ts_out);
+                                    // The kernel's own timestamp for this frame: several
+                                    // frames can arrive in one read, and finger speed
+                                    // (the glide) needs the real time between them.
+                                    let t = event_time(clock, ev.timestamp());
+                                    ts.sync(t, touch_size, &mut ts_out);
                                 }
                                 true
                             }
@@ -411,21 +446,7 @@ impl InputBackend for EvdevInput {
                             }
                         }
                     }
-                    for o in ts_out {
-                        match o {
-                            touchscreen::Out::MoveTo(fx, fy) => {
-                                cx = (fx * (comp_w.max(1) - 1) as f32).round() as i32;
-                                cy = (fy * (comp_h.max(1) - 1) as f32).round() as i32;
-                                send_motion(&tx, cx, cy, comp_w, comp_h);
-                            }
-                            touchscreen::Out::Press | touchscreen::Out::Release => {
-                                let _ = tx.send(InputCmd::PointerButton {
-                                    button: 0x110,
-                                    pressed: matches!(o, touchscreen::Out::Press),
-                                });
-                            }
-                        }
-                    }
+                    emit_touch(&tx, ts_out, &mut cx, &mut cy, comp_w, comp_h);
                     if moved {
                         send_motion(&tx, cx, cy, comp_w, comp_h);
                     }
@@ -551,6 +572,59 @@ fn send_motion(tx: &std::sync::mpsc::Sender<InputCmd>, x: i32, y: i32, w: i32, h
         width: w.max(1) as u32,
         height: h.max(1) as u32,
     });
+}
+
+/// Turn what the touchscreen state machine decided into compositor input.
+fn emit_touch(
+    tx: &std::sync::mpsc::Sender<InputCmd>,
+    outs: Vec<touchscreen::Out>,
+    cx: &mut i32,
+    cy: &mut i32,
+    comp_w: i32,
+    comp_h: i32,
+) {
+    const BTN_LEFT: u32 = 0x110;
+    const BTN_RIGHT: u32 = 0x111;
+    for o in outs {
+        match o {
+            touchscreen::Out::MoveTo(fx, fy) => {
+                *cx = (fx * (comp_w.max(1) - 1) as f32).round() as i32;
+                *cy = (fy * (comp_h.max(1) - 1) as f32).round() as i32;
+                send_motion(tx, *cx, *cy, comp_w, comp_h);
+            }
+            touchscreen::Out::Press | touchscreen::Out::Release => {
+                let _ = tx.send(InputCmd::PointerButton {
+                    button: BTN_LEFT,
+                    pressed: matches!(o, touchscreen::Out::Press),
+                });
+            }
+            touchscreen::Out::RightClick => {
+                for pressed in [true, false] {
+                    let _ = tx.send(InputCmd::PointerButton {
+                        button: BTN_RIGHT,
+                        pressed,
+                    });
+                }
+            }
+            touchscreen::Out::Scroll(v120) => {
+                let _ = tx.send(InputCmd::Scroll { v120 });
+            }
+        }
+    }
+}
+
+/// The `Instant` a kernel event timestamp corresponds to, given a matching
+/// `(Instant, SystemTime)` pair taken at the same moment. Evdev stamps events
+/// with the wall clock. Falls back to the base instant for anything that
+/// does not map (a clock step, a different clock id).
+fn event_time(
+    base: (std::time::Instant, std::time::SystemTime),
+    ts: std::time::SystemTime,
+) -> std::time::Instant {
+    match ts.duration_since(base.1) {
+        Ok(d) => base.0 + d,
+        Err(e) => base.0.checked_sub(e.duration()).unwrap_or(base.0),
+    }
 }
 
 /// BTN_LEFT..BTN_TASK live in 0x110..=0x117; treat those as pointer buttons.
