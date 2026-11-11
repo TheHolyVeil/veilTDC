@@ -12,8 +12,13 @@ tiny-skia              = { workspace = true }
 smithay-client-toolkit = { workspace = true }
 wayland-client         = { workspace = true }
 wayland-protocols-wlr  = { workspace = true }
+wayland-protocols      = { workspace = true, features = ["client", "staging"] }
+rustix                 = { workspace = true }
 crossbeam-channel      = { workspace = true }
 tracing                = { workspace = true }
 serde                  = { workspace = true }
 serde_json             = { workspace = true }
 thiserror              = { workspace = true }
+
+[dev-dependencies]
+tempfile               = { workspace = true }

@@ -1,686 +1,256 @@
-//! Wayland fullscreen overlay surface for veil-power.
-//! Uses KeyboardInteractivity::Exclusive and binds ext-background-effect-v1 when available.
+//! The power menu as a `veil_ui::modal` app: key and pointer mapping, and what
+//! each action runs. All the Wayland plumbing lives in the modal module.
 
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 
-use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
-    output::{OutputHandler, OutputState},
-    registry::{ProvidesRegistryState, RegistryState},
-    registry_handlers,
-    seat::{
-        keyboard::{KeyboardHandler, KeyEvent, Keysym, Modifiers, RawModifiers, RepeatInfo},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler, ThemedPointer, ThemeSpec},
-        Capability, SeatHandler, SeatState,
-    },
-    shell::{
-        wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-            LayerSurfaceConfigure,
-        },
-        WaylandSurface,
-    },
-    shm::{slot::SlotPool, Shm, ShmHandler},
-};
-use wayland_client::{
-    globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface},
-    Connection, EventQueue, QueueHandle,
-};
-use wayland_protocols::ext::background_effect::v1::client::{
-    ext_background_effect_manager_v1::{self, ExtBackgroundEffectManagerV1},
-    ext_background_effect_surface_v1::{self, ExtBackgroundEffectSurfaceV1},
-};
-
-use crate::panel::{Action, ClickZone, Panel};
 use veil_palette::Tokens;
 use veil_text::FontConfig;
+use veil_ui::modal::{Flow, Key, ModalApp, Pointer};
+use veil_ui::Keysym;
 
-pub struct PowerSurface {
-    queue: EventQueue<State>,
-    state: State,
-}
+use crate::panel::{Action, ClickZone, Panel};
 
-impl PowerSurface {
-    pub fn new(tokens: Tokens, font_cfg: Option<&FontConfig>, ipc: Option<UnixStream>) -> Result<Self, Box<dyn std::error::Error>> {
-        let conn = Connection::connect_to_env()?;
-        let (globals, queue) = registry_queue_init::<State>(&conn)?;
-        let qh = queue.handle();
-
-        let compositor = CompositorState::bind(&globals, &qh)?;
-        let layer_shell = LayerShell::bind(&globals, &qh)?;
-        let shm = Shm::bind(&globals, &qh)?;
-        let seat_state = SeatState::new(&globals, &qh);
-
-        // Check for ext-background-effect-v1
-        let bg_effect_manager = match globals.bind::<ExtBackgroundEffectManagerV1, _, _>(&qh, 1..=1, ()) {
-            Ok(mgr) => {
-                tracing::info!("veil-power: ext-background-effect-v1 manager bound successfully");
-                Some(mgr)
-            }
-            Err(e) => {
-                tracing::debug!("veil-power: ext-background-effect-v1 not available ({e})");
-                None
-            }
-        };
-
-        let state = State {
-            registry: RegistryState::new(&globals),
-            compositor,
-            output_state: OutputState::new(&globals, &qh),
-            seat_state,
-            shm,
-            layer_shell,
-            bg_effect_manager,
-            bg_effect_surface: None,
-            surface: None,
-            pool: None,
-            sw: 0,
-            sh: 0,
-            configured: false,
-            should_close: false,
-            mouse_x: 0.0,
-            mouse_y: 0.0,
-            pressed: false,
-            pointer: None,
-            click_zones: Vec::new(),
-            panel: Panel::new(tokens, font_cfg),
-            dirty: true,
-            ipc,
-        };
-
-        let mut s = Self { queue, state };
-        s.queue.roundtrip(&mut s.state)?;
-        Ok(s)
-    }
-
-    pub fn tick(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
-        use rustix::event::{poll, PollFd, PollFlags};
-        use rustix::fd::AsFd;
-        use rustix::time::Timespec;
-        use std::os::unix::io::AsRawFd;
-
-        if let Err(e) = self.queue.flush() {
-            tracing::debug!("veil-power flush: {e}");
-        }
-
-        if let Some(guard) = self.queue.prepare_read() {
-            let raw = self.queue.as_fd().as_raw_fd();
-            let bfd = unsafe { rustix::fd::BorrowedFd::borrow_raw(raw) };
-            let mut pfd = PollFd::new(&bfd, PollFlags::IN);
-            let ts = Timespec {
-                tv_sec: 0,
-                tv_nsec: 10_000_000, // 10ms
-            };
-            let ready = poll(std::slice::from_mut(&mut pfd), Some(&ts)).unwrap_or(0);
-            if ready > 0 {
-                let _ = guard.read();
-            } else {
-                drop(guard);
-            }
-        }
-        self.queue.dispatch_pending(&mut self.state)?;
-
-        if self.state.should_close {
-            return Ok(true);
-        }
-
-        if self.state.configured && self.state.dirty {
-            self.state.dirty = false;
-            self.repaint()?;
-        }
-        Ok(false)
-    }
-
-    fn repaint(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let s = &mut self.state;
-        if s.sw == 0 || s.sh == 0 {
-            return Ok(());
-        }
-        let Some(ref ls) = s.surface else { return Ok(()); };
-        let Some(ref mut pool) = s.pool else { return Ok(()); };
-
-        let (pixels, zones) = s.panel.render(s.sw, s.sh);
-        s.click_zones = zones;
-
-        let stride = s.sw * 4;
-        let (buffer, canvas) = pool.create_buffer(
-            s.sw as i32,
-            s.sh as i32,
-            stride as i32,
-            wl_shm::Format::Argb8888,
-        )?;
-
-        let n = canvas.len().min(pixels.len());
-        canvas[..n].copy_from_slice(&pixels[..n]);
-
-        let surf = ls.wl_surface();
-        buffer.attach_to(surf).ok();
-        surf.damage_buffer(0, 0, s.sw as i32, s.sh as i32);
-        ls.commit();
-        Ok(())
-    }
-}
-
-// ── Wayland state ─────────────────────────────────────────────────────────────
-
-struct State {
-    registry: RegistryState,
-    compositor: CompositorState,
-    output_state: OutputState,
-    seat_state: SeatState,
-    shm: Shm,
-    layer_shell: LayerShell,
-    bg_effect_manager: Option<ExtBackgroundEffectManagerV1>,
-    bg_effect_surface: Option<ExtBackgroundEffectSurfaceV1>,
-    surface: Option<LayerSurface>,
-    pool: Option<SlotPool>,
-    sw: u32,
-    sh: u32,
-    configured: bool,
-    should_close: bool,
-    mouse_x: f64,
-    mouse_y: f64,
-    pressed: bool,
-    pointer: Option<ThemedPointer>,
-    click_zones: Vec<ClickZone>,
+pub struct PowerApp {
     panel: Panel,
-    dirty: bool,
-    ipc: Option<UnixStream>,
+    zones: Vec<ClickZone>,
+    /// What to do with a chosen action. Replaced in tests so they never
+    /// reach `systemctl`.
+    runner: Box<dyn FnMut(Action)>,
 }
 
-impl State {
-    fn create_surface(&mut self, qh: &QueueHandle<Self>, output: &wl_output::WlOutput) {
-        if self.surface.is_some() {
-            return;
-        }
-
-        let surface = self.compositor.create_surface(qh);
-        let ls = self.layer_shell.create_layer_surface(
-            qh,
-            surface,
-            Layer::Overlay,
-            Some("veil-power"),
-            Some(output),
-        );
-
-        // Full-screen: anchor all edges
-        ls.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        ls.set_exclusive_zone(-1);
-        ls.set_size(0, 0);
-        ls.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-
-        // If ext-background-effect-v1 is available, request background blur
-        if let Some(ref mgr) = self.bg_effect_manager {
-            let effect_surface = mgr.get_background_effect(ls.wl_surface(), qh, ());
-            let region = self.compositor.wl_compositor().create_region(qh, ());
-            // Default initial size covers typical output; configure updates it
-            region.add(0, 0, i32::MAX / 2, i32::MAX / 2);
-            effect_surface.set_blur_region(Some(&region));
-            region.destroy();
-            self.bg_effect_surface = Some(effect_surface);
-        }
-
-        ls.commit();
-
-        let pool = SlotPool::new(1920 * 1080 * 4, &self.shm).expect("veil-power: pool");
-        self.surface = Some(ls);
-        self.pool = Some(pool);
+impl PowerApp {
+    pub fn new(tokens: Tokens, font_cfg: Option<&FontConfig>, mut ipc: Option<UnixStream>) -> Self {
+        Self::with_runner(tokens, font_cfg, Box::new(move |a| run_action(&mut ipc, a)))
     }
 
-    fn update_blur_region(&self, qh: &QueueHandle<Self>, w: u32, h: u32) {
-        if let Some(ref effect_surface) = self.bg_effect_surface {
-            let region = self.compositor.wl_compositor().create_region(qh, ());
-            region.add(0, 0, w as i32, h as i32);
-            effect_surface.set_blur_region(Some(&region));
-            region.destroy();
+    pub fn with_runner(tokens: Tokens, font_cfg: Option<&FontConfig>, runner: Box<dyn FnMut(Action)>) -> Self {
+        PowerApp { panel: Panel::new(tokens, font_cfg), zones: Vec::new(), runner }
+    }
+
+    /// Run the chosen action (if any) and say what the surface should do.
+    fn finish(&mut self, close: bool, action: Option<Action>) -> Flow {
+        if let Some(a) = action {
+            (self.runner)(a);
+        }
+        if close {
+            Flow::Close
+        } else {
+            Flow::Redraw
         }
     }
 
-    fn execute_action(&mut self, action: Action) {
-        tracing::info!("veil-power: executing action {:?}", action);
-        // Try IPC first
-        let cmd = match action {
-            Action::Lock => Some("session.lock"),
-            Action::Logout => Some("session.logout"),
-            Action::Suspend => Some("session.suspend"),
-            Action::Hibernate => None,
-            Action::Reboot => Some("session.reboot"),
-            Action::Shutdown => Some("session.poweroff"),
-        };
+    fn number(&mut self, n: usize) -> Flow {
+        let (close, action) = self.panel.select_number(n);
+        self.finish(close, action)
+    }
+}
 
-        let mut ipc_succeeded = false;
-        if let (Some(cmd_name), Some(ref mut stream)) = (cmd, &mut self.ipc) {
-            use std::io::Write;
-            let msg = veil_ipc::ClientMessage::Cmd {
-                id: 1,
-                cmd: cmd_name.to_string(),
-                args: serde_json::Value::Null,
-            };
-            if let Ok(bytes) = veil_ipc::encode(&msg) {
-                if stream.write_all(&bytes).is_ok() {
-                    ipc_succeeded = true;
-                }
-            }
-        }
+/// Keys that keep acting while held.
+fn is_navigation(sym: Keysym) -> bool {
+    matches!(sym, Keysym::Left | Keysym::Right | Keysym::Up | Keysym::Down | Keysym::h | Keysym::j | Keysym::k | Keysym::l)
+}
 
-        if !ipc_succeeded {
-            // Standalone fallback
-            match action {
-                Action::Lock => {
-                    let _ = Command::new("veil-lock")
-                        .spawn()
-                        .or_else(|_| Command::new("swaylock").arg("-f").spawn());
-                }
-                Action::Logout => {
-                    let _ = Command::new("pkill").args(["-TERM", "veil"]).spawn();
-                }
-                Action::Suspend => {
-                    let _ = Command::new("systemctl").arg("suspend").spawn();
-                }
-                Action::Hibernate => {
-                    let _ = Command::new("systemctl").arg("hibernate").spawn();
-                }
-                Action::Reboot => {
-                    let _ = Command::new("systemctl").arg("reboot").spawn();
-                }
-                Action::Shutdown => {
-                    let _ = Command::new("systemctl").arg("poweroff").spawn();
-                }
-            }
-        }
+impl ModalApp for PowerApp {
+    fn render(&mut self, w: u32, h: u32) -> Vec<u8> {
+        let (pixels, zones) = self.panel.render(w, h);
+        self.zones = zones;
+        pixels
     }
 
-    fn handle_key(&mut self, sym: Keysym) -> bool {
-        match sym {
+    fn key(&mut self, key: &Key) -> Flow {
+        if key.repeat && !is_navigation(key.sym) {
+            return Flow::Idle;
+        }
+        match key.sym {
             Keysym::Escape => {
                 let close = self.panel.key_escape();
-                self.dirty = true;
-                close
+                self.finish(close, None)
             }
             Keysym::Return | Keysym::KP_Enter => {
                 let (close, action) = self.panel.key_enter();
-                self.dirty = true;
-                if let Some(act) = action {
-                    self.execute_action(act);
-                }
-                close
+                self.finish(close, action)
             }
             Keysym::Left | Keysym::h => {
                 self.panel.nav_prev();
-                self.dirty = true;
-                false
+                Flow::Redraw
             }
             Keysym::Right | Keysym::l => {
                 self.panel.nav_next();
-                self.dirty = true;
-                false
+                Flow::Redraw
             }
             Keysym::Up | Keysym::k => {
                 self.panel.nav_up();
-                self.dirty = true;
-                false
+                Flow::Redraw
             }
             Keysym::Down | Keysym::j => {
                 self.panel.nav_down();
-                self.dirty = true;
-                false
+                Flow::Redraw
             }
-            Keysym::_1 => self.handle_num(0),
-            Keysym::_2 => self.handle_num(1),
-            Keysym::_3 => self.handle_num(2),
-            Keysym::_4 => self.handle_num(3),
-            Keysym::_5 => self.handle_num(4),
-            Keysym::_6 => self.handle_num(5),
-            _ => false,
+            Keysym::_1 => self.number(0),
+            Keysym::_2 => self.number(1),
+            Keysym::_3 => self.number(2),
+            Keysym::_4 => self.number(3),
+            Keysym::_5 => self.number(4),
+            Keysym::_6 => self.number(5),
+            _ => Flow::Idle,
         }
     }
 
-    fn handle_num(&mut self, n: usize) -> bool {
-        let (close, action) = self.panel.select_number(n);
-        self.dirty = true;
-        if let Some(act) = action {
-            self.execute_action(act);
-        }
-        close
-    }
-}
-
-// ── Handler impls ─────────────────────────────────────────────────────────────
-
-impl CompositorHandler for State {
-    fn scale_factor_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
-    ) {
-    }
-    fn transform_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: wl_output::Transform,
-    ) {
-    }
-    fn frame(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: u32,
-    ) {
-    }
-    fn surface_enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
-    fn surface_leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
-}
-
-impl OutputHandler for State {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
-    }
-    fn new_output(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        output: wl_output::WlOutput,
-    ) {
-        self.create_surface(qh, &output);
-    }
-    fn update_output(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_output::WlOutput,
-    ) {
-    }
-    fn output_destroyed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_output::WlOutput,
-    ) {
-    }
-}
-
-impl SeatHandler for State {
-    fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
-    }
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-
-    fn new_capability(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        seat: wl_seat::WlSeat,
-        cap: Capability,
-    ) {
-        if cap == Capability::Pointer && self.pointer.is_none() {
-            let cs = self.compositor.create_surface(qh);
-            if let Ok(p) = self
-                .seat_state
-                .get_pointer_with_theme(qh, &seat, self.shm.wl_shm(), cs, ThemeSpec::System)
-            {
-                self.pointer = Some(p);
+    fn pointer(&mut self, ev: Pointer) -> Flow {
+        match ev {
+            Pointer::Move { x, y } => {
+                if self.panel.hover(x, y, &self.zones) {
+                    Flow::Redraw
+                } else {
+                    Flow::Idle
+                }
             }
-        }
-        if cap == Capability::Keyboard {
-            let _ = self.seat_state.get_keyboard(qh, &seat, None);
-        }
-    }
-
-    fn remove_capability(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        cap: Capability,
-    ) {
-        if cap == Capability::Pointer {
-            self.pointer = None;
-        }
-    }
-}
-
-impl KeyboardHandler for State {
-    fn enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _: u32,
-        _: &[u32],
-        _: &[Keysym],
-    ) {
-    }
-    fn leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _: u32,
-    ) {
-    }
-
-    fn press_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        event: KeyEvent,
-    ) {
-        if self.handle_key(event.keysym) {
-            self.should_close = true;
-        }
-    }
-
-    fn release_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        _: KeyEvent,
-    ) {
-    }
-
-    fn repeat_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        event: KeyEvent,
-    ) {
-        match event.keysym {
-            Keysym::Left
-            | Keysym::Right
-            | Keysym::Up
-            | Keysym::Down
-            | Keysym::h
-            | Keysym::j
-            | Keysym::k
-            | Keysym::l
-                if self.handle_key(event.keysym) =>
-            {
-                self.should_close = true;
+            Pointer::Click { x, y } => {
+                let (close, action) = self.panel.click(x, y, &self.zones);
+                self.finish(close, action)
             }
-            _ => {}
-        }
-    }
-
-    fn update_modifiers(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        _: Modifiers,
-        _: RawModifiers,
-        _: u32,
-    ) {
-    }
-
-    fn update_repeat_info(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: RepeatInfo,
-    ) {
-    }
-}
-
-impl PointerHandler for State {
-    fn pointer_frame(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_pointer::WlPointer,
-        events: &[PointerEvent],
-    ) {
-        for ev in events {
-            match ev.kind {
-                PointerEventKind::Motion { .. } => {
-                    self.mouse_x = ev.position.0;
-                    self.mouse_y = ev.position.1;
-                    if self
-                        .panel
-                        .hover(self.mouse_x as f32, self.mouse_y as f32, &self.click_zones)
-                    {
-                        self.dirty = true;
-                    }
-                }
-                PointerEventKind::Press { button: 0x110, .. } => {
-                    self.pressed = true;
-                }
-                PointerEventKind::Release { button: 0x110, .. } if self.pressed => {
-                    self.pressed = false;
-                    let (close, action) = self.panel.click(
-                        self.mouse_x as f32,
-                        self.mouse_y as f32,
-                        &self.click_zones,
-                    );
-                    self.dirty = true;
-                    if let Some(act) = action {
-                        self.execute_action(act);
-                    }
-                    if close {
-                        self.should_close = true;
-                    }
-                }
-                _ => {}
-            }
+            Pointer::Scroll { .. } | Pointer::Leave => Flow::Idle,
         }
     }
 }
 
-impl LayerShellHandler for State {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.should_close = true;
+/// Ask the compositor to do it over IPC; with no compositor (the menu run on
+/// its own) fall back to the system tools.
+fn run_action(ipc: &mut Option<UnixStream>, action: Action) {
+    tracing::info!("veil-power: executing action {action:?}");
+    let cmd = match action {
+        Action::Lock => Some("session.lock"),
+        Action::Logout => Some("session.logout"),
+        Action::Suspend => Some("session.suspend"),
+        Action::Hibernate => None,
+        Action::Reboot => Some("session.reboot"),
+        Action::Shutdown => Some("session.poweroff"),
+    };
+
+    if let (Some(cmd), Some(stream)) = (cmd, ipc.as_mut()) {
+        let msg = veil_ipc::ClientMessage::Cmd { id: 1, cmd: cmd.to_string(), args: serde_json::Value::Null };
+        if veil_ipc::encode(&msg).is_ok_and(|bytes| stream.write_all(&bytes).is_ok()) {
+            return;
+        }
     }
 
-    fn configure(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        ls: &LayerSurface,
-        cfg: LayerSurfaceConfigure,
-        _: u32,
-    ) {
-        if let Some(ref s) = self.surface {
-            if s.wl_surface() == ls.wl_surface() {
-                if cfg.new_size.0 > 0 {
-                    self.sw = cfg.new_size.0;
-                }
-                if cfg.new_size.1 > 0 {
-                    self.sh = cfg.new_size.1;
-                }
-                self.configured = true;
-                self.dirty = true;
-                self.update_blur_region(qh, self.sw, self.sh);
-            }
+    // Standalone fallback
+    match action {
+        Action::Lock => {
+            let _ = Command::new("veil-lock").spawn().or_else(|_| Command::new("swaylock").arg("-f").spawn());
+        }
+        Action::Logout => {
+            let _ = Command::new("pkill").args(["-TERM", "veil"]).spawn();
+        }
+        Action::Suspend => {
+            let _ = Command::new("systemctl").arg("suspend").spawn();
+        }
+        Action::Hibernate => {
+            let _ = Command::new("systemctl").arg("hibernate").spawn();
+        }
+        Action::Reboot => {
+            let _ = Command::new("systemctl").arg("reboot").spawn();
+        }
+        Action::Shutdown => {
+            let _ = Command::new("systemctl").arg("poweroff").spawn();
         }
     }
 }
 
-impl ShmHandler for State {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn key(sym: Keysym, repeat: bool) -> Key {
+        Key { sym, text: None, ctrl: false, alt: false, shift: false, repeat }
+    }
+
+    fn app() -> (PowerApp, Rc<RefCell<Vec<Action>>>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let sink = log.clone();
+        let app = PowerApp::with_runner(Tokens::default(), None, Box::new(move |a| sink.borrow_mut().push(a)));
+        (app, log)
+    }
+
+    #[test]
+    fn navigation_redraws_and_unknown_keys_do_nothing() {
+        let (mut a, log) = app();
+        for sym in [Keysym::Left, Keysym::Right, Keysym::Up, Keysym::Down, Keysym::h, Keysym::j, Keysym::k, Keysym::l] {
+            assert_eq!(a.key(&key(sym, false)), Flow::Redraw, "{sym:?}");
+        }
+        assert_eq!(a.key(&key(Keysym::x, false)), Flow::Idle);
+        assert_eq!(a.key(&key(Keysym::F5, false)), Flow::Idle);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn only_navigation_repeats() {
+        let (mut a, log) = app();
+        assert_eq!(a.key(&key(Keysym::Right, true)), Flow::Redraw);
+        assert_eq!(a.key(&key(Keysym::Return, true)), Flow::Idle);
+        assert_eq!(a.key(&key(Keysym::_1, true)), Flow::Idle);
+        assert!(log.borrow().is_empty(), "a held Enter or number must never run an action");
+    }
+
+    #[test]
+    fn escape_closes_a_fresh_menu() {
+        let (mut a, log) = app();
+        assert_eq!(a.key(&key(Keysym::Escape, false)), Flow::Close);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_unconfirmed_action_runs_once_and_closes() {
+        let (mut a, log) = app();
+        // Lock (the first entry) needs no confirmation.
+        assert_eq!(a.key(&key(Keysym::Return, false)), Flow::Close);
+        assert_eq!(*log.borrow(), [Action::Lock]);
+    }
+
+    #[test]
+    fn a_dangerous_action_asks_first_and_escape_backs_out() {
+        let (mut a, log) = app();
+        assert_eq!(a.key(&key(Keysym::_6, false)), Flow::Redraw, "Shutdown asks for confirmation");
+        assert!(log.borrow().is_empty());
+        assert_eq!(a.key(&key(Keysym::Escape, false)), Flow::Redraw, "backs out, the menu stays");
+        assert!(log.borrow().is_empty());
+        // Enter on the default (Cancel) also backs out
+        a.key(&key(Keysym::_6, false));
+        assert_eq!(a.key(&key(Keysym::Return, false)), Flow::Redraw);
+        assert!(log.borrow().is_empty());
+        // choosing Confirm runs it
+        a.key(&key(Keysym::_6, false));
+        a.key(&key(Keysym::Right, false));
+        assert_eq!(a.key(&key(Keysym::Return, false)), Flow::Close);
+        assert_eq!(*log.borrow(), [Action::Shutdown]);
+    }
+
+    #[test]
+    fn rendering_fills_the_surface_and_records_click_zones() {
+        let (mut a, _) = app();
+        let px = a.render(800, 600);
+        assert_eq!(px.len(), 800 * 600 * 4);
+        assert!(!a.zones.is_empty());
+    }
+
+    #[test]
+    fn pointer_events_map_to_flows() {
+        let (mut a, log) = app();
+        a.render(800, 600);
+        assert_eq!(a.pointer(Pointer::Move { x: 1.0, y: 1.0 }), Flow::Idle, "empty space");
+        assert_eq!(a.pointer(Pointer::Scroll { dy: 3.0 }), Flow::Idle);
+        assert_eq!(a.pointer(Pointer::Leave), Flow::Idle);
+        let z = a.zones[0].clone();
+        let (cx, cy) = ((z.x0 + z.x1) / 2.0, (z.y0 + z.y1) / 2.0);
+        assert_ne!(a.pointer(Pointer::Click { x: cx, y: cy }), Flow::Idle);
+        assert!(log.borrow().len() <= 1);
+        // a click on nothing neither runs nor closes
+        let before = log.borrow().len();
+        assert_eq!(a.pointer(Pointer::Click { x: 1.0, y: 1.0 }), Flow::Redraw);
+        assert_eq!(log.borrow().len(), before);
     }
 }
-
-impl wayland_client::Dispatch<wl_region::WlRegion, ()> for State {
-    fn event(
-        _: &mut Self,
-        _: &wl_region::WlRegion,
-        _: wl_region::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl wayland_client::Dispatch<ExtBackgroundEffectManagerV1, ()> for State {
-    fn event(
-        _: &mut Self,
-        _: &ExtBackgroundEffectManagerV1,
-        event: ext_background_effect_manager_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        tracing::debug!("veil-power: ext_background_effect_manager_v1 event: {:?}", event);
-    }
-}
-
-impl wayland_client::Dispatch<ExtBackgroundEffectSurfaceV1, ()> for State {
-    fn event(
-        _: &mut Self,
-        _: &ExtBackgroundEffectSurfaceV1,
-        _: ext_background_effect_surface_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl ProvidesRegistryState for State {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry
-    }
-    registry_handlers![OutputState, SeatState];
-}
-
-smithay_client_toolkit::delegate_compositor!(State);
-smithay_client_toolkit::delegate_output!(State);
-smithay_client_toolkit::delegate_seat!(State);
-smithay_client_toolkit::delegate_pointer!(State);
-smithay_client_toolkit::delegate_keyboard!(State);
-smithay_client_toolkit::delegate_layer!(State);
-smithay_client_toolkit::delegate_shm!(State);
-smithay_client_toolkit::delegate_registry!(State);
