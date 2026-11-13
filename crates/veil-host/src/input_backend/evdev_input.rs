@@ -8,6 +8,7 @@
 
 use super::{InputBackend, InputCtx};
 use crate::input::InputCmd;
+use super::dwt::Dwt;
 use super::touchpad::{self, Touchpad};
 use super::sysrq::SysRqBridge;
 use super::touchscreen::{self, Touchscreen};
@@ -197,6 +198,9 @@ impl InputBackend for EvdevInput {
         let mut was_active = true;
         // Maps the kernel's wall-clock event timestamps onto `Instant`s.
         let clock = (std::time::Instant::now(), std::time::SystemTime::now());
+        // Disable-while-typing for the touchpad (default on; `VEIL_DWT=off`
+        // turns it off, `VEIL_DWT=<ms>` sets the timeout).
+        let mut dwt = Dwt::from_env();
 
         while running.load(Ordering::Relaxed) {
             let active = crate::seat::session_active();
@@ -208,6 +212,7 @@ impl InputBackend for EvdevInput {
                     let _ = dev.ungrab();
                 }
                 sysrq.reset();
+                dwt.reset();
                 for tp in touchpads.iter_mut().flatten() {
                     tp.reset();
                 }
@@ -331,6 +336,8 @@ impl InputBackend for EvdevInput {
                 let mut tp_out: Vec<touchpad::Out> = Vec::new();
                 let mut ts_out: Vec<touchscreen::Out> = Vec::new();
                 let now = std::time::Instant::now();
+                // Is the user typing right now? Decided once per batch.
+                let typing = dwt.blocks(now);
                 // Output size in pixels: the touchscreen measures slop and
                 // scroll distance on screen, not in device units.
                 let touch_size = (
@@ -342,6 +349,8 @@ impl InputBackend for EvdevInput {
                     // BTN_TOOL_*, SYN_REPORT) feed the touchpad state machine.
                     // The physical click (BTN_LEFT..) falls through below.
                     if let Some(tp) = touchpads[i].as_mut() {
+                        // Typing in progress: palm rejection (see `Dwt`).
+                        tp.set_blocked(typing);
                         let ours = match ev.destructure() {
                             EventSummary::Key(_, key, value) if value != 2 => {
                                 tp.key(key.code(), value == 1, now)
@@ -392,6 +401,14 @@ impl InputBackend for EvdevInput {
                         };
                         if ours {
                             continue;
+                        }
+                    }
+                    // Typing detector for the touchpad's palm rejection. Only
+                    // real keyboard keys count; pad and mouse buttons (codes
+                    // 0x100 and up) are ignored inside `Dwt`.
+                    if let EventSummary::Key(_, key, value) = ev.destructure() {
+                        if value != 2 {
+                            dwt.key(key.code(), value == 1, event_time(clock, ev.timestamp()));
                         }
                     }
                     // K2: Alt+SysRq+<key> is replayed to the kernel (and kept

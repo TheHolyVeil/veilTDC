@@ -323,6 +323,18 @@ impl Monitor {
     }
 }
 
+/// A destroyed layer surface that is still fading out (Sector 2). See
+/// `State::layer_dying`.
+#[derive(Clone, Copy, Debug)]
+pub struct DyingLayer {
+    /// Output it was on.
+    pub monitor: usize,
+    /// Which layer it lived on, so it fades at the right depth.
+    pub layer: WlrLayer,
+    /// Where its buffer was last drawn, in output pixels.
+    pub rect: Rect,
+}
+
 pub struct State {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -498,6 +510,11 @@ pub struct State {
     /// their `surface_buffers` entry) until the fade completes; then both are
     /// removed. See `blit_layers_animated` and the `layer_destroyed` hook.
     pub layer_fades: HashMap<ObjectId, crate::anim::SurfaceFade>,
+    /// Layer surfaces that were destroyed but are still fading out. They are
+    /// gone from the layer map, so what is needed to draw them (output, layer
+    /// for z-order, where they were) is kept here, next to the buffer that
+    /// `surface_buffers` holds for them until `layer_fade_tick` drains them.
+    pub layer_dying: HashMap<ObjectId, DyingLayer>,
     /// Handle to the main calloop loop, set once the loop exists. The
     /// pre-commit hook in `new_surface` needs it to register an explicit-sync
     /// acquire-point source (S4); `None` before startup finishes, in which
@@ -840,7 +857,13 @@ impl CompositorHandler for State {
                 buffer.release();
             }
             Assign::Removed => {
-                let old = self.surface_buffers.remove(&surface.id()).map(|b| (b.w, b.h));
+                // A destroyed layer surface that is fading out keeps its last
+                // buffer: it is all the fade has to draw.
+                let old = if self.layer_dying.contains_key(&surface.id()) {
+                    None
+                } else {
+                    self.surface_buffers.remove(&surface.id()).map(|b| (b.w, b.h))
+                };
                 match toplevel_rect_for(self, surface) {
                     Some((m, r)) => {
                         let d = surface_damage(r, surface, &[old]);
@@ -902,7 +925,15 @@ impl CompositorHandler for State {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
-        self.layer_rects.remove(&surface.id());
+        let id = surface.id();
+        self.layer_rects.remove(&id);
+        if self.layer_dying.contains_key(&id) {
+            // A destroyed layer surface still fading out: its last buffer is
+            // all that is left to draw it with. `layer_fade_tick` drops it
+            // (and repaints the spot) when the fade ends.
+            return;
+        }
+        self.layer_fades.remove(&id);
         if let Some(old) = self.surface_buffers.remove(&surface.id()) {
             match toplevel_rect_for(self, surface) {
                 Some((m, r)) => {
@@ -1456,9 +1487,11 @@ impl WlrLayerShellHandler for State {
         if let Err(e) = mapped {
             tracing::warn!("layer-shell: could not map '{}': {e}", layer.namespace());
         }
-        // Sector 2: start a map fade (0 → 1) for this surface.
-        let surf_id = layer.wl_surface().id();
-        self.layer_fades.insert(surf_id, crate::anim::SurfaceFade::map(std::time::Instant::now()));
+        // Sector 2: the map fade does not start here. The surface has nothing
+        // to show until its first buffer arrives (often 100+ ms later, the
+        // client still starting up), so a fade begun now would be over before
+        // anything is visible. `layer_commit_damage` starts it on that first
+        // buffer instead.
         mark_dirty_full(self);
     }
 
@@ -1487,8 +1520,32 @@ impl WlrLayerShellHandler for State {
                 }
                 found
             };
-            if found.is_some() {
-                self.surface_buffers.remove(&surface.wl_surface().id());
+            if let Some(l) = found {
+                // Sector 2: fade it out instead of cutting it. The surface is
+                // out of the layer map now, but its last buffer and rect are
+                // still known, so `layer_dying` lets the compositor keep
+                // drawing it at a falling alpha. The buffer is dropped by
+                // `layer_fade_tick` when the fade ends, not here. A surface
+                // that never showed anything (no buffer, no fade) goes at once.
+                let id = dead.id();
+                let now = Instant::now();
+                let fading = match (
+                    self.layer_rects.get(&id).copied(),
+                    self.surface_buffers.contains_key(&id),
+                    self.layer_fades.get_mut(&id),
+                ) {
+                    (Some(rect), true, Some(fade)) => {
+                        fade.begin_unmap(now);
+                        self.layer_dying
+                            .insert(id.clone(), DyingLayer { monitor: idx, layer: l.layer(), rect });
+                        true
+                    }
+                    _ => false,
+                };
+                if !fading {
+                    self.layer_fades.remove(&id);
+                    self.surface_buffers.remove(&id);
+                }
                 if idx < self.monitors.len() {
                     relayout_monitor(self, idx);
                 }
@@ -1837,24 +1894,10 @@ fn legacy_bar_visible(state: &State, idx: usize) -> bool {
 }
 
 /// Blit the layer surfaces on the given layers, bottom-most layer first,
-/// clipped to `clip`.
-fn blit_layers(
-    back: &mut [u8],
-    w: u32,
-    h: u32,
-    cache: &HashMap<ObjectId, SurfaceBuf>,
-    output: &Output,
-    layers: &[WlrLayer],
-    clip: Rect,
-) {
-    blit_layers_animated(back, w, h, cache, output, layers, clip, &HashMap::new());
-}
-
-/// Like `blit_layers` but applies per-surface alpha from `fades` (Sector 2).
-/// Surfaces in an unmap fade are still present in `fades` even after their
-/// Wayland surface is gone; their `SurfaceBuf` is kept alive until the fade
-/// completes — this function draws them at their fading alpha so the
-/// compositor keeps its own independent reference to where they were.
+/// clipped to `clip`, each at its fade alpha from `fades` (Sector 2; a surface
+/// with no entry is fully opaque). Destroyed surfaces still fading out are not
+/// in the layer map any more; `blit_dying_layers` draws those.
+#[allow(clippy::too_many_arguments)]
 fn blit_layers_animated(
     back: &mut [u8],
     w: u32,
@@ -1885,6 +1928,7 @@ fn blit_layers_animated(
 /// Blit a surface tree with a global alpha. Wraps `blit_subtree` for the
 /// common mapped-layer case; unmapping surfaces use this directly since they
 /// are no longer in the layer map when their fade runs.
+#[allow(clippy::too_many_arguments)]
 fn blit_with_global_alpha_subtree(
     back: &mut [u8],
     w: u32,
@@ -1919,6 +1963,75 @@ fn blit_with_global_alpha_subtree(
         |_, _, _| true,
     );
 }
+/// Draw layer surfaces that were destroyed but are still fading out, on
+/// monitor `idx` and on `layers` (so each fades at its own depth). They are
+/// gone from the layer map, so they are drawn from what `layer_dying` kept:
+/// the last buffer, where it was last drawn, at the fade's current alpha.
+/// Only the root buffer is drawn; a subsurface of a dying layer is not.
+#[allow(clippy::too_many_arguments)]
+fn blit_dying_layers(
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+    cache: &HashMap<ObjectId, SurfaceBuf>,
+    idx: usize,
+    layers: &[WlrLayer],
+    clip: Rect,
+    fades: &HashMap<ObjectId, crate::anim::SurfaceFade>,
+    dying: &HashMap<ObjectId, DyingLayer>,
+) {
+    let now = std::time::Instant::now();
+    for (id, d) in dying {
+        if d.monitor != idx || !layers.contains(&d.layer) {
+            continue;
+        }
+        let (Some(fade), Some(buf)) = (fades.get(id), cache.get(id)) else {
+            continue;
+        };
+        blit_with_global_alpha(back, w, h, buf, d.rect.x, d.rect.y, clip, fade.alpha.value(now));
+    }
+}
+
+/// Once per tick, before compositing: advance the layer map/unmap fades
+/// (Sector 2). Returns true while there is anything animating, so the tick
+/// stays at full rate and keeps compositing.
+///  - A fade-in that has finished is dropped (no entry means alpha 1), and one
+///    more frame is queued so the surface lands at exactly full opacity.
+///  - A destroyed surface whose fade-out has finished is removed for good:
+///    its buffer, its fade and its bookkeeping, and the spot is repainted.
+///  - While a fade is in flight the screen is kept dirty so every tick draws
+///    the next step.
+fn layer_fade_tick(state: &mut State) -> bool {
+    if state.layer_fades.is_empty() {
+        return false;
+    }
+    let now = Instant::now();
+    let mut changed = false;
+
+    let finished: Vec<ObjectId> = state
+        .layer_fades
+        .iter()
+        .filter(|(_, f)| !f.is_busy(now))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in finished {
+        let gone = state.layer_fades.get(&id).is_some_and(|f| f.is_gone(now));
+        state.layer_fades.remove(&id);
+        if gone {
+            state.layer_dying.remove(&id);
+            state.surface_buffers.remove(&id);
+            state.layer_rects.remove(&id);
+        }
+        changed = true;
+    }
+
+    let animating = state.layer_fades.values().any(|f| f.is_busy(now));
+    if changed || animating {
+        mark_dirty_full(state);
+    }
+    changed || animating
+}
+
 // drm_syncobj's manager/surface/timeline dispatch — smithay 0.7.0 uses the
 // classic Dispatch/GlobalDispatch pattern here (not Dispatch2, which is
 // master-branch-only and not in this pinned version), hence its own macro
@@ -2190,6 +2303,7 @@ fn blit(back: &mut [u8], back_w: u32, back_h: u32, src: &SurfaceBuf, x: i32, y: 
 ///   effective_a = (src_a * global_alpha).round()
 ///   out_rgb     = src_rgb * (global_alpha) + dst_rgb * (1 - effective_a/255)
 /// When `global_alpha == 1.0` this reduces to the same formula as `blit`.
+#[allow(clippy::too_many_arguments)]
 fn blit_with_global_alpha(
     back: &mut [u8],
     back_w: u32,
@@ -3419,6 +3533,14 @@ fn layer_commit_damage(
     let id = surface.id();
     let old = state.layer_rects.get(&id).copied();
     let new = new_size.and_then(|s| layer_surface_rect(state, idx, surface, s));
+    // Sector 2: the first buffer a layer surface shows (or the first after it
+    // was unmapped) starts its fade-in. Not at creation: the client has
+    // nothing drawn yet then, and the fade would run its course unseen.
+    if old.is_none() && new.is_some() && !state.layer_dying.contains_key(&id) {
+        state
+            .layer_fades
+            .insert(id.clone(), crate::anim::SurfaceFade::map(Instant::now()));
+    }
     match new {
         Some(r) => {
             state.layer_rects.insert(id, r);
@@ -3492,7 +3614,14 @@ fn composite_one_monitor(
     //    `composite_and_send` guarantees it; the `try_unwrap` is the check).
     //  - the buffer is the right size. A resize marks full damage anyway.
     // Anything else falls back to the old full repaint, which is always safe.
+    // A layer fade (Sector 2) changes surface alpha every frame; repaint the
+    // whole output for its few frames instead of working out the rect.
+    let fading = state
+        .layer_fades
+        .values()
+        .any(|f| f.is_busy(std::time::Instant::now()));
     let unclipped_overlay = legacy_bar
+        || fading
         || state.osd.is_some()
         || (idx == active_idx
             && (show_help || launcher_present || power_menu_present || wallpaper_chooser_present));
@@ -3548,6 +3677,17 @@ fn composite_one_monitor(
             &[WlrLayer::Background, WlrLayer::Bottom],
             clip,
             &state.layer_fades,
+        );
+        blit_dying_layers(
+            back,
+            w,
+            h,
+            &state.surface_buffers,
+            idx,
+            &[WlrLayer::Background, WlrLayer::Bottom],
+            clip,
+            &state.layer_fades,
+            &state.layer_dying,
         );
     }
 
@@ -3663,6 +3803,17 @@ fn composite_one_monitor(
             &[WlrLayer::Top, WlrLayer::Overlay]
         };
         blit_layers_animated(back, w, h, &state.surface_buffers, out, upper, clip, &state.layer_fades);
+        blit_dying_layers(
+            back,
+            w,
+            h,
+            &state.surface_buffers,
+            idx,
+            upper,
+            clip,
+            &state.layer_fades,
+            &state.layer_dying,
+        );
     }
 
     // Cursor on top — only on the monitor the pointer is actually over.
@@ -6312,6 +6463,7 @@ pub fn run(
         surface_buffers: HashMap::new(),
         layer_rects: HashMap::new(),
         layer_fades: HashMap::new(),
+        layer_dying: HashMap::new(),
         loop_handle: None, // set right after the event loop is created
         cursor_status: CursorImageStatus::default_named(),
         focus_cache: None,
@@ -6642,6 +6794,11 @@ pub fn run(
             // Frame callbacks are fired inside composite_and_send after the frame is sent.
             wallpaper_tick(&mut data.state);
             media_tick(&mut data.state);
+            // Sector 2: advance layer map/unmap fades and drain finished ones.
+            // While any is running the tick stays at full rate (N11).
+            if layer_fade_tick(&mut data.state) {
+                busy = true;
+            }
             let t_pre_composite = tick_trace.then(std::time::Instant::now);
             composite_and_send(&mut data.state);
             let t_post_composite = tick_trace.then(std::time::Instant::now);
@@ -7052,5 +7209,53 @@ mod import_tests {
         assert_eq!(back[((2 * 16 + 2) * 4) as usize], 0, "tip clipped away");
         // Row 1 is "##": pixel (3,3) is inside the clip and white.
         assert_eq!(back[((3 * 16 + 3) * 4) as usize], 255);
+    }
+
+    fn solid(w: u32, h: u32, px: [u8; 4]) -> SurfaceBuf {
+        SurfaceBuf { rgba: px.repeat((w * h) as usize), w, h }
+    }
+
+    #[test]
+    fn global_alpha_one_is_the_plain_blit_and_zero_draws_nothing() {
+        let src = solid(2, 2, [200, 100, 50, 255]);
+        let full = Rect { x: 0, y: 0, w: 2, h: 2 };
+
+        let mut a = vec![10u8; 2 * 2 * 4];
+        let mut b = a.clone();
+        blit(&mut a, 2, 2, &src, 0, 0, full);
+        blit_with_global_alpha(&mut b, 2, 2, &src, 0, 0, full, 1.0);
+        assert_eq!(a, b);
+
+        let mut c = vec![10u8; 2 * 2 * 4];
+        blit_with_global_alpha(&mut c, 2, 2, &src, 0, 0, full, 0.0);
+        assert!(c.iter().all(|&v| v == 10), "alpha 0 leaves the back buffer alone");
+    }
+
+    #[test]
+    fn global_alpha_fades_between_the_back_buffer_and_the_surface() {
+        let src = solid(1, 1, [200, 200, 200, 255]);
+        let full = Rect { x: 0, y: 0, w: 1, h: 1 };
+        let mut last = 0u8;
+        for step in 1..=10 {
+            let mut back = vec![0u8, 0, 0, 255];
+            blit_with_global_alpha(&mut back, 1, 1, &src, 0, 0, full, step as f32 / 10.0);
+            assert!(back[0] >= last, "brighter as the fade-in progresses");
+            last = back[0];
+        }
+        // Halfway is roughly halfway (premultiplied scaling, integer maths).
+        let mut back = vec![0u8, 0, 0, 255];
+        blit_with_global_alpha(&mut back, 1, 1, &src, 0, 0, full, 0.5);
+        assert!((95..=105).contains(&back[0]), "got {}", back[0]);
+        assert_eq!(back[3], 255);
+    }
+
+    #[test]
+    fn global_alpha_respects_the_clip() {
+        let src = solid(4, 1, [255, 255, 255, 255]);
+        let mut back = vec![0u8; 4 * 4];
+        blit_with_global_alpha(&mut back, 4, 1, &src, 0, 0, Rect { x: 1, y: 0, w: 2, h: 1 }, 0.5);
+        assert_eq!(back[0], 0, "outside the clip");
+        assert!(back[4] > 0 && back[8] > 0, "inside the clip");
+        assert_eq!(back[12], 0, "outside the clip");
     }
 }

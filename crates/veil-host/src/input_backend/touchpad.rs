@@ -79,6 +79,11 @@ pub struct Touchpad {
     rem_y: f32,
     prev_t: Option<Instant>,
     speed: f32,
+    /// Disable-while-typing is in effect (set by the caller from `Dwt`).
+    blocked: bool,
+    /// The current touch began while typing: a resting palm. It is ignored
+    /// until the finger lifts, even after typing stops.
+    palm_touch: bool,
 }
 
 impl Touchpad {
@@ -105,7 +110,19 @@ impl Touchpad {
             rem_y: 0.0,
             prev_t: None,
             speed: 0.0,
+            blocked: false,
+            palm_touch: false,
         }
+    }
+
+    /// Whether the pad should ignore touches because the user is typing.
+    /// Call before feeding each batch of events. Motion, scrolling and taps
+    /// are dropped while blocked; a touch that *starts* while blocked stays
+    /// ignored until it lifts; a touch already in progress picks up again
+    /// where the finger is, without a jump, once typing stops. The physical
+    /// click is not the pad's business and still works.
+    pub fn set_blocked(&mut self, blocked: bool) {
+        self.blocked = blocked;
     }
 
     /// Forget any touch in progress (used when the session goes inactive).
@@ -140,6 +157,8 @@ impl Touchpad {
                     self.scroll_acc_mm = 0.0;
                     self.speed = 0.0;
                     self.last = None;
+                    // Landing while the user is typing: a resting palm.
+                    self.palm_touch = self.blocked;
                 } else {
                     let quick = self
                         .touch_started
@@ -148,10 +167,12 @@ impl Touchpad {
                         && quick
                         && self.peak_fingers == 1
                         && self.travelled_mm < TAP_MAX_TRAVEL_MM
+                        && !self.palm_touch
                     {
                         self.pending_tap = true;
                     }
                     self.touching = false;
+                    self.palm_touch = false;
                     self.last = None;
                 }
             }
@@ -196,6 +217,16 @@ impl Touchpad {
 
     /// `sync` with an explicit clock (tests).
     pub fn sync_at(&mut self, out: &mut Vec<Out>, now: Instant) {
+        if self.blocked || self.palm_touch {
+            // Typing (or a palm that landed while typing): emit nothing, and
+            // forget the finger position so motion resumes without a jump.
+            self.pending_tap = false;
+            self.last = None;
+            self.rem_x = 0.0;
+            self.rem_y = 0.0;
+            self.speed = 0.0;
+            return;
+        }
         if self.pending_tap {
             self.pending_tap = false;
             out.push(Out::Tap);
@@ -459,5 +490,119 @@ mod accel_tests {
         };
         let (slow, fast) = (run(2), run(25));
         assert!(fast > slow * 3, "slow={slow} fast={fast}");
+    }
+}
+
+#[cfg(test)]
+mod palm_tests {
+    use super::*;
+
+    fn pad() -> Touchpad {
+        Touchpad::new(10.0, 10.0)
+    }
+
+    fn frame(tp: &mut Touchpad, x: i32, y: i32) -> Vec<Out> {
+        tp.abs(ABS_X, x);
+        tp.abs(ABS_Y, y);
+        let mut out = Vec::new();
+        let now = tp.prev_t.map_or_else(Instant::now, |t| t + Duration::from_millis(8));
+        tp.sync_at(&mut out, now);
+        out
+    }
+
+    fn down(tp: &mut Touchpad, now: Instant) {
+        tp.key(BTN_TOUCH, true, now);
+        tp.key(BTN_TOOL_FINGER, true, now);
+    }
+
+    fn up(tp: &mut Touchpad, now: Instant) {
+        tp.key(BTN_TOUCH, false, now);
+        tp.key(BTN_TOOL_FINGER, false, now);
+    }
+
+    #[test]
+    fn a_blocked_pad_emits_nothing() {
+        let mut tp = pad();
+        let t = Instant::now();
+        tp.set_blocked(true);
+        down(&mut tp, t);
+        for i in 0..10 {
+            assert!(frame(&mut tp, 500 + i * 10, 500).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_palm_that_landed_during_typing_stays_ignored_after_typing_stops() {
+        let mut tp = pad();
+        let t = Instant::now();
+        tp.set_blocked(true);
+        down(&mut tp, t);
+        frame(&mut tp, 500, 500);
+        tp.set_blocked(false); // typing is over, the palm is still there
+        for i in 1..10 {
+            assert!(frame(&mut tp, 500 + i * 10, 500).is_empty(), "palm must stay ignored");
+        }
+        // Lifting it ends the palm; the next touch works normally.
+        up(&mut tp, t + Duration::from_millis(300));
+        down(&mut tp, t + Duration::from_millis(400));
+        frame(&mut tp, 100, 100);
+        assert!(matches!(frame(&mut tp, 110, 100).as_slice(), [Out::Motion(..)]));
+    }
+
+    #[test]
+    fn a_palm_touch_is_never_a_tap() {
+        let mut tp = pad();
+        let t = Instant::now();
+        tp.set_blocked(true);
+        down(&mut tp, t);
+        tp.set_blocked(false);
+        up(&mut tp, t + Duration::from_millis(60)); // quick, still: would tap
+        assert!(frame(&mut tp, 500, 500).is_empty());
+    }
+
+    #[test]
+    fn a_touch_already_in_progress_resumes_without_a_jump() {
+        let mut tp = pad();
+        let t = Instant::now();
+        down(&mut tp, t);
+        frame(&mut tp, 500, 500);
+        assert!(matches!(frame(&mut tp, 510, 500).as_slice(), [Out::Motion(..)]));
+
+        tp.set_blocked(true); // typing starts mid-touch
+        assert!(frame(&mut tp, 700, 500).is_empty());
+        assert!(frame(&mut tp, 900, 500).is_empty());
+        tp.set_blocked(false);
+        // First report after the block only re-seeds; the 40 mm the finger
+        // travelled meanwhile must not come out as one giant jump.
+        assert!(frame(&mut tp, 910, 500).is_empty());
+        match frame(&mut tp, 920, 500).as_slice() {
+            [Out::Motion(dx, _)] => assert!(*dx < 60, "dx={dx}"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tap_that_ends_during_typing_is_dropped() {
+        let mut tp = pad();
+        let t = Instant::now();
+        down(&mut tp, t);
+        frame(&mut tp, 500, 500);
+        tp.set_blocked(true);
+        up(&mut tp, t + Duration::from_millis(60));
+        assert!(frame(&mut tp, 500, 500).is_empty());
+        tp.set_blocked(false);
+        assert!(frame(&mut tp, 500, 500).is_empty(), "the tap must not appear late");
+    }
+
+    #[test]
+    fn taps_work_again_after_typing() {
+        let mut tp = pad();
+        let t = Instant::now();
+        tp.set_blocked(true);
+        tp.set_blocked(false);
+        down(&mut tp, t);
+        frame(&mut tp, 500, 500);
+        up(&mut tp, t + Duration::from_millis(60));
+        assert_eq!(frame(&mut tp, 500, 500), vec![Out::Tap]);
     }
 }

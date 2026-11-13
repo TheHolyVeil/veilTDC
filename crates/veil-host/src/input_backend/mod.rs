@@ -16,6 +16,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 mod crossterm_input;
+mod dwt;
 mod evdev_input;
 mod touchpad;
 mod touchscreen;
