@@ -32,6 +32,19 @@ pub const FADE_MS: u64 = 120;
 /// Workspace slide duration.
 pub const SLIDE_MS: u64 = 180;
 
+/// Window open (fade in + small rise) duration.
+pub const WINDOW_OPEN_MS: u64 = 200;
+
+/// How far below its place a window starts when it opens, in pixels.
+pub const OPEN_SLIDE_PX: i32 = 12;
+
+/// Vertical offset of an opening window for its current opacity: the full
+/// `OPEN_SLIDE_PX` while invisible, none once fully shown. Derived from the
+/// fade itself, so the rise and the fade always stay in step.
+pub fn open_slide_offset(alpha: f32) -> i32 {
+    ((1.0 - alpha.clamp(0.0, 1.0)) * OPEN_SLIDE_PX as f32).round() as i32
+}
+
 /// Focus-border colour-fade duration.
 pub const FOCUS_FADE_MS: u64 = 150;
 
@@ -191,10 +204,21 @@ pub struct SurfaceFade {
 impl SurfaceFade {
     /// Start a fresh map fade (0 → 1).
     pub fn map(now: Instant) -> Self {
+        Self::map_for(now, Duration::from_millis(FADE_MS))
+    }
+
+    /// Start a map fade (0 → 1) of a given length.
+    pub fn map_for(now: Instant, duration: Duration) -> Self {
         let mut alpha = AnimProp::immediate(0.0);
-        alpha.start(0.0, 1.0, Duration::from_millis(FADE_MS));
+        alpha.start(0.0, 1.0, duration);
         alpha.started = Some(now);
         Self { alpha, unmapping: false }
+    }
+
+    /// A surface that is fully shown and not animating, as the start of an
+    /// unmap fade for one that never had a map fade (or whose has finished).
+    pub fn shown() -> Self {
+        Self { alpha: AnimProp::immediate(1.0), unmapping: false }
     }
 
     /// Begin an unmap fade from the current opacity down to 0.
@@ -258,6 +282,17 @@ impl WorkspaceSlide {
     pub fn current_offset(&self, now: Instant) -> i32 {
         self.offset.value(now)
     }
+}
+
+/// Horizontal displacement of the incoming and the outgoing workspace while a
+/// slide runs, as `(incoming, outgoing)`. `incoming` is the animated offset
+/// (it starts at `direction * width` and ends at 0). The outgoing workspace
+/// is always exactly one screen width behind it, so the two move as one
+/// strip: when the incoming one is a full width away the outgoing one is in
+/// place, and once the incoming one has arrived the outgoing one is a full
+/// width off the other side.
+pub fn slide_offsets(incoming: i32, direction: i32, width: i32) -> (i32, i32) {
+    (incoming, incoming - direction * width)
 }
 
 // ── Focus-colour fade ────────────────────────────────────────────────────────
@@ -327,6 +362,50 @@ mod tests {
     fn lerp_i32_midpoint() {
         // 0 → 100 at t=0.5 → 50
         assert_eq!(i32::lerp(0, 100, 0.5), 50);
+    }
+
+    #[test]
+    fn open_slide_follows_the_fade() {
+        assert_eq!(open_slide_offset(0.0), OPEN_SLIDE_PX);
+        assert_eq!(open_slide_offset(1.0), 0);
+        assert_eq!(open_slide_offset(0.5), OPEN_SLIDE_PX / 2);
+        // Out-of-range alpha never pushes a window further than its start
+        // point or past its place.
+        assert_eq!(open_slide_offset(-3.0), OPEN_SLIDE_PX);
+        assert_eq!(open_slide_offset(7.0), 0);
+        // Monotonic: the window only ever rises.
+        let mut last = i32::MAX;
+        for step in 0..=20 {
+            let o = open_slide_offset(step as f32 / 20.0);
+            assert!(o <= last);
+            last = o;
+        }
+    }
+
+    #[test]
+    fn a_shown_surface_unmaps_to_gone() {
+        let t = Instant::now();
+        let mut f = SurfaceFade::shown();
+        assert!(!f.is_busy(t) && !f.is_gone(t));
+        assert_eq!(f.alpha.value(t), 1.0);
+        f.begin_unmap(t);
+        let mid = t + Duration::from_millis(FADE_MS / 2);
+        assert!(f.is_busy(mid) && !f.is_gone(mid));
+        assert!(f.alpha.value(mid) < 1.0 && f.alpha.value(mid) > 0.0);
+        let end = t + Duration::from_millis(FADE_MS + 1);
+        assert!(f.is_gone(end));
+        assert_eq!(f.alpha.value(end), 0.0);
+    }
+
+    #[test]
+    fn map_for_runs_for_its_own_duration() {
+        let t = Instant::now();
+        let f = SurfaceFade::map_for(t, Duration::from_millis(WINDOW_OPEN_MS));
+        assert!(f.is_busy(t + Duration::from_millis(WINDOW_OPEN_MS - 1)));
+        assert!(!f.is_busy(t + Duration::from_millis(WINDOW_OPEN_MS)));
+        assert_eq!(f.alpha.value(t), 0.0);
+        assert_eq!(f.alpha.value(t + Duration::from_millis(WINDOW_OPEN_MS)), 1.0);
+        assert!(!f.unmapping);
     }
 
     #[test]
@@ -460,6 +539,26 @@ mod tests {
     }
 
     // ── FocusColorFade ──────────────────────────────────────────────────────
+
+    #[test]
+    fn slide_offsets_move_as_one_strip() {
+        let w = 1920;
+        // Going right: the new workspace starts a screen to the right...
+        assert_eq!(slide_offsets(w, 1, w), (w, 0));
+        // ...halfway, the old one has gone half a screen left...
+        assert_eq!(slide_offsets(w / 2, 1, w), (w / 2, -w / 2));
+        // ...and on arrival the old one is a full screen off to the left.
+        assert_eq!(slide_offsets(0, 1, w), (0, -w));
+        // Going left mirrors it.
+        assert_eq!(slide_offsets(-w, -1, w), (-w, 0));
+        assert_eq!(slide_offsets(0, -1, w), (0, w));
+        // The gap between the two never changes.
+        for inc in [-1920, -700, 0, 300, 1920] {
+            let dir = if inc >= 0 { 1 } else { -1 };
+            let (i, o) = slide_offsets(inc, dir, w);
+            assert_eq!(i - o, dir * w);
+        }
+    }
 
     #[test]
     fn focus_fade_immediate_returns_color() {

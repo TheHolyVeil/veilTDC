@@ -291,6 +291,24 @@ pub struct Monitor {
     /// field doc on the old flat `State.prev_frame` — same reclaim trick,
     /// now one slot per monitor since each sends its own Frame.
     pub prev_frame: Option<Arc<Vec<u8>>>,
+    /// A workspace switch sliding in (Sector 4); `None` when idle.
+    pub ws_slide: Option<WsSlide>,
+}
+
+/// A workspace switch in progress on one monitor: the workspace being
+/// entered slides in while the one being left slides out. The layout is
+/// recomputed for the new workspace at the switch, so what was on screen is
+/// saved here to keep drawing the old windows where they were.
+pub struct WsSlide {
+    pub anim: crate::anim::WorkspaceSlide,
+    /// The workspace being left.
+    pub from_ws: u8,
+    /// Where its windows were tiled, in live-window order.
+    pub from_rects: Vec<Rect>,
+    /// Which of them had focus (index into `from_rects`).
+    pub from_focused: usize,
+    /// +1 when the new workspace comes in from the right, -1 from the left.
+    pub dir: i32,
 }
 
 impl Monitor {
@@ -319,6 +337,7 @@ impl Monitor {
             damage: None,
             last_composite: None,
             prev_frame: None,
+            ws_slide: None,
         }
     }
 }
@@ -333,6 +352,21 @@ pub struct DyingLayer {
     pub layer: WlrLayer,
     /// Where its buffer was last drawn, in output pixels.
     pub rect: Rect,
+}
+
+/// How a toplevel was last drawn (Sector 5): kept up to date by every
+/// composite while the window is on screen, so that if it is closed there is
+/// still something to fade out. See `State::window_last`.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowSnap {
+    /// Output it was drawn on.
+    pub monitor: usize,
+    /// Its tiled rect (the border goes just outside it).
+    pub rect: Rect,
+    /// The surface's geometry origin: the buffer is drawn at `rect - origin`.
+    pub origin: (i32, i32),
+    /// The border colour it had.
+    pub border: [u8; 4],
 }
 
 pub struct State {
@@ -466,6 +500,10 @@ pub struct State {
     /// `osd = { ... }` — see `veil_config::OsdConfig`. (`osd` below is the
     /// built-in fallback OSD.)
     pub osd_cfg: veil_config::OsdConfig,
+    /// `blur = { ... }` — see `veil_config::BlurConfig`.
+    pub blur_cfg: veil_config::BlurConfig,
+    /// Work buffers for the blur pass, reused every frame.
+    pub blur_scratch: crate::blur::BlurScratch,
     /// `veil shell osd` has been started for this session.
     pub osd_started: bool,
     /// Open the launcher once the session is up (`veil-host start`, no app to
@@ -515,6 +553,24 @@ pub struct State {
     /// for z-order, where they were) is kept here, next to the buffer that
     /// `surface_buffers` holds for them until `layer_fade_tick` drains them.
     pub layer_dying: HashMap<ObjectId, DyingLayer>,
+    /// Open fades of toplevels (fade in + small rise), keyed by the window's
+    /// root surface id. An entry lives only while the fade runs.
+    pub window_fades: HashMap<ObjectId, crate::anim::SurfaceFade>,
+    /// Focus-border colour fades, keyed like `window_fades`. The border colour
+    /// a window should have is worked out each composite; when it differs
+    /// from where the fade is heading, a fade to the new colour starts.
+    pub border_fades: HashMap<ObjectId, crate::anim::FocusColorFade>,
+    /// A window animation was running at the last tick, so a final frame is
+    /// owed once they settle.
+    pub win_anim_was_busy: bool,
+    /// How each toplevel visible at its monitor's last composite was drawn
+    /// (keyed by root surface id). A window that disappears from here without
+    /// the compositor having closed it on purpose has nothing left to show.
+    pub window_last: HashMap<ObjectId, WindowSnap>,
+    /// Windows that were closed and are fading out: what they looked like,
+    /// kept until `window_anim_tick` drains them. Their last buffer stays in
+    /// `surface_buffers` and their fade (unmapping) in `window_fades`.
+    pub window_dying: HashMap<ObjectId, WindowSnap>,
     /// Handle to the main calloop loop, set once the loop exists. The
     /// pre-commit hook in `new_surface` needs it to register an explicit-sync
     /// acquire-point source (S4); `None` before startup finishes, in which
@@ -699,7 +755,10 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        self.background_effect.commit(surface);
+        if self.background_effect.commit(surface) {
+            // The blur region moved or changed: what is under it repaints.
+            mark_dirty_full(self);
+        }
         // Layer-shell surfaces (the bar etc.): arrange, initial configure,
         // exclusive-zone retile. Their buffers still go through the normal
         // cache below like any other surface.
@@ -812,6 +871,17 @@ impl CompositorHandler for State {
                         .insert(surface.id(), SurfaceBuf { rgba: dest, w, h });
                     match toplevel_rect_for(self, surface) {
                         Some((m, r)) => {
+                            // Sector 3: a toplevel's first buffer opens it with
+                            // a fade and a small rise.
+                            if old_size.is_none() {
+                                self.window_fades.insert(
+                                    surface.id(),
+                                    crate::anim::SurfaceFade::map_for(
+                                        Instant::now(),
+                                        std::time::Duration::from_millis(crate::anim::WINDOW_OPEN_MS),
+                                    ),
+                                );
+                            }
                             let d = surface_damage(r, surface, &[old_size, Some((w, h))]);
                             mark_dirty_rect(self, m, d)
                         }
@@ -933,7 +1003,15 @@ impl CompositorHandler for State {
             // (and repaints the spot) when the fade ends.
             return;
         }
+        // Sector 5: a window that was on screen fades out instead of
+        // vanishing. Its buffer is kept for the fade; `window_anim_tick`
+        // drops it at the end.
+        if begin_window_close(self, &id) {
+            return;
+        }
         self.layer_fades.remove(&id);
+        self.window_fades.remove(&id);
+        self.border_fades.remove(&id);
         if let Some(old) = self.surface_buffers.remove(&surface.id()) {
             match toplevel_rect_for(self, surface) {
                 Some((m, r)) => {
@@ -1907,6 +1985,7 @@ fn blit_layers_animated(
     layers: &[WlrLayer],
     clip: Rect,
     fades: &HashMap<ObjectId, crate::anim::SurfaceFade>,
+    mut blur: Option<&mut BlurCtx>,
 ) {
     let now = std::time::Instant::now();
     let map = layer_map_for_output(output);
@@ -1920,9 +1999,86 @@ fn blit_layers_animated(
                 .get(&id)
                 .map(|f| f.alpha.value(now))
                 .unwrap_or(1.0);
+                if let Some(b) = blur.as_deref_mut().filter(|b| b.cfg.layer_allowed(ls.namespace())) {
+                blur_behind(back, w, h, b, ls.wl_surface(), (g.loc.x, g.loc.y), layer_bounds(cache, ls.wl_surface(), (g.loc.x, g.loc.y)), clip, alpha);
+            }
             blit_with_global_alpha_subtree(back, w, h, cache, ls.wl_surface(), (g.loc.x, g.loc.y), clip, alpha);
         }
     }
+}
+
+/// What the compositor needs to blur behind a surface while compositing.
+struct BlurCtx<'a> {
+    cfg: &'a veil_config::BlurConfig,
+    effects: &'a crate::background_effect::BackgroundEffectState,
+    scratch: &'a mut crate::blur::BlurScratch,
+}
+
+/// Where a layer surface is drawn: its place in the layer map plus the size of
+/// its buffer. (`layer_geometry`'s own size is empty here, and the requested
+/// size is 0 on a stretched axis, so the buffer is the one reliable size.)
+fn layer_bounds(cache: &HashMap<ObjectId, SurfaceBuf>, surface: &WlSurface, loc: (i32, i32)) -> Rect {
+    let (w, h) = cache.get(&surface.id()).map_or((0, 0), |b| (b.w, b.h));
+    Rect { x: loc.0, y: loc.1, w, h }
+}
+
+/// Blur the pixels under `surface`'s blur region before it is drawn.
+/// `origin` is where the surface's (0,0) lands; `bounds` keeps the blur inside
+/// the surface's own slot; `strength` follows a fade.
+#[allow(clippy::too_many_arguments)]
+fn blur_behind(
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+    ctx: &mut BlurCtx,
+    surface: &WlSurface,
+    origin: (i32, i32),
+    bounds: Rect,
+    clip: Rect,
+    strength: f32,
+) {
+    for r in ctx.effects.rects_in(surface, origin, bounds, w, h) {
+        crate::blur::blur_rect(back, w, h, r, clip, ctx.cfg.radius, strength, ctx.scratch);
+    }
+}
+
+/// Every output-space rect on monitor `idx` that will be blurred. Computed
+/// before drawing so damage can grow to cover them (`expand_damage`). It is
+/// deliberately generous (layers hidden by a fullscreen window still count):
+/// a bigger repaint is always safe, a smaller one is not.
+fn blur_footprints(state: &State, idx: usize) -> Vec<Rect> {
+    let cfg = &state.blur_cfg;
+    if !cfg.enabled {
+        return Vec::new();
+    }
+    let m = &state.monitors[idx];
+    let (w, h) = (m.output_w, m.output_h);
+    let fx = &state.background_effect;
+    let mut out = Vec::new();
+    if let Some(output) = state.layer_outputs.get(idx) {
+        let map = layer_map_for_output(output);
+        for ls in map.layers() {
+            if !cfg.layer_allowed(ls.namespace()) {
+                continue;
+            }
+            let Some(g) = map.layer_geometry(ls) else { continue };
+            out.extend(fx.rects_in(ls.wl_surface(), (g.loc.x, g.loc.y), layer_bounds(&state.surface_buffers, ls.wl_surface(), (g.loc.x, g.loc.y)), w, h));
+        }
+    }
+    if cfg.windows {
+        let surfs = state
+            .toplevels
+            .iter()
+            .filter(|t| t.alive() && t.monitor == idx && t.workspace == m.active_workspace)
+            .map(|t| t.wl_surface());
+        for (i, surf) in surfs.enumerate() {
+            let Some(surf) = surf else { continue };
+            let r = m.layout_rects.get(i).copied().unwrap_or(Rect { x: 0, y: 0, w, h });
+            let (gx, gy) = geometry_origin(&surf);
+            out.extend(fx.rects_in(&surf, (r.x - gx, r.y - gy), r, w, h));
+        }
+    }
+    out
 }
 
 /// Blit a surface tree with a global alpha. Wraps `blit_subtree` for the
@@ -2030,6 +2186,62 @@ fn layer_fade_tick(state: &mut State) -> bool {
         mark_dirty_full(state);
     }
     changed || animating
+}
+
+/// Once per tick, before compositing: advance window open fades and
+/// focus-border colour fades (Sector 3). Returns true while there is anything
+/// animating, or when one just settled, so the tick stays at full rate and a
+/// final frame lands on the exact end state.
+///  - A finished open fade is dropped (no entry means fully shown).
+///  - While anything runs the screen is kept dirty so every tick draws the
+///    next step. Border fades start inside `composite_one_monitor` when it
+///    sees a window's colour target change, and are picked up here from the
+///    next tick on.
+fn window_anim_tick(state: &mut State) -> bool {
+    let now = Instant::now();
+    // Sector 5: a closed window whose fade-out has finished is removed for
+    // good: its buffer, snapshot and fade. The spot is repainted below.
+    let gone: Vec<ObjectId> = state
+        .window_fades
+        .iter()
+        .filter(|(_, f)| f.is_gone(now))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &gone {
+        state.window_dying.remove(id);
+        state.surface_buffers.remove(id);
+        state.border_fades.remove(id);
+        state.window_last.remove(id);
+    }
+    let before = state.window_fades.len();
+    state.window_fades.retain(|_, f| f.is_busy(now));
+    let mut dropped = state.window_fades.len() != before;
+
+    // Workspace slides (Sector 4): a finished one is cleared, and one more
+    // frame is queued so the new workspace lands exactly in place.
+    let mut sliding = false;
+    for m in state.monitors.iter_mut() {
+        match &m.ws_slide {
+            Some(s) if s.anim.is_busy(now) => sliding = true,
+            Some(_) => {
+                m.ws_slide = None;
+                dropped = true;
+            }
+            None => {}
+        }
+    }
+
+    let busy = sliding
+        || state.window_fades.values().any(|f| f.is_busy(now))
+        || state.border_fades.values().any(|f| f.is_busy(now));
+    let settled = state.win_anim_was_busy && !busy;
+    state.win_anim_was_busy = busy;
+
+    let active = busy || settled || dropped;
+    if active {
+        mark_dirty_full(state);
+    }
+    active
 }
 
 // drm_syncobj's manager/surface/timeline dispatch — smithay 0.7.0 uses the
@@ -2644,6 +2856,10 @@ pub fn reload_config(state: &mut State) {
     if state.osd_started && !new_cfg.osd.shell {
         tracing::info!("osd.shell = false: the running OSD stays until the session ends");
     }
+    if state.blur_cfg != new_cfg.blur {
+        mark_dirty_full(state);
+    }
+    state.blur_cfg = new_cfg.blur;
     state.osd_cfg = new_cfg.osd;
     state.notify = new_cfg.notify;
     state.bar = new_cfg.bar;
@@ -2840,9 +3056,33 @@ fn dispatch_action(state: &mut State, action: veil_config::Action) {
                 // unrelated, each monitor has its own 9-slot array.
                 let cur_ws = state.monitors[idx].active_workspace;
                 let cur_layout = state.monitors[idx].layout;
+                // Sector 4: save what is on screen so the workspace we leave
+                // can slide out (the layout is recomputed for the new one
+                // below). A fullscreen window is not slid: it switches at once.
+                let slide_from = if state.monitors[idx].fullscreen.is_none() {
+                    Some((
+                        state.monitors[idx].layout_rects.clone(),
+                        cur_layout.focused,
+                    ))
+                } else {
+                    None
+                };
                 state.monitors[idx].workspace_layouts[cur_ws as usize] = cur_layout;
                 state.monitors[idx].layout = state.monitors[idx].workspace_layouts[target as usize];
                 state.monitors[idx].active_workspace = target;
+                if let Some((from_rects, from_focused)) = slide_from {
+                    let dir = if target > cur_ws { 1 } else { -1 };
+                    let width = state.monitors[idx].output_w as i32;
+                    let mut anim = crate::anim::WorkspaceSlide::idle();
+                    anim.start(dir * width, Instant::now());
+                    state.monitors[idx].ws_slide = Some(WsSlide {
+                        anim,
+                        from_ws: cur_ws,
+                        from_rects,
+                        from_focused,
+                        dir,
+                    });
+                }
                 state.show_osd(
                     format!("WORKSPACE {}", target + 1),
                     "",
@@ -3359,7 +3599,42 @@ fn relayout_monitor(state: &mut State, idx: usize) {
 /// Border strips just OUTSIDE `r` (never over window content, so translucent
 /// windows don't tint). Each strip is clipped to `clip`, so a border outside
 /// the frame's damage is left exactly as the previous frame drew it.
+#[cfg(test)]
 fn draw_border(back: &mut [u8], w: u32, h: u32, r: Rect, t: u32, c: [u8; 4], clip: Rect) {
+    draw_border_alpha(back, w, h, r, t, c, clip, 1.0);
+}
+
+/// Blend `c` over the pixels of `r` at `alpha` (`r` already inside the
+/// `w`-wide buffer). At 1.0 it is a plain fill.
+fn blend_rect(back: &mut [u8], w: u32, r: Rect, c: [u8; 4], alpha: f32) {
+    if r.is_empty() {
+        return;
+    }
+    let a = (alpha.clamp(0.0, 1.0) * 256.0) as u32; // 0..=256
+    let (stride, rw) = (w as usize * 4, r.w as usize * 4);
+    for y in r.y as usize..(r.y + r.h as i32) as usize {
+        let row = &mut back[y * stride + r.x as usize * 4..][..rw];
+        for px in row.as_chunks_mut::<4>().0 {
+            for k in 0..3 {
+                px[k] = ((c[k] as u32 * a + px[k] as u32 * (256 - a)) >> 8) as u8;
+            }
+            px[3] = 255;
+        }
+    }
+}
+
+/// `draw_border` at a given opacity, for a window that is fading in.
+#[allow(clippy::too_many_arguments)]
+fn draw_border_alpha(
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+    r: Rect,
+    t: u32,
+    c: [u8; 4],
+    clip: Rect,
+    alpha: f32,
+) {
     use crate::font5x7::fill_rect;
     let ti = t as i32;
     if r.x + r.w as i32 + ti <= 0
@@ -3378,8 +3653,13 @@ fn draw_border(back: &mut [u8], w: u32, h: u32, r: Rect, t: u32, c: [u8; 4], cli
     ];
     for s in strips {
         let s = s.intersect(&clip);
-        if !s.is_empty() {
+        if s.is_empty() {
+            continue;
+        }
+        if alpha >= 1.0 {
             fill_rect(back, w, h, s.x, s.y, s.w, s.h, c);
+        } else {
+            blend_rect(back, w, s, c, alpha);
         }
     }
 }
@@ -3505,6 +3785,72 @@ fn surface_damage(tile: Rect, surface: &WlSurface, sizes: &[Option<(u32, u32)>])
     })
 }
 
+/// Draw windows that were closed and are fading out, on monitor `idx`: the
+/// last buffer where it was last drawn, sinking a little as it fades (the
+/// mirror of the open rise), with its border fading along. Only the root
+/// buffer is drawn; a popup or subsurface of a closed window is not.
+#[allow(clippy::too_many_arguments)]
+fn blit_dying_windows(
+    back: &mut [u8],
+    w: u32,
+    h: u32,
+    cache: &HashMap<ObjectId, SurfaceBuf>,
+    idx: usize,
+    clip: Rect,
+    fades: &HashMap<ObjectId, crate::anim::SurfaceFade>,
+    dying: &HashMap<ObjectId, WindowSnap>,
+) {
+    let now = std::time::Instant::now();
+    for (id, d) in dying {
+        if d.monitor != idx {
+            continue;
+        }
+        let (Some(fade), Some(buf)) = (fades.get(id), cache.get(id)) else {
+            continue;
+        };
+        let alpha = fade.alpha.value(now);
+        let dy = crate::anim::open_slide_offset(alpha);
+        draw_border_alpha(back, w, h, Rect { y: d.rect.y + dy, ..d.rect }, BORDER, d.border, clip, alpha);
+        blit_with_global_alpha(
+            back,
+            w,
+            h,
+            buf,
+            d.rect.x - d.origin.0,
+            d.rect.y - d.origin.1 + dy,
+            clip,
+            alpha,
+        );
+    }
+}
+
+/// A toplevel's wl_surface is being destroyed. If the window was on screen
+/// (`window_last` has how it looked) start a close fade: keep its last
+/// buffer, and turn its snapshot into a dying window. Returns true when a
+/// fade started; the caller then leaves the buffer alone, and
+/// `window_anim_tick` removes everything when the fade ends.
+fn begin_window_close(state: &mut State, id: &ObjectId) -> bool {
+    if !state.surface_buffers.contains_key(id) {
+        return false;
+    }
+    let Some(snap) = state.window_last.remove(id) else {
+        return false;
+    };
+    let now = Instant::now();
+    // From wherever an open fade has got to, or from fully shown.
+    let mut fade = state
+        .window_fades
+        .remove(id)
+        .unwrap_or_else(crate::anim::SurfaceFade::shown);
+    fade.begin_unmap(now);
+    state.window_fades.insert(id.clone(), fade);
+    // The border keeps the colour it was drawn with, so its fade is not needed.
+    state.border_fades.remove(id);
+    state.window_dying.insert(id.clone(), snap);
+    mark_dirty_full(state);
+    true
+}
+
 /// Where a layer surface's buffer is drawn, in output pixels: the arranged
 /// geometry's origin (the one `blit_layers` uses) with the buffer's own size.
 fn layer_surface_rect(
@@ -3576,6 +3922,8 @@ fn composite_one_monitor(
     // Decided before `m` below borrows state.monitors: whole-state reads
     // (layer maps) can't overlap that borrow.
     let legacy_bar = legacy_bar_visible(state, idx);
+    // Output-space rectangles that will be blurred this frame (phase 6c).
+    let blur_fp = blur_footprints(state, idx);
     // One `&mut Monitor` borrow, reused for every monitor-scoped field
     // access below via `m.field` — NOT re-indexing `state.monitors[idx]`
     // repeatedly, which the borrow checker can't prove disjoint across
@@ -3599,6 +3947,11 @@ fn composite_one_monitor(
         .take()
         .unwrap_or(Rect { x: 0, y: 0, w, h })
         .clamp_to(w, h);
+    // A blur reads the pixels around the ones that changed, so any damage
+    // that touches a blurred area repaints all of it (see `expand_damage`).
+    if !blur_fp.is_empty() {
+        frame_damage = crate::blur::expand_damage(frame_damage, &blur_fp).clamp_to(w, h);
+    }
 
     let needed = (w as usize) * (h as usize) * 4;
 
@@ -3614,12 +3967,13 @@ fn composite_one_monitor(
     //    `composite_and_send` guarantees it; the `try_unwrap` is the check).
     //  - the buffer is the right size. A resize marks full damage anyway.
     // Anything else falls back to the old full repaint, which is always safe.
-    // A layer fade (Sector 2) changes surface alpha every frame; repaint the
-    // whole output for its few frames instead of working out the rect.
-    let fading = state
-        .layer_fades
-        .values()
-        .any(|f| f.is_busy(std::time::Instant::now()));
+    // A layer or window fade (Sectors 2-3) changes pixels outside any rect we
+    // could cheaply work out; repaint the whole output for its few frames.
+    let fade_now = std::time::Instant::now();
+    let fading = state.layer_fades.values().any(|f| f.is_busy(fade_now))
+        || state.window_fades.values().any(|f| f.is_busy(fade_now))
+        || state.border_fades.values().any(|f| f.is_busy(fade_now))
+        || m.ws_slide.as_ref().is_some_and(|s| s.anim.is_busy(fade_now));
     let unclipped_overlay = legacy_bar
         || fading
         || state.osd.is_some()
@@ -3665,6 +4019,12 @@ fn composite_one_monitor(
 
     let ws = m.active_workspace;
     let back = &mut m.composite_buf;
+    // Blur behind surfaces that asked for it (phase 6c); `None` = switched off.
+    let mut blur = state.blur_cfg.enabled.then_some(BlurCtx {
+        cfg: &state.blur_cfg,
+        effects: &state.background_effect,
+        scratch: &mut state.blur_scratch,
+    });
 
     // Layer-shell Background + Bottom sit under every window.
     if let Some(out) = state.layer_outputs.get(idx) {
@@ -3677,6 +4037,7 @@ fn composite_one_monitor(
             &[WlrLayer::Background, WlrLayer::Bottom],
             clip,
             &state.layer_fades,
+            blur.as_mut(),
         );
         blit_dying_layers(
             back,
@@ -3705,23 +4066,43 @@ fn composite_one_monitor(
         .filter(|t| t.alive() && t.monitor == idx && t.workspace == ws)
         .map(|t| t.wl_surface())
         .collect();
-    for (i, surf_opt) in toplevels.iter().enumerate() {
-        let Some(surf) = surf_opt else { continue };
-        let r = m
-            .layout_rects
-            .get(i)
-            .copied()
-            .unwrap_or(Rect { x: 0, y: 0, w, h });
-        if m.fullscreen.is_none() {
-            let color = if i == m.layout.focused {
-                state.theme.accent
+    let anim_now = std::time::Instant::now();
+
+    // Sector 4: during a workspace slide the incoming workspace's windows are
+    // drawn `in_dx` to the side of their place, and the workspace being left
+    // is drawn from what was saved when the switch happened, `out_dx` aside.
+    let slide = m.ws_slide.as_ref().filter(|s| s.anim.is_busy(anim_now));
+    let (in_dx, out_dx) = slide.map_or((0, 0), |s| {
+        crate::anim::slide_offsets(s.anim.current_offset(anim_now), s.dir, w as i32)
+    });
+    let outgoing: Vec<(WlSurface, Rect, bool)> = match slide {
+        Some(s) => {
+            let surfs: Vec<Option<WlSurface>> = state
+                .toplevels
+                .iter()
+                .filter(|t| t.alive() && t.monitor == idx && t.workspace == s.from_ws)
+                .map(|t| t.wl_surface())
+                .collect();
+            // If windows came or went since the switch, the saved rects no
+            // longer line up with them; skip the outgoing side then.
+            if surfs.len() == s.from_rects.len() {
+                surfs
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, sf)| sf.map(|sf| (sf, s.from_rects[i], i == s.from_focused)))
+                    .collect()
             } else {
-                state.theme.text_dim
-            };
-            draw_border(back, w, h, r, BORDER, color, clip);
+                Vec::new()
+            }
         }
+        None => Vec::new(),
+    };
+    for (surf, r, focused) in &outgoing {
+        let color = if *focused { state.theme.accent } else { state.theme.text_dim };
+        let rr = Rect { x: r.x + out_dx, ..*r };
+        draw_border_alpha(back, w, h, rr, BORDER, color, clip, 1.0);
         let (gx, gy) = geometry_origin(surf);
-        blit_subtree(back, w, h, &state.surface_buffers, surf, (r.x - gx, r.y - gy), clip);
+        blit_subtree(back, w, h, &state.surface_buffers, surf, (rr.x - gx, rr.y - gy), clip);
         for (popup, off) in PopupManager::popups_for_surface(surf) {
             let ps = popup.wl_surface().clone();
             blit_subtree(
@@ -3730,11 +4111,111 @@ fn composite_one_monitor(
                 h,
                 &state.surface_buffers,
                 &ps,
-                (r.x + off.x, r.y + off.y),
+                (rr.x + off.x, rr.y + off.y),
                 clip,
             );
         }
     }
+    let mut seen: Vec<ObjectId> = Vec::new();
+    for (i, surf_opt) in toplevels.iter().enumerate() {
+        let Some(surf) = surf_opt else { continue };
+        let r = m
+            .layout_rects
+            .get(i)
+            .copied()
+            .unwrap_or(Rect { x: 0, y: 0, w, h });
+        let sid = surf.id();
+        // Sector 3: a window that is opening fades in and rises into place;
+        // the rise is derived from the fade so they stay in step.
+        let open_alpha = state
+            .window_fades
+            .get(&sid)
+            .map_or(1.0, |f| f.alpha.value(anim_now));
+        let dy = crate::anim::open_slide_offset(open_alpha);
+        let (gx, gy) = geometry_origin(surf);
+        if m.fullscreen.is_none() {
+            let target = if i == m.layout.focused {
+                state.theme.accent
+            } else {
+                state.theme.text_dim
+            };
+            // The border colour eases to a new target when focus (or the
+            // theme) changes, instead of snapping.
+            let color = match state.border_fades.entry(sid.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    let f = e.into_mut();
+                    if f.color.to != target {
+                        f.fade_to(target, anim_now);
+                    }
+                    f.value(anim_now)
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(crate::anim::FocusColorFade::immediate(target));
+                    target
+                }
+            };
+            draw_border_alpha(
+                back,
+                w,
+                h,
+                Rect { x: r.x + in_dx, y: r.y + dy, ..r },
+                BORDER,
+                color,
+                clip,
+                open_alpha,
+            );
+            // Remember how it looks, for a close fade (Sector 5).
+            state.window_last.insert(
+                sid.clone(),
+                WindowSnap { monitor: idx, rect: r, origin: (gx, gy), border: color },
+            );
+            seen.push(sid.clone());
+        }
+        // Blur what is already composited under this window (translucent
+        // terminals), before the window itself goes on top.
+        if let Some(b) = blur.as_mut().filter(|b| b.cfg.windows) {
+            blur_behind(
+                back,
+                w,
+                h,
+                b,
+                surf,
+                (r.x - gx + in_dx, r.y - gy + dy),
+                Rect { x: r.x + in_dx, y: r.y + dy, ..r },
+                clip,
+                open_alpha,
+            );
+        }
+        blit_with_global_alpha_subtree(
+            back,
+            w,
+            h,
+            &state.surface_buffers,
+            surf,
+            (r.x - gx + in_dx, r.y - gy + dy),
+            clip,
+            open_alpha,
+        );
+        for (popup, off) in PopupManager::popups_for_surface(surf) {
+            let ps = popup.wl_surface().clone();
+            blit_with_global_alpha_subtree(
+                back,
+                w,
+                h,
+                &state.surface_buffers,
+                &ps,
+                (r.x + off.x + in_dx, r.y + off.y + dy),
+                clip,
+                open_alpha,
+            );
+        }
+    }
+
+    // Forget windows of this monitor that were not on screen this pass (closed,
+    // or on another workspace): only what was really visible gets a close fade.
+    state
+        .window_last
+        .retain(|id, s| s.monitor != idx || seen.contains(id));
 
     // Fullscreen window repaints last among tiled content, regardless of its
     // position in the loop above — other windows keep their normal (real,
@@ -3757,13 +4238,27 @@ fn composite_one_monitor(
             .find(|t| t.wl_surface().as_ref() == Some(fs))
             .and_then(|t| t.wl_surface())
         {
-            blit_subtree(back, w, h, &state.surface_buffers, &surf, (0, 0), clip);
+            blit_subtree(back, w, h, &state.surface_buffers, &surf, (in_dx, 0), clip);
             for (popup, off) in PopupManager::popups_for_surface(&surf) {
                 let ps = popup.wl_surface().clone();
-                blit_subtree(back, w, h, &state.surface_buffers, &ps, (off.x, off.y), clip);
+                blit_subtree(back, w, h, &state.surface_buffers, &ps, (off.x + in_dx, off.y), clip);
             }
         }
     }
+
+    // Sector 5: windows that were just closed fade out over what is left. The
+    // survivors have already been re-tiled into the freed space, so the ghost
+    // goes on top of them rather than under.
+    blit_dying_windows(
+        back,
+        w,
+        h,
+        &state.surface_buffers,
+        idx,
+        clip,
+        &state.window_fades,
+        &state.window_dying,
+    );
 
     // Override-redirect windows (menus, tooltips, dropdowns) — absolute
     // position from the X server, not a tiled rect. Drawn on every
@@ -3802,7 +4297,7 @@ fn composite_one_monitor(
         } else {
             &[WlrLayer::Top, WlrLayer::Overlay]
         };
-        blit_layers_animated(back, w, h, &state.surface_buffers, out, upper, clip, &state.layer_fades);
+        blit_layers_animated(back, w, h, &state.surface_buffers, out, upper, clip, &state.layer_fades, blur.as_mut());
         blit_dying_layers(
             back,
             w,
@@ -6227,6 +6722,7 @@ pub fn run(
     bar: veil_config::BarConfig,
     notify: veil_config::NotifyConfig,
     osd_cfg: veil_config::OsdConfig,
+    blur_cfg: veil_config::BlurConfig,
     shell_opts: crate::ShellOptions,
 ) -> io::Result<()> {
     let composite_interval = composite_interval_for(fps, 60_000);
@@ -6446,6 +6942,8 @@ pub fn run(
         notify_dirty: false,
         notify_started: false,
         osd_cfg,
+        blur_cfg,
+        blur_scratch: Default::default(),
         osd_started: false,
         // No anchor client to spawn into (`veil-host start`) → open the
         // launcher once the shell is ready, instead of an empty screen with no
@@ -6464,6 +6962,11 @@ pub fn run(
         layer_rects: HashMap::new(),
         layer_fades: HashMap::new(),
         layer_dying: HashMap::new(),
+        window_fades: HashMap::new(),
+        border_fades: HashMap::new(),
+        win_anim_was_busy: false,
+        window_last: HashMap::new(),
+        window_dying: HashMap::new(),
         loop_handle: None, // set right after the event loop is created
         cursor_status: CursorImageStatus::default_named(),
         focus_cache: None,
@@ -6797,6 +7300,10 @@ pub fn run(
             // Sector 2: advance layer map/unmap fades and drain finished ones.
             // While any is running the tick stays at full rate (N11).
             if layer_fade_tick(&mut data.state) {
+                busy = true;
+            }
+            // Sector 3: window open fades and focus-border colour fades.
+            if window_anim_tick(&mut data.state) {
                 busy = true;
             }
             let t_pre_composite = tick_trace.then(std::time::Instant::now);
@@ -7247,6 +7754,53 @@ mod import_tests {
         blit_with_global_alpha(&mut back, 1, 1, &src, 0, 0, full, 0.5);
         assert!((95..=105).contains(&back[0]), "got {}", back[0]);
         assert_eq!(back[3], 255);
+    }
+
+    #[test]
+    fn blend_rect_ends_are_exact_and_the_middle_is_between() {
+        let c = [200u8, 100, 50, 255];
+        let r = Rect { x: 1, y: 0, w: 2, h: 1 };
+        let base = vec![10u8; 4 * 4];
+
+        let mut a = base.clone();
+        blend_rect(&mut a, 4, r, c, 0.0);
+        assert_eq!(&a[4..12], &[10, 10, 10, 255, 10, 10, 10, 255]);
+
+        let mut b = base.clone();
+        blend_rect(&mut b, 4, r, c, 1.0);
+        assert_eq!(&b[4..8], &c);
+        assert_eq!(&b[8..12], &c);
+
+        let mut m = base.clone();
+        blend_rect(&mut m, 4, r, c, 0.5);
+        assert!((100..=110).contains(&m[4]), "got {}", m[4]);
+        // Outside the rect nothing moves.
+        assert_eq!(&m[0..4], &[10, 10, 10, 10]);
+        assert_eq!(&m[12..16], &[10, 10, 10, 10]);
+    }
+
+    #[test]
+    fn border_alpha_blends_and_still_respects_the_clip() {
+        let (w, h) = (10u32, 10u32);
+        let r = Rect { x: 3, y: 3, w: 4, h: 4 };
+        let full = Rect { x: 0, y: 0, w, h };
+
+        let mut solid = vec![0u8; (w * h * 4) as usize];
+        draw_border_alpha(&mut solid, w, h, r, 2, [200, 200, 200, 255], full, 1.0);
+        let mut plain = vec![0u8; (w * h * 4) as usize];
+        draw_border(&mut plain, w, h, r, 2, [200, 200, 200, 255], full);
+        assert_eq!(solid, plain, "alpha 1.0 is the plain border");
+
+        let mut half = vec![0u8; (w * h * 4) as usize];
+        draw_border_alpha(&mut half, w, h, r, 2, [200, 200, 200, 255], full, 0.5);
+        let px = |b: &Vec<u8>, x: u32, y: u32| b[((y * w + x) * 4) as usize];
+        assert!((95..=105).contains(&px(&half, 1, 1)));
+        assert_eq!(px(&half, 4, 4), 0, "window content is never touched");
+
+        let mut clipped = vec![0u8; (w * h * 4) as usize];
+        draw_border_alpha(&mut clipped, w, h, r, 2, [200, 200, 200, 255], Rect { x: 0, y: 0, w: 4, h: 4 }, 0.5);
+        assert!(px(&clipped, 1, 1) > 0);
+        assert_eq!(px(&clipped, 8, 5), 0, "outside the clip");
     }
 
     #[test]

@@ -14,9 +14,20 @@ use smithay::reexports::wayland_server::{
     protocol::wl_surface::WlSurface,
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
-use smithay::wayland::compositor::{get_region_attributes, RegionAttributes};
+use smithay::wayland::compositor::{get_region_attributes, RectangleKind, RegionAttributes};
 
+use crate::layout::Rect;
 use crate::server::State;
+
+/// A region as plain numbers, so two of them can be compared.
+fn flat(region: &Option<RegionAttributes>) -> Vec<(bool, i32, i32, i32, i32)> {
+    region.as_ref().map_or_else(Vec::new, |a| {
+        a.rects
+            .iter()
+            .map(|(k, r)| (matches!(k, RectangleKind::Add), r.loc.x, r.loc.y, r.size.w, r.size.h))
+            .collect()
+    })
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct BlurRegionState {
@@ -52,10 +63,43 @@ impl BackgroundEffectState {
     }
 
     /// Called on `wl_surface.commit` to apply double-buffered blur state.
-    pub fn commit(&mut self, surface: &WlSurface) {
-        if let Some(state) = self.effects.get_mut(&surface.id()) {
-            state.current = state.pending.clone();
-        }
+    /// Returns true when the committed region actually changed, so the
+    /// caller can repaint (a steady blurred bar commits every second and must
+    /// not look like a change).
+    pub fn commit(&mut self, surface: &WlSurface) -> bool {
+        let Some(state) = self.effects.get_mut(&surface.id()) else {
+            return false;
+        };
+        let changed = flat(&state.current) != flat(&state.pending);
+        state.current = state.pending.clone();
+        changed
+    }
+
+    /// The blur rectangles of `surface` in output space: its committed region
+    /// moved by `origin` (where the surface's (0,0) lands), with subtractions
+    /// applied, clipped to `bounds` and the `w` x `h` output.
+    pub fn rects_in(&self, surface: &WlSurface, origin: (i32, i32), bounds: Rect, w: u32, h: u32) -> Vec<Rect> {
+        let Some(attrs) = self.blur_region(surface) else {
+            return Vec::new();
+        };
+        let ops: Vec<(bool, Rect)> = attrs
+            .rects
+            .iter()
+            .map(|(kind, r)| {
+                let rect = Rect {
+                    x: origin.0 + r.loc.x,
+                    y: origin.1 + r.loc.y,
+                    w: r.size.w.max(0) as u32,
+                    h: r.size.h.max(0) as u32,
+                };
+                (matches!(kind, RectangleKind::Add), rect)
+            })
+            .collect();
+        crate::blur::region_rects(&ops)
+            .into_iter()
+            .map(|r| r.intersect(&bounds).clamp_to(w, h))
+            .filter(|r| !r.is_empty())
+            .collect()
     }
 
     /// Check if a surface has an active blur region.

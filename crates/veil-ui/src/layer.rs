@@ -5,6 +5,7 @@
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 use smithay_client_toolkit::{
+    background_effect::{BackgroundEffectHandler, BackgroundEffectState},
     compositor::{CompositorHandler, CompositorState, Region},
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -21,6 +22,10 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
+};
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1::Capability as BlurCap,
+    ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
 };
 use wayland_client::{
     globals::registry_queue_init,
@@ -88,6 +93,10 @@ struct OutputSurface {
     width: u32,
     height: u32,
     configured: bool,
+    /// `ext-background-effect` object for this surface, when the compositor has one.
+    effect: Option<ExtBackgroundEffectSurfaceV1>,
+    /// The size the blur region was last set for (`None` = no blur asked).
+    blur_size: Option<(u32, u32)>,
 }
 
 pub struct LayerShellClient {
@@ -148,6 +157,7 @@ impl LayerShellClient {
         let shm = Shm::bind(&globals, &qh)
             .map_err(|e| format!("wl_shm missing: {e}"))?;
         let seat_state = SeatState::new(&globals, &qh);
+        let bg = BackgroundEffectState::new(&globals, &qh);
 
         let (tx, rx) = channel();
 
@@ -158,6 +168,8 @@ impl LayerShellClient {
             seat_state,
             shm,
             layer_shell,
+            bg,
+            blur_on: true,
             opts,
             surfaces: Vec::new(),
             pointer: None,
@@ -215,6 +227,20 @@ impl LayerShellClient {
             s.layer_surface.set_size(size.0, size.1);
             s.layer_surface.set_exclusive_zone(exclusive_zone);
             s.layer_surface.commit();
+        }
+    }
+
+    /// Ask the compositor to blur (or stop blurring) behind every surface of
+    /// this client. On by default; the compositor's `blur` config has the
+    /// final say, per namespace.
+    pub fn set_blur(&mut self, on: bool) {
+        self.state.blur_on = on;
+        let blur = self.state.blur_wanted();
+        for s in &mut self.state.surfaces {
+            sync_blur(&self.state.compositor, s, blur);
+            if s.configured {
+                s.layer_surface.commit();
+            }
         }
     }
 
@@ -307,6 +333,10 @@ struct ClientState {
     seat_state: SeatState,
     shm: Shm,
     layer_shell: LayerShell,
+    bg: BackgroundEffectState,
+    /// Ask the compositor to blur behind this client's surfaces (default on;
+    /// the compositor's `blur` config decides whether it happens).
+    blur_on: bool,
     opts: LayerOptions,
     surfaces: Vec<OutputSurface>,
     pointer: Option<ThemedPointer<()>>,
@@ -327,6 +357,12 @@ impl ClientState {
             .find(|s| s.layer_surface.wl_surface() == wl)
             .map(|s| s.name.clone())
             .unwrap_or_default()
+    }
+
+    /// Blur is asked for only when the app wants it and the compositor has
+    /// advertised the blur capability (asking without it is a protocol error).
+    fn blur_wanted(&self) -> bool {
+        self.blur_on && self.bg.capabilities().is_some_and(|c| c.contains(BlurCap::Blur))
     }
 
     fn add_output(&mut self, qh: &QueueHandle<Self>, output: &wl_output::WlOutput) {
@@ -362,6 +398,7 @@ impl ClientState {
         layer_surface.set_size(self.opts.size.0, self.opts.size.1);
         let (mt, mr, mb, ml) = self.opts.margin;
         layer_surface.set_margin(mt, mr, mb, ml);
+        let effect = self.bg.get_background_effect(layer_surface.wl_surface(), qh).ok();
         layer_surface.commit();
 
         let pool = match SlotPool::new(8 * 1024 * 1024, &self.shm) {
@@ -380,6 +417,8 @@ impl ClientState {
             width: 0,
             height: 0,
             configured: false,
+            effect,
+            blur_size: None,
         });
     }
 }
@@ -529,6 +568,7 @@ impl LayerShellHandler for ClientState {
         cfg: LayerSurfaceConfigure,
         _: u32,
     ) {
+        let blur = self.blur_wanted();
         for s in &mut self.surfaces {
             if s.layer_surface.wl_surface() == layer_surface.wl_surface() {
                 if cfg.new_size.0 > 0 {
@@ -538,6 +578,7 @@ impl LayerShellHandler for ClientState {
                     s.height = cfg.new_size.1;
                 }
                 s.configured = true;
+                sync_blur(&self.compositor, s, blur);
                 self.reconfigured = true;
                 break;
             }
@@ -560,6 +601,40 @@ impl wayland_client::Dispatch<wl_region::WlRegion, ()> for ClientState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+/// Bring a surface's blur region in line with what is wanted: the whole
+/// surface while `on`, nothing otherwise. Applies on the surface's next commit.
+fn sync_blur(compositor: &CompositorState, s: &mut OutputSurface, on: bool) {
+    let want = (on && s.width > 0 && s.height > 0).then_some((s.width, s.height));
+    let Some(effect) = &s.effect else { return };
+    if s.blur_size == want {
+        return;
+    }
+    match want {
+        Some((w, h)) => {
+            let Ok(region) = Region::new(compositor) else { return };
+            region.add(0, 0, w as i32, h as i32);
+            effect.set_blur_region(Some(region.wl_region()));
+        }
+        None => effect.set_blur_region(None),
+    }
+    s.blur_size = want;
+}
+
+impl BackgroundEffectHandler for ClientState {
+    fn background_effect_state(&mut self) -> &mut BackgroundEffectState {
+        &mut self.bg
+    }
+
+    fn update_capabilities(&mut self) {
+        // Capabilities can arrive after the first configure: re-sync every
+        // surface now that blur is known to be available (or not).
+        let blur = self.blur_wanted();
+        for s in &mut self.surfaces {
+            sync_blur(&self.compositor, s, blur);
+        }
     }
 }
 

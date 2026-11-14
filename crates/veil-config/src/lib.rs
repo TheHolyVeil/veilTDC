@@ -832,6 +832,39 @@ impl Default for OsdConfig {
     }
 }
 
+/// `blur = { ... }` — background blur behind surfaces that ask for it
+/// (`ext-background-effect`).
+///
+/// ```lua
+/// blur = { enabled = true, radius = 8, windows = true,
+///          namespaces = { ["veil-bar"] = false } }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlurConfig {
+    /// Master switch. Off: no surface is blurred whatever it asks.
+    pub enabled: bool,
+    /// Blur reach in pixels (1..=32).
+    pub radius: u32,
+    /// Also blur toplevel windows that ask for it (translucent terminals).
+    pub windows: bool,
+    /// Per layer-shell namespace override; a namespace not listed follows
+    /// `enabled`. `["veil-bar"] = false` turns the bar's blur off.
+    pub namespaces: std::collections::BTreeMap<String, bool>,
+}
+
+impl Default for BlurConfig {
+    fn default() -> Self {
+        Self { enabled: true, radius: 8, windows: true, namespaces: Default::default() }
+    }
+}
+
+impl BlurConfig {
+    /// Whether a layer surface of `namespace` gets its requested blur.
+    pub fn layer_allowed(&self, namespace: &str) -> bool {
+        self.enabled && self.namespaces.get(namespace).copied().unwrap_or(true)
+    }
+}
+
 /// How a wallpaper is fitted to the output (`fit` in Lua).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WallpaperFit {
@@ -1017,6 +1050,31 @@ fn parse_osd(gl: &mlua::Table, default: &OsdConfig) -> OsdConfig {
     OsdConfig { shell: get_bool(&ot, "shell", default.shell) }
 }
 
+fn parse_blur(gl: &mlua::Table, default: &BlurConfig) -> BlurConfig {
+    let Ok(bt) = gl.get::<mlua::Table>("blur") else {
+        return default.clone();
+    };
+    let radius = match bt.get::<mlua::Value>("radius") {
+        Ok(mlua::Value::Integer(n)) if n > 0 => (n as u64).min(32) as u32,
+        Ok(mlua::Value::Number(n)) if n >= 1.0 => (n as u64).min(32) as u32,
+        _ => default.radius,
+    };
+    let mut namespaces = default.namespaces.clone();
+    if let Ok(t) = bt.get::<mlua::Table>("namespaces") {
+        for (name, on) in t.pairs::<String, mlua::Value>().flatten() {
+            if let mlua::Value::Boolean(b) = on {
+                namespaces.insert(name, b);
+            }
+        }
+    }
+    BlurConfig {
+        enabled: get_bool(&bt, "enabled", default.enabled),
+        radius,
+        windows: get_bool(&bt, "windows", default.windows),
+        namespaces,
+    }
+}
+
 fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
     let Ok(bt) = gl.get::<mlua::Table>("bar") else {
         return default.clone();
@@ -1151,6 +1209,8 @@ pub struct VeilConfig {
     pub notify: NotifyConfig,
     /// `osd = { ... }` config — see `OsdConfig`.
     pub osd: OsdConfig,
+    /// `blur = { ... }` config — see `BlurConfig`.
+    pub blur: BlurConfig,
     /// Static wallpaper, if configured.
     pub wallpaper: Option<WallpaperConfig>,
 }
@@ -1177,6 +1237,7 @@ impl Default for VeilConfig {
             bar: BarConfig::default(),
             notify: NotifyConfig::default(),
             osd: OsdConfig::default(),
+            blur: BlurConfig::default(),
             wallpaper: None,
         }
     }
@@ -1190,7 +1251,7 @@ impl Default for VeilConfig {
 const TOP_KEYS: &[&str] = &[
     "quality", "fps", "clipboard_sync", "refresh", "cage_timeout_secs", "input",
     "gpu_render", "gpu_power", "output", "background", "theme", "theme_mode",
-    "keybinds", "apps", "font", "bar", "notify", "osd", "wallpaper",
+    "keybinds", "apps", "font", "bar", "notify", "osd", "wallpaper", "blur",
 ];
 const FONT_KEYS: &[&str] = &["family", "mono", "icons", "fallback", "size", "weight"];
 const WALLPAPER_KEYS: &[&str] = &["engine", "paths", "path", "interval", "shuffle", "fit"];
@@ -1200,6 +1261,7 @@ const BAR_KEYS: &[&str] = &[
 const WIDGET_KEYS: &[&str] = &["clock", "disk", "weather", "custom"];
 const NOTIFY_KEYS: &[&str] = &["shell", "timeout", "max_visible", "dnd_critical"];
 const OSD_KEYS: &[&str] = &["shell"];
+const BLUR_KEYS: &[&str] = &["enabled", "radius", "windows", "namespaces"];
 
 /// Keys a `keybinds` table accepts (also valid at top level when there is no
 /// `keybinds` table, because the parser falls back to the globals).
@@ -1311,6 +1373,9 @@ fn lint_config(gl: &mlua::Table, builtin: &std::collections::HashSet<String>) ->
     }
     if let Ok(t) = gl.get::<mlua::Table>("osd") {
         lint_table("osd", &t, OSD_KEYS, &mut out);
+    }
+    if let Ok(t) = gl.get::<mlua::Table>("blur") {
+        lint_table("blur", &t, BLUR_KEYS, &mut out);
     }
     if let Ok(bar) = gl.get::<mlua::Table>("bar") {
         lint_table("bar", &bar, BAR_KEYS, &mut out);
@@ -1466,6 +1531,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
         bar: parse_bar(&gl, &d.bar),
         notify: parse_notify(&gl, &d.notify),
         osd: parse_osd(&gl, &d.osd),
+        blur: parse_blur(&gl, &d.blur),
         font: parse_font(&gl, &d.font),
         wallpaper: parse_wallpaper(&gl),
     })
@@ -1922,5 +1988,40 @@ mod osd_tests {
         assert!(!parse("osd = { shell = false }").shell);
         assert!(parse("osd = { }").shell);
         assert!(parse(r#"osd = { shell = "no" }"#).shell);
+    }
+}
+
+#[cfg(test)]
+mod blur_tests {
+    use super::*;
+
+    fn parse(src: &str) -> BlurConfig {
+        let lua = mlua::Lua::new();
+        lua.load(src).exec().unwrap();
+        parse_blur(&lua.globals(), &BlurConfig::default())
+    }
+
+    #[test]
+    fn defaults_when_absent() {
+        assert_eq!(parse(""), BlurConfig::default());
+        assert!(BlurConfig::default().layer_allowed("veil-bar"));
+    }
+
+    #[test]
+    fn keys_parse_and_radius_is_clamped() {
+        let c = parse(r#"blur = { enabled = false, radius = 99, windows = false }"#);
+        assert!(!c.enabled && !c.windows);
+        assert_eq!(c.radius, 32);
+        assert_eq!(parse("blur = { radius = 0 }").radius, 8);
+        assert_eq!(parse(r#"blur = { radius = "big" }"#).radius, 8);
+    }
+
+    #[test]
+    fn namespace_override_beats_the_default() {
+        let c = parse(r#"blur = { namespaces = { ["veil-bar"] = false, ["veil-osd"] = true, junk = 3 } }"#);
+        assert!(!c.layer_allowed("veil-bar"));
+        assert!(c.layer_allowed("veil-osd"));
+        assert!(c.layer_allowed("veil-notify"));
+        assert!(!parse("blur = { enabled = false }").layer_allowed("veil-osd"));
     }
 }

@@ -12,6 +12,7 @@ use std::thread;
 
 pub mod anim;
 pub mod background_effect;
+pub mod blur;
 pub mod cli;
 pub mod detile;
 pub mod font5x7;
@@ -73,6 +74,8 @@ pub struct HostConfig {
     pub bar: veil_config::BarConfig,
     pub notify: veil_config::NotifyConfig,
     pub osd: veil_config::OsdConfig,
+    /// `blur = { ... }` — see `veil_config::BlurConfig`.
+    pub blur: veil_config::BlurConfig,
     pub shell: ShellOptions,
 }
 
@@ -100,6 +103,7 @@ impl Default for HostConfig {
             bar: veil_config::BarConfig::default(),
             notify: veil_config::NotifyConfig::default(),
             osd: veil_config::OsdConfig::default(),
+            blur: veil_config::BlurConfig::default(),
             shell: ShellOptions::default(),
         }
     }
@@ -142,6 +146,7 @@ impl Host {
                     config.bar,
                     config.notify,
                     config.osd,
+                    config.blur,
                     config.shell,
                 ) {
                     eprintln!("[veil-host] server exited: {e}");

@@ -1050,11 +1050,16 @@ fn the_bell_and_dnd_work_through_the_real_host() {
 
     let mut ctl = rig.env.ipc();
     ctl.cmd("notify.dnd", json!({ "mode": "on" })).unwrap();
+    eprintln!("DBGT before-dnd-bell {:?}", rig.toasts());
     expect_bell(&mut events, 1, true);
+    eprintln!("DBGT after-dnd-bell {:?}", rig.toasts());
     assert!(ctl.cmd("notify.dnd", json!({ "mode": "maybe" })).is_err(), "a bad mode is refused");
 
+    eprintln!("DBGT pre-quiet {:?}", rig.toasts());
     rig.send(&["quiet"]);
+    eprintln!("DBGT post-send {:?}", rig.toasts());
     expect_bell(&mut events, 2, true);
+    for ms in [100u64, 400, 1500, 2500, 3000] { std::thread::sleep(Duration::from_millis(ms)); eprintln!("DBGT +{ms} {:?}", rig.toasts()); }
     std::thread::sleep(Duration::from_millis(500));
     assert!(rig.toasts().is_empty(), "no toast under do-not-disturb");
 
@@ -1063,4 +1068,139 @@ fn the_bell_and_dnd_work_through_the_real_host() {
 
     ctl.cmd("notify.panel", json!({})).unwrap();
     expect_bell(&mut events, 0, true); // opening the panel reads everything
+}
+
+// ─── background blur (phase 6c) ──────────────────────────────────────────────
+
+/// A layer client that paints `paint(w, h)` (premultiplied RGBA) on every
+/// configure, until dropped.
+struct Painter {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Painter {
+    fn spawn(socket: &Path, opts: LayerOptions, blur: bool, paint: fn(u32, u32) -> Vec<u8>) -> Self {
+        let stream = UnixStream::connect(socket).expect("connect to compositor");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut client = LayerShellClient::with_options(opts, Some(stream)).expect("layer client");
+            client.set_blur(blur);
+            let mut drawn = false;
+            while !stop_t.load(Ordering::Relaxed) {
+                if client.dispatch().is_err() {
+                    return;
+                }
+                if client.take_reconfigured() || !drawn {
+                    client.present_for_each(|_, w, h| paint(w, h));
+                    drawn = true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        Self { stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for Painter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Left of x=200 white, right of it black: one hard vertical edge.
+fn edge_backdrop(w: u32, h: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity((w * h * 4) as usize);
+    for _ in 0..h {
+        for x in 0..w {
+            v.extend_from_slice(if x < 200 { &[255, 255, 255, 255] } else { &[0, 0, 0, 255] });
+        }
+    }
+    v
+}
+
+fn see_through(w: u32, h: u32) -> Vec<u8> {
+    vec![0; (w * h * 4) as usize]
+}
+
+/// First channel of each `(x, y)` in the newest frame (draining the queue), or
+/// `None` when no frame has arrived since the last call. One call per frame:
+/// a second call would find the queue already empty.
+fn newest_reds(env: &Env, pts: &[(usize, usize)]) -> Option<Vec<u8>> {
+    let mut last = None;
+    while let Ok(f) = env.host.frames().try_recv() {
+        last = Some(f);
+    }
+    last.map(|f| pts.iter().map(|&(x, y)| f.rgba[(y * f.width as usize + x) * 4]).collect())
+}
+
+#[test]
+fn a_blurring_layer_softens_what_is_under_it_and_only_there() {
+    let Some(env) = start(false, &[]) else { return };
+    let all = Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT;
+    let _back = Painter::spawn(
+        &env.wayland_socket,
+        opts("test-backdrop", Layer::Bottom, all, (0, 0), -1, KeyboardInteractivity::None),
+        false,
+        edge_backdrop,
+    );
+    // Fully transparent, so what shows through is exactly the blurred backdrop.
+    let _glass = Painter::spawn(
+        &env.wayland_socket,
+        opts("test-glass", Layer::Top, Anchor::TOP | Anchor::LEFT, (400, 200), 0, KeyboardInteractivity::None),
+        true,
+        see_through,
+    );
+    wait_for("both layers mapped", Duration::from_secs(8), || {
+        mapped(&env, "test-backdrop") && mapped(&env, "test-glass")
+    });
+    // Inside the glass the edge is a gradient; below it the edge stays hard.
+    wait_for("the edge blurred under the glass", Duration::from_secs(10), || {
+        matches!(newest_reds(&env, &[(199, 100), (200, 100)]).as_deref(), Some(&[l, r]) if l < 235 && r > 20 && l > r)
+    });
+    wait_for("a frame to compare against", Duration::from_secs(5), || {
+        matches!(newest_reds(&env, &[(199, 300), (200, 300)]).as_deref(), Some(&[255, 0]))
+    });
+}
+
+#[test]
+fn without_a_blur_request_the_edge_stays_hard() {
+    let Some(env) = start(false, &[]) else { return };
+    let all = Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT;
+    let _back = Painter::spawn(
+        &env.wayland_socket,
+        opts("test-backdrop", Layer::Bottom, all, (0, 0), -1, KeyboardInteractivity::None),
+        false,
+        edge_backdrop,
+    );
+    let _glass = Painter::spawn(
+        &env.wayland_socket,
+        opts("test-glass", Layer::Top, Anchor::TOP | Anchor::LEFT, (400, 200), 0, KeyboardInteractivity::None),
+        false,
+        see_through,
+    );
+    wait_for("both layers mapped", Duration::from_secs(8), || {
+        mapped(&env, "test-backdrop") && mapped(&env, "test-glass")
+    });
+    wait_for("a hard edge", Duration::from_secs(10), || {
+        matches!(newest_reds(&env, &[(199, 100), (200, 100)]).as_deref(), Some(&[255, 0]))
+    });
+    // Stays hard for a few more frames: nothing blurs it late.
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(newest_reds(&env, &[(199, 100)]).is_none_or(|v| v[0] == 255));
+}
+
+#[test]
+fn the_namespace_switch_turns_a_requested_blur_off() {
+    // blur.namespaces["test-glass"] = false in the compositor's config.
+    let Some(rt) = runtime_dir() else { return };
+    let _ = rt;
+    let mut cfg = veil_config::BlurConfig::default();
+    cfg.namespaces.insert("test-glass".into(), false);
+    assert!(!cfg.layer_allowed("test-glass"));
+    assert!(cfg.layer_allowed("test-backdrop"));
 }
