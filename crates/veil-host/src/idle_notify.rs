@@ -65,6 +65,14 @@ impl IdleNotify {
         }
     }
 
+    pub fn last_activity(&self) -> Instant {
+        self.last_activity
+    }
+
+    pub fn is_inhibited(&mut self) -> bool {
+        self.inhibited()
+    }
+
     fn inhibited(&mut self) -> bool {
         self.inhibitors.retain(|s| s.is_alive());
         !self.inhibitors.is_empty()

@@ -849,6 +849,22 @@ impl OutputBackend for DrmOutput {
 
         Ok(processed)
     }
+
+    fn set_dpms(&mut self, on: bool) -> io::Result<()> {
+        if on {
+            for i in 0..self.monitors.len() {
+                if let Err(e) = self.reassert_crtc(i) {
+                    eprintln!("[veil-drm] DPMS on failed for monitor {i}: {e}");
+                }
+            }
+        } else {
+            for m in &self.monitors {
+                let card = &self.cards[m.card_idx];
+                let _ = card.set_crtc(m.crtc, None, (0, 0), &[], None);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl DrmOutput {

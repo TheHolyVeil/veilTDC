@@ -12,7 +12,7 @@ use super::dwt::Dwt;
 use super::touchpad::{self, Touchpad};
 use super::sysrq::SysRqBridge;
 use super::touchscreen::{self, Touchscreen};
-use evdev::{AbsoluteAxisCode, Device, EventSummary, KeyCode, PropType, RelativeAxisCode, SynchronizationCode};
+use evdev::{AbsoluteAxisCode, Device, EventSummary, KeyCode, PropType, RelativeAxisCode, SwitchCode, SynchronizationCode};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::Ordering;
 
@@ -99,10 +99,13 @@ impl EvdevInput {
         let mut touchpads = Vec::new();
         let mut touchscreens = Vec::new();
         for (path, mut dev) in evdev::enumerate() {
-            // Keep keyboards and pointing devices; skip everything else.
+            // Keep keyboards, pointing devices, and lid switches; skip everything else.
             let has_keys = dev.supported_keys().is_some();
             let has_rel = dev.supported_relative_axes().is_some();
-            if has_keys || has_rel {
+            let has_lid = dev
+                .supported_switches()
+                .is_some_and(|sw| sw.contains(SwitchCode::SW_LID));
+            if has_keys || has_rel || has_lid {
                 match dev.set_nonblocking(true) {
                     Ok(()) => {
                         // Exclusively grab: events go ONLY to veil. Stops
@@ -576,6 +579,10 @@ fn handle_event(
                 }
                 _ => {}
             }
+        }
+        EventSummary::Switch(_, SwitchCode::SW_LID, value) => {
+            // value: 1 = lid closed, 0 = lid open
+            let _ = tx.send(InputCmd::LidSwitch { closed: value == 1 });
         }
         _ => {}
     }

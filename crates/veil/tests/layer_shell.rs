@@ -1204,3 +1204,15 @@ fn the_namespace_switch_turns_a_requested_blur_off() {
     assert!(!cfg.layer_allowed("test-glass"));
     assert!(cfg.layer_allowed("test-backdrop"));
 }
+
+#[test]
+fn lid_switch_and_dpms_idle_state() {
+    let Some(env) = start(false, &[]) else { return };
+    assert!(env.host.dpms_active().load(Ordering::Relaxed), "DPMS starts active");
+
+    // Close lid
+    env.host.send_input(InputCmd::LidSwitch { closed: true }).unwrap();
+    // Open lid
+    env.host.send_input(InputCmd::LidSwitch { closed: false }).unwrap();
+    assert!(env.host.dpms_active().load(Ordering::Relaxed), "DPMS remains active after open");
+}

@@ -865,6 +865,82 @@ impl BlurConfig {
     }
 }
 
+/// Action to take when laptop lid is closed (`lid_action` in Lua).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LidAction {
+    #[default]
+    LockSuspend,
+    Nothing,
+    Lock,
+    Suspend,
+}
+
+impl std::str::FromStr for LidAction {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "nothing" | "none" | "ignore" => Self::Nothing,
+            "lock" => Self::Lock,
+            "suspend" | "sleep" => Self::Suspend,
+            "lock+suspend" | "lock_suspend" | "locksuspend" => Self::LockSuspend,
+            _ => Self::default(),
+        })
+    }
+}
+
+impl LidAction {
+    pub fn parse_str(s: &str) -> Self {
+        s.parse().unwrap_or_default()
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Nothing => "nothing",
+            Self::Lock => "lock",
+            Self::Suspend => "suspend",
+            Self::LockSuspend => "lock+suspend",
+        }
+    }
+}
+
+/// `idle = { ... }` — idle timers, screen blanking (DPMS), and power management.
+///
+/// ```lua
+/// idle = {
+///     enabled = true,
+///     lock_timeout = 300,        -- seconds to auto-lock (0 = disabled)
+///     dpms_timeout = 600,        -- seconds to blank display (0 = disabled)
+///     suspend_timeout = 1800,    -- seconds to auto-suspend (0 = disabled)
+///     lid_action = "lock+suspend", -- "nothing" | "lock" | "suspend" | "lock+suspend"
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleConfig {
+    /// Master switch for idle timers.
+    pub enabled: bool,
+    /// Inactivity timeout in seconds before locking (0 = disabled).
+    pub lock_timeout: u32,
+    /// Inactivity timeout in seconds before powering down displays (0 = disabled).
+    pub dpms_timeout: u32,
+    /// Inactivity timeout in seconds before suspending (0 = disabled).
+    pub suspend_timeout: u32,
+    /// Action taken when the laptop lid is closed.
+    pub lid_action: LidAction,
+}
+
+impl Default for IdleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lock_timeout: 300,
+            dpms_timeout: 600,
+            suspend_timeout: 1800,
+            lid_action: LidAction::LockSuspend,
+        }
+    }
+}
+
 /// How a wallpaper is fitted to the output (`fit` in Lua).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WallpaperFit {
@@ -1075,6 +1151,39 @@ fn parse_blur(gl: &mlua::Table, default: &BlurConfig) -> BlurConfig {
     }
 }
 
+fn parse_idle(gl: &mlua::Table, default: &IdleConfig) -> IdleConfig {
+    let Ok(it) = gl.get::<mlua::Table>("idle") else {
+        return default.clone();
+    };
+    let lock_timeout = match it.get::<mlua::Value>("lock_timeout") {
+        Ok(mlua::Value::Integer(n)) if n >= 0 => n as u32,
+        Ok(mlua::Value::Number(n)) if n >= 0.0 => n as u32,
+        _ => default.lock_timeout,
+    };
+    let dpms_timeout = match it.get::<mlua::Value>("dpms_timeout") {
+        Ok(mlua::Value::Integer(n)) if n >= 0 => n as u32,
+        Ok(mlua::Value::Number(n)) if n >= 0.0 => n as u32,
+        _ => default.dpms_timeout,
+    };
+    let suspend_timeout = match it.get::<mlua::Value>("suspend_timeout") {
+        Ok(mlua::Value::Integer(n)) if n >= 0 => n as u32,
+        Ok(mlua::Value::Number(n)) if n >= 0.0 => n as u32,
+        _ => default.suspend_timeout,
+    };
+    let lid_action = it
+        .get::<String>("lid_action")
+        .map(|s| LidAction::parse_str(&s))
+        .unwrap_or(default.lid_action);
+
+    IdleConfig {
+        enabled: get_bool(&it, "enabled", default.enabled),
+        lock_timeout,
+        dpms_timeout,
+        suspend_timeout,
+        lid_action,
+    }
+}
+
 fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
     let Ok(bt) = gl.get::<mlua::Table>("bar") else {
         return default.clone();
@@ -1211,6 +1320,8 @@ pub struct VeilConfig {
     pub osd: OsdConfig,
     /// `blur = { ... }` config — see `BlurConfig`.
     pub blur: BlurConfig,
+    /// `idle = { ... }` config — see `IdleConfig`.
+    pub idle: IdleConfig,
     /// Static wallpaper, if configured.
     pub wallpaper: Option<WallpaperConfig>,
 }
@@ -1238,6 +1349,7 @@ impl Default for VeilConfig {
             notify: NotifyConfig::default(),
             osd: OsdConfig::default(),
             blur: BlurConfig::default(),
+            idle: IdleConfig::default(),
             wallpaper: None,
         }
     }
@@ -1251,7 +1363,7 @@ impl Default for VeilConfig {
 const TOP_KEYS: &[&str] = &[
     "quality", "fps", "clipboard_sync", "refresh", "cage_timeout_secs", "input",
     "gpu_render", "gpu_power", "output", "background", "theme", "theme_mode",
-    "keybinds", "apps", "font", "bar", "notify", "osd", "wallpaper", "blur",
+    "keybinds", "apps", "font", "bar", "notify", "osd", "wallpaper", "blur", "idle",
 ];
 const FONT_KEYS: &[&str] = &["family", "mono", "icons", "fallback", "size", "weight"];
 const WALLPAPER_KEYS: &[&str] = &["engine", "paths", "path", "interval", "shuffle", "fit"];
@@ -1262,6 +1374,7 @@ const WIDGET_KEYS: &[&str] = &["clock", "disk", "weather", "custom"];
 const NOTIFY_KEYS: &[&str] = &["shell", "timeout", "max_visible", "dnd_critical"];
 const OSD_KEYS: &[&str] = &["shell"];
 const BLUR_KEYS: &[&str] = &["enabled", "radius", "windows", "namespaces"];
+const IDLE_KEYS: &[&str] = &["enabled", "lock_timeout", "dpms_timeout", "suspend_timeout", "lid_action"];
 
 /// Keys a `keybinds` table accepts (also valid at top level when there is no
 /// `keybinds` table, because the parser falls back to the globals).
@@ -1376,6 +1489,9 @@ fn lint_config(gl: &mlua::Table, builtin: &std::collections::HashSet<String>) ->
     }
     if let Ok(t) = gl.get::<mlua::Table>("blur") {
         lint_table("blur", &t, BLUR_KEYS, &mut out);
+    }
+    if let Ok(t) = gl.get::<mlua::Table>("idle") {
+        lint_table("idle", &t, IDLE_KEYS, &mut out);
     }
     if let Ok(bar) = gl.get::<mlua::Table>("bar") {
         lint_table("bar", &bar, BAR_KEYS, &mut out);
@@ -1532,6 +1648,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
         notify: parse_notify(&gl, &d.notify),
         osd: parse_osd(&gl, &d.osd),
         blur: parse_blur(&gl, &d.blur),
+        idle: parse_idle(&gl, &d.idle),
         font: parse_font(&gl, &d.font),
         wallpaper: parse_wallpaper(&gl),
     })
@@ -2023,5 +2140,42 @@ mod blur_tests {
         assert!(c.layer_allowed("veil-osd"));
         assert!(c.layer_allowed("veil-notify"));
         assert!(!parse("blur = { enabled = false }").layer_allowed("veil-osd"));
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    fn parse(src: &str) -> IdleConfig {
+        let lua = mlua::Lua::new();
+        lua.load(src).exec().unwrap();
+        parse_idle(&lua.globals(), &IdleConfig::default())
+    }
+
+    #[test]
+    fn defaults_when_absent() {
+        let c = parse("");
+        assert_eq!(c, IdleConfig::default());
+        assert!(c.enabled);
+        assert_eq!(c.lock_timeout, 300);
+        assert_eq!(c.dpms_timeout, 600);
+        assert_eq!(c.suspend_timeout, 1800);
+        assert_eq!(c.lid_action, LidAction::LockSuspend);
+    }
+
+    #[test]
+    fn parses_custom_timeouts_and_lid_actions() {
+        let c = parse(r#"idle = { enabled = false, lock_timeout = 120, dpms_timeout = 240, suspend_timeout = 600, lid_action = "suspend" }"#);
+        assert!(!c.enabled);
+        assert_eq!(c.lock_timeout, 120);
+        assert_eq!(c.dpms_timeout, 240);
+        assert_eq!(c.suspend_timeout, 600);
+        assert_eq!(c.lid_action, LidAction::Suspend);
+
+        assert_eq!(parse(r#"idle = { lid_action = "nothing" }"#).lid_action, LidAction::Nothing);
+        assert_eq!(parse(r#"idle = { lid_action = "lock" }"#).lid_action, LidAction::Lock);
+        assert_eq!(parse(r#"idle = { lid_action = "lock_suspend" }"#).lid_action, LidAction::LockSuspend);
+        assert_eq!(parse(r#"idle = { lid_action = "lock+suspend" }"#).lid_action, LidAction::LockSuspend);
     }
 }

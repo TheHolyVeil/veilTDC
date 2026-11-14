@@ -61,6 +61,9 @@ pub enum InputCmd {
         body: String,
         progress: Option<u8>,
     },
+
+    /// Laptop lid switch event (true = closed, false = opened).
+    LidSwitch { closed: bool },
 }
 
 // TODO: routing layer that takes an InputCmd and calls into

@@ -306,7 +306,9 @@ impl Panel {
             let selected = i == self.selected;
 
             // Button background
-            let bg = if selected {
+            let bg = if selected && action == Action::Shutdown {
+                Color::from_rgba8(self.tokens.err[0], self.tokens.err[1], self.tokens.err[2], 255)
+            } else if selected {
                 Color::from_rgba8(
                     self.tokens.accent[0],
                     self.tokens.accent[1],
@@ -324,7 +326,9 @@ impl Panel {
             fill_circle(pm, cx, cy, btn_radius, bg);
 
             // Border / selection ring
-            let border_color = if selected {
+            let border_color = if selected && action == Action::Shutdown {
+                Color::from_rgba8(self.tokens.err[0], self.tokens.err[1], self.tokens.err[2], 255)
+            } else if selected {
                 Color::from_rgba8(
                     self.tokens.accent[0],
                     self.tokens.accent[1],

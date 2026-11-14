@@ -245,6 +245,7 @@ pub fn run_cli() -> std::io::Result<()> {
     cfg.notify = vcfg.notify.clone();
     cfg.osd = vcfg.osd.clone();
     cfg.blur = vcfg.blur.clone();
+    cfg.idle = vcfg.idle.clone();
     cfg.fps = vcfg.fps; // 0 = match the display (resolved in SetMonitors)
     cfg.clipboard_sync = vcfg.clipboard_sync;
 
@@ -393,6 +394,7 @@ pub fn run_cli() -> std::io::Result<()> {
     // Track last-known terminal size so we can notify the output backend on change.
     let mut last_term_cols = init_cols;
     let mut last_term_rows = init_rows;
+    let mut last_dpms = true;
 
     // One slot per monitor — the compositor sends one Frame per monitor per
     // composited tick (see composite_and_send's per-tick loop), tagged with
@@ -441,6 +443,18 @@ pub fn run_cli() -> std::io::Result<()> {
         let _ = output.service_seat();
         loop_seat += t_iter.elapsed();
         loop_iters += 1;
+
+        let cur_dpms = host.dpms_active().load(Ordering::Relaxed);
+        if cur_dpms != last_dpms {
+            last_dpms = cur_dpms;
+            let _ = output.set_dpms(cur_dpms);
+        }
+
+        if !cur_dpms {
+            while host.frames().try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
 
         // Pull in everything the compositor has produced so far. Anything newer
         // than a frame we're still holding back coalesces into it (damage

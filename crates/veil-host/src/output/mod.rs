@@ -101,6 +101,13 @@ pub trait OutputBackend {
     fn service_seat(&mut self) -> io::Result<()> {
         Ok(())
     }
+
+    /// Set DPMS power state for displays: true = on (normal operation),
+    /// false = off (screens blanked / powered down for idle).
+    /// Default: no-op (terminal output ignores DPMS).
+    fn set_dpms(&mut self, _on: bool) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(PartialEq)]

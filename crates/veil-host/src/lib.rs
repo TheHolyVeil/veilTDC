@@ -76,6 +76,8 @@ pub struct HostConfig {
     pub osd: veil_config::OsdConfig,
     /// `blur = { ... }` — see `veil_config::BlurConfig`.
     pub blur: veil_config::BlurConfig,
+    /// `idle = { ... }` — see `veil_config::IdleConfig`.
+    pub idle: veil_config::IdleConfig,
     pub shell: ShellOptions,
 }
 
@@ -104,6 +106,7 @@ impl Default for HostConfig {
             notify: veil_config::NotifyConfig::default(),
             osd: veil_config::OsdConfig::default(),
             blur: veil_config::BlurConfig::default(),
+            idle: veil_config::IdleConfig::default(),
             shell: ShellOptions::default(),
         }
     }
@@ -113,6 +116,7 @@ pub struct Host {
     frames: mpsc::Receiver<Frame>,
     input: mpsc::Sender<InputCmd>,
     stop: StdArc<AtomicBool>,
+    dpms: StdArc<AtomicBool>,
     _thread: thread::JoinHandle<()>,
 }
 
@@ -122,6 +126,8 @@ impl Host {
         let (input_tx, input_rx) = mpsc::channel::<InputCmd>();
         let stop = StdArc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
+        let dpms = StdArc::new(AtomicBool::new(true));
+        let dpms_t = dpms.clone();
 
         let handle = thread::Builder::new()
             .name("veil-host".into())
@@ -137,6 +143,7 @@ impl Host {
                     frame_tx,
                     input_rx,
                     stop_t,
+                    dpms_t,
                     config.keybinds,
                     config.background,
                     config.theme,
@@ -147,6 +154,7 @@ impl Host {
                     config.notify,
                     config.osd,
                     config.blur,
+                    config.idle,
                     config.shell,
                 ) {
                     eprintln!("[veil-host] server exited: {e}");
@@ -157,6 +165,7 @@ impl Host {
             frames: frame_rx,
             input: input_tx,
             stop,
+            dpms,
             _thread: handle,
         })
     }
@@ -172,6 +181,11 @@ impl Host {
     /// Ask the compositor loop to exit on its next iteration.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Read/watch the DPMS display power state (true = on, false = powered down for idle).
+    pub fn dpms_active(&self) -> StdArc<AtomicBool> {
+        self.dpms.clone()
     }
 
     /// Clone the input sender for use on another thread.

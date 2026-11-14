@@ -502,6 +502,11 @@ pub struct State {
     pub osd_cfg: veil_config::OsdConfig,
     /// `blur = { ... }` — see `veil_config::BlurConfig`.
     pub blur_cfg: veil_config::BlurConfig,
+    /// `idle = { ... }` — see `veil_config::IdleConfig`.
+    pub idle_cfg: veil_config::IdleConfig,
+    pub dpms_active: Arc<AtomicBool>,
+    pub idle_locked: bool,
+    pub idle_suspended: bool,
     /// Work buffers for the blur pass, reused every frame.
     pub blur_scratch: crate::blur::BlurScratch,
     /// `veil shell osd` has been started for this session.
@@ -656,6 +661,24 @@ impl State {
     fn next_serial(&mut self) -> Serial {
         self.serial_counter = self.serial_counter.wrapping_add(1);
         Serial::from(self.serial_counter)
+    }
+
+    pub fn request_lock(&mut self) {
+        tracing::info!("[idle/session] lock requested (lock client pending implementation)");
+    }
+
+    pub fn request_suspend(&mut self) {
+        tracing::info!("[idle/session] suspending system");
+        spawn_command(&self.socket_name, "systemctl suspend");
+    }
+
+    pub fn set_dpms(&mut self, on: bool) {
+        if self.dpms_active.swap(on, Ordering::Relaxed) != on {
+            tracing::info!("[idle/session] DPMS state changed: on={on}");
+            if on {
+                mark_dirty_full(self);
+            }
+        }
     }
 
     /// The GPU importer's EGL/GLES context sits on the render node and costs
@@ -2860,6 +2883,7 @@ pub fn reload_config(state: &mut State) {
         mark_dirty_full(state);
     }
     state.blur_cfg = new_cfg.blur;
+    state.idle_cfg = new_cfg.idle;
     state.osd_cfg = new_cfg.osd;
     state.notify = new_cfg.notify;
     state.bar = new_cfg.bar;
@@ -4723,6 +4747,42 @@ fn media_tick(state: &mut State) {
     }
 }
 
+fn idle_tick(state: &mut State, now: Instant) {
+    if !state.idle_cfg.enabled {
+        return;
+    }
+    if state.idle_notify.is_inhibited() {
+        return;
+    }
+    let elapsed = now.saturating_duration_since(state.idle_notify.last_activity());
+
+    // Lock timeout
+    if state.idle_cfg.lock_timeout > 0
+        && !state.idle_locked
+        && elapsed >= Duration::from_secs(state.idle_cfg.lock_timeout as u64)
+    {
+        state.idle_locked = true;
+        state.request_lock();
+    }
+
+    // DPMS timeout
+    if state.idle_cfg.dpms_timeout > 0
+        && state.dpms_active.load(Ordering::Relaxed)
+        && elapsed >= Duration::from_secs(state.idle_cfg.dpms_timeout as u64)
+    {
+        state.set_dpms(false);
+    }
+
+    // Suspend timeout
+    if state.idle_cfg.suspend_timeout > 0
+        && !state.idle_suspended
+        && elapsed >= Duration::from_secs(state.idle_cfg.suspend_timeout as u64)
+    {
+        state.idle_suspended = true;
+        state.request_suspend();
+    }
+}
+
 fn wallpaper_tick(state: &mut State) {
     if state
         .wallpaper_chooser
@@ -5392,6 +5452,10 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             | InputCmd::Scroll { .. }
     ) {
         state.idle_notify.activity(state.loop_handle.as_ref());
+        state.idle_suspended = false;
+        if !state.dpms_active.load(Ordering::Relaxed) {
+            state.set_dpms(true);
+        }
     }
 
     match cmd {
@@ -6043,6 +6107,31 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
         } => {
             state.show_osd(title, body, progress, Duration::from_secs(2));
         }
+
+        InputCmd::LidSwitch { closed } => {
+            tracing::info!("[idle/session] lid switch: closed={closed}");
+            if closed {
+                match state.idle_cfg.lid_action {
+                    veil_config::LidAction::Nothing => {
+                        tracing::debug!("[idle/session] lid closed: configured action is nothing");
+                    }
+                    veil_config::LidAction::Lock => {
+                        state.request_lock();
+                    }
+                    veil_config::LidAction::Suspend => {
+                        state.request_suspend();
+                    }
+                    veil_config::LidAction::LockSuspend => {
+                        state.request_lock();
+                        state.request_suspend();
+                    }
+                }
+            } else {
+                state.set_dpms(true);
+                state.idle_suspended = false;
+                state.idle_notify.activity(state.loop_handle.as_ref());
+            }
+        }
     }
 }
 
@@ -6456,7 +6545,7 @@ fn ipc_command(
             Ok(None)
         }
         c::SESSION_LOCK => {
-            spawn_command(&state.socket_name, "veil-lock");
+            state.request_lock();
             Ok(None)
         }
         c::SESSION_LOGOUT => {
@@ -6464,7 +6553,7 @@ fn ipc_command(
             Ok(None)
         }
         c::SESSION_SUSPEND => {
-            spawn_command(&state.socket_name, "systemctl suspend");
+            state.request_suspend();
             Ok(None)
         }
         c::SESSION_REBOOT => {
@@ -6713,6 +6802,7 @@ pub fn run(
     frame_tx: mpsc::Sender<Frame>,
     input_rx: mpsc::Receiver<InputCmd>,
     stop: Arc<AtomicBool>,
+    dpms: Arc<AtomicBool>,
     keybinds: veil_config::Keybinds,
     background: [u8; 3],
     theme: veil_config::Theme,
@@ -6723,6 +6813,7 @@ pub fn run(
     notify: veil_config::NotifyConfig,
     osd_cfg: veil_config::OsdConfig,
     blur_cfg: veil_config::BlurConfig,
+    idle_cfg: veil_config::IdleConfig,
     shell_opts: crate::ShellOptions,
 ) -> io::Result<()> {
     let composite_interval = composite_interval_for(fps, 60_000);
@@ -6943,6 +7034,10 @@ pub fn run(
         notify_started: false,
         osd_cfg,
         blur_cfg,
+        idle_cfg,
+        dpms_active: dpms,
+        idle_locked: false,
+        idle_suspended: false,
         blur_scratch: Default::default(),
         osd_started: false,
         // No anchor client to spawn into (`veil-host start`) → open the
@@ -7297,6 +7392,7 @@ pub fn run(
             // Frame callbacks are fired inside composite_and_send after the frame is sent.
             wallpaper_tick(&mut data.state);
             media_tick(&mut data.state);
+            idle_tick(&mut data.state, now);
             // Sector 2: advance layer map/unmap fades and drain finished ones.
             // While any is running the tick stays at full rate (N11).
             if layer_fade_tick(&mut data.state) {
