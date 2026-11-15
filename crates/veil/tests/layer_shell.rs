@@ -74,6 +74,14 @@ fn start(shell_bar: bool, trusted: &[&str]) -> Option<Env> {
             shell: false,
             ..Default::default()
         },
+        // The defaults lock + `systemctl suspend` on lid close and on idle,
+        // and the test host really spawns that. Tests must never touch the
+        // machine's power state.
+        idle: veil_config::IdleConfig {
+            enabled: false,
+            lid_action: veil_config::LidAction::Nothing,
+            ..Default::default()
+        },
         shell: ShellOptions {
             ipc_socket: Some(ipc_path.clone()),
             shell_exe: Some(PathBuf::from(env!("CARGO_BIN_EXE_veil"))),
