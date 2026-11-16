@@ -12,6 +12,7 @@ members = [
     "crates/veil-notify",
     "crates/veil-power",
     "crates/veil-osd",
+    "crates/veil-lock",
     "crates/veil-launch",
     "crates/veil",
 ]
@@ -61,6 +62,7 @@ wayland-client        = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 crossbeam-channel     = "0.5"
 rustix                = "1"
+zeroize              = "1.9"
 
 [profile.release]
 # opt-level "z" optimizes for SIZE and turns off most loop vectorization and

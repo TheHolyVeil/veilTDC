@@ -29,7 +29,9 @@ pub mod palette;
 pub mod output;
 pub mod output_management;
 pub mod powermenu;
+pub mod screencopy;
 pub mod seat;
+pub mod session_lock;
 pub mod server;
 pub mod sink;
 pub mod supervisor;
@@ -78,6 +80,8 @@ pub struct HostConfig {
     pub blur: veil_config::BlurConfig,
     /// `idle = { ... }` — see `veil_config::IdleConfig`.
     pub idle: veil_config::IdleConfig,
+    /// Layout fresh workspaces start in (`default_layout` in Lua).
+    pub default_layout: veil_config::DefaultLayout,
     pub shell: ShellOptions,
 }
 
@@ -107,6 +111,7 @@ impl Default for HostConfig {
             osd: veil_config::OsdConfig::default(),
             blur: veil_config::BlurConfig::default(),
             idle: veil_config::IdleConfig::default(),
+            default_layout: veil_config::DefaultLayout::default(),
             shell: ShellOptions::default(),
         }
     }
@@ -155,6 +160,7 @@ impl Host {
                     config.osd,
                     config.blur,
                     config.idle,
+                    config.default_layout,
                     config.shell,
                 ) {
                     eprintln!("[veil-host] server exited: {e}");

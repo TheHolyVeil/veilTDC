@@ -198,17 +198,17 @@ fn wait_readable(queue: &EventQueue<State>, timeout: Option<Duration>) -> bool {
 
 /// Auto-repeat for one held key. The compositor only sends press and release;
 /// repeating is the client's job (and SCTK only does it with calloop).
-struct Repeater {
+pub struct Repeater {
     info: RepeatInfo,
     held: Option<(u32, Key, Instant)>,
 }
 
 impl Repeater {
-    fn new(info: RepeatInfo) -> Self {
+    pub fn new(info: RepeatInfo) -> Self {
         Repeater { info, held: None }
     }
 
-    fn set_info(&mut self, info: RepeatInfo) {
+    pub fn set_info(&mut self, info: RepeatInfo) {
         self.info = info;
         if matches!(info, RepeatInfo::Disable) {
             self.held = None;
@@ -217,7 +217,7 @@ impl Repeater {
 
     /// A key went down. Modifiers, Enter, Escape and Tab never repeat: holding
     /// Enter must not run an action over and over.
-    fn press(&mut self, raw: u32, key: &Key, now: Instant) {
+    pub fn press(&mut self, raw: u32, key: &Key, now: Instant) {
         let RepeatInfo::Repeat { delay, .. } = self.info else {
             self.held = None;
             return;
@@ -227,23 +227,23 @@ impl Repeater {
         self.held = (!no_repeat).then(|| (raw, key.clone(), now + Duration::from_millis(u64::from(delay))));
     }
 
-    fn release(&mut self, raw: u32) {
+    pub fn release(&mut self, raw: u32) {
         if self.held.as_ref().is_some_and(|(r, ..)| *r == raw) {
             self.held = None;
         }
     }
 
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.held = None;
     }
 
-    fn next_due(&self) -> Option<Instant> {
+    pub fn next_due(&self) -> Option<Instant> {
         self.held.as_ref().map(|(_, _, t)| *t)
     }
 
     /// The next repeat that is due at `now`, if any. Call until `None`: after a
     /// stall several may be owed, but never more than one per interval.
-    fn due(&mut self, now: Instant) -> Option<Key> {
+    pub fn due(&mut self, now: Instant) -> Option<Key> {
         let RepeatInfo::Repeat { rate, .. } = self.info else { return None };
         let (_, key, next) = self.held.as_mut()?;
         if now < *next {

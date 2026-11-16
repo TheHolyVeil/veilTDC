@@ -246,6 +246,7 @@ pub fn run_cli() -> std::io::Result<()> {
     cfg.osd = vcfg.osd.clone();
     cfg.blur = vcfg.blur.clone();
     cfg.idle = vcfg.idle.clone();
+    cfg.default_layout = vcfg.default_layout;
     cfg.fps = vcfg.fps; // 0 = match the display (resolved in SetMonitors)
     cfg.clipboard_sync = vcfg.clipboard_sync;
 

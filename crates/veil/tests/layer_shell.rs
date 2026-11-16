@@ -1224,3 +1224,64 @@ fn lid_switch_and_dpms_idle_state() {
     env.host.send_input(InputCmd::LidSwitch { closed: false }).unwrap();
     assert!(env.host.dpms_active().load(Ordering::Relaxed), "DPMS remains active after open");
 }
+
+// ─── screencopy ──────────────────────────────────────────────────────────────
+
+/// Run `grim` (a real wlr-screencopy client) against the test compositor and
+/// return `(width, height, rgb)` from its PPM output. `None` when grim is not
+/// installed, so the test skips instead of failing.
+fn grim_ppm(env: &Env, geometry: Option<&str>) -> Option<(usize, usize, Vec<u8>)> {
+    let mut cmd = std::process::Command::new("grim");
+    cmd.env("WAYLAND_DISPLAY", &env.wayland_socket)
+        .env_remove("WAYLAND_SOCKET")
+        .args(["-t", "ppm"]);
+    if let Some(g) = geometry {
+        cmd.args(["-g", g]);
+    }
+    cmd.arg("-");
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("could not run grim: {e}"),
+    };
+    assert!(out.status.success(), "grim failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // "P6\n<w> <h>\n255\n" then w*h*3 bytes.
+    let data = out.stdout;
+    let mut pos = 0;
+    let mut token = || {
+        while data[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        let start = pos;
+        while !data[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        String::from_utf8_lossy(&data[start..pos]).into_owned()
+    };
+    assert_eq!(token(), "P6");
+    let w: usize = token().parse().unwrap();
+    let h: usize = token().parse().unwrap();
+    assert_eq!(token(), "255");
+    pos += 1; // the single whitespace byte after maxval
+    Some((w, h, data[pos..].to_vec()))
+}
+
+#[test]
+fn grim_captures_the_whole_output_and_a_region() {
+    let Some(env) = start(false, &[]) else { return };
+    let Some((w, h, px)) = grim_ppm(&env, None) else {
+        eprintln!("skipping: grim is not installed");
+        return;
+    };
+    assert_eq!((w, h), (W as usize, H as usize));
+    assert_eq!(px.len(), w * h * 3);
+    // Nothing is drawn in the bottom-right corner, so it is the bare
+    // background (the default cement grey), channel order included.
+    let i = ((h - 1) * w + (w - 1)) * 3;
+    assert_eq!(&px[i..i + 3], &[0x8c, 0x8c, 0x8c]);
+
+    let (rw, rh, rpx) = grim_ppm(&env, Some("100,100 50x40")).expect("grim ran once already");
+    assert_eq!((rw, rh), (50, 40));
+    assert_eq!(rpx.len(), 50 * 40 * 3);
+}

@@ -28,6 +28,35 @@ impl GpuPower {
     }
 }
 
+/// Which tiling layout every workspace starts in (`default_layout` in
+/// config.lua). The `ToggleLayout` action still flips a workspace at
+/// runtime; this only sets the layout fresh workspaces begin in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DefaultLayout {
+    #[default]
+    Dwindle,
+    Scroller,
+}
+
+impl DefaultLayout {
+    /// Unknown strings fall back to `Dwindle` (the long-standing default),
+    /// the same forgiving behavior as `GpuPower::parse_str`; the config
+    /// linter is what flags a typo'd value.
+    pub fn parse_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "scroller" | "scroll" => Self::Scroller,
+            _ => Self::Dwindle,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Dwindle => "dwindle",
+            Self::Scroller => "scroller",
+        }
+    }
+}
+
 /// Render quality ladder (`quality` in config.lua), best to last resort:
 /// Kitty graphics, then halfblock in truecolor / 256 / 16 colours, then ASCII.
 /// `Sixel` parses but is not implemented; it resolves like `Auto`.
@@ -1293,6 +1322,9 @@ pub struct VeilConfig {
     pub gpu_render: bool,
     /// Which GPU to prefer when `gpu_render` is on: "high" (default) or "low".
     pub gpu_power: GpuPower,
+    /// Layout every workspace starts in (`default_layout = "dwindle" |
+    /// "scroller"` in Lua). Default `Dwindle`.
+    pub default_layout: DefaultLayout,
     pub keybinds: Keybinds,
     pub output: OutputPref,
     /// Bare background color (RGB), shown wherever no window covers —
@@ -1338,6 +1370,7 @@ impl Default for VeilConfig {
             input: true,
             gpu_render: true,
             gpu_power: GpuPower::High,
+            default_layout: DefaultLayout::Dwindle,
             keybinds: Keybinds::default(),
             output: OutputPref::Auto,
             background: [0x8c, 0x8c, 0x8c],
@@ -1362,7 +1395,7 @@ impl Default for VeilConfig {
 
 const TOP_KEYS: &[&str] = &[
     "quality", "fps", "clipboard_sync", "refresh", "cage_timeout_secs", "input",
-    "gpu_render", "gpu_power", "output", "background", "theme", "theme_mode",
+    "gpu_render", "gpu_power", "default_layout", "output", "background", "theme", "theme_mode",
     "keybinds", "apps", "font", "bar", "notify", "osd", "wallpaper", "blur", "idle",
 ];
 const FONT_KEYS: &[&str] = &["family", "mono", "icons", "fallback", "size", "weight"];
@@ -1628,6 +1661,10 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
             .get::<String>("gpu_power")
             .map(|s| GpuPower::parse_str(&s))
             .unwrap_or(d.gpu_power),
+        default_layout: gl
+            .get::<String>("default_layout")
+            .map(|s| DefaultLayout::parse_str(&s))
+            .unwrap_or(d.default_layout),
         keybinds: parse_keybinds(&gl),
         output: gl
             .get::<String>("output")
@@ -1803,6 +1840,28 @@ mod app_bind_tests {
         // A normal override still works, and untouched actions keep defaults.
         assert_eq!(kb.action_for('x'), Some(Action::Close));
         assert_eq!(kb.action_for('l'), Some(Action::FocusRight));
+    }
+
+    #[test]
+    fn default_layout_defaults_to_dwindle_and_accepts_scroller() {
+        assert_eq!(load_str("dl-default", "fps = 0").default_layout, DefaultLayout::Dwindle);
+        assert_eq!(
+            load_str("dl-scroller", r#"default_layout = "scroller""#).default_layout,
+            DefaultLayout::Scroller
+        );
+        assert_eq!(
+            load_str("dl-scroll", r#"default_layout = "Scroll""#).default_layout,
+            DefaultLayout::Scroller
+        );
+        assert_eq!(
+            load_str("dl-dwindle", r#"default_layout = "dwindle""#).default_layout,
+            DefaultLayout::Dwindle
+        );
+        // A typo falls back to the old default rather than breaking the load.
+        assert_eq!(
+            load_str("dl-typo", r#"default_layout = "scrolllr""#).default_layout,
+            DefaultLayout::Dwindle
+        );
     }
 
     #[test]

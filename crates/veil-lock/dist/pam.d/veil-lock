@@ -1,0 +1,12 @@
+#%PAM-1.0
+# veil-lock PAM service: install to /etc/pam.d/veil-lock
+#
+#   install -Dm644 crates/veil-lock/dist/pam.d/veil-lock /etc/pam.d/veil-lock
+#
+# Authentication only (the session is already open). `system-auth` is the
+# distro's normal unlock stack: unix password, faillock, and whatever else
+# (pam_u2f, fprintd) is configured there.
+#
+# If this file is missing, veil-lock falls back to `login`, then `system-auth`.
+auth      include   system-auth
+account   include   system-auth

@@ -143,6 +143,15 @@ pub enum LayoutMode {
     Scroll,
 }
 
+impl From<veil_config::DefaultLayout> for LayoutMode {
+    fn from(d: veil_config::DefaultLayout) -> Self {
+        match d {
+            veil_config::DefaultLayout::Dwindle => LayoutMode::Dwindle,
+            veil_config::DefaultLayout::Scroller => LayoutMode::Scroll,
+        }
+    }
+}
+
 /// Tiling state not derivable from the window list.
 #[derive(Clone, Copy)]
 pub struct Layout {

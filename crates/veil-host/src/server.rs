@@ -120,7 +120,7 @@ use smithay::wayland::shell::wlr_layer::{
     LayerSurfaceConfigure, LayerSurfaceData, WlrLayerShellHandler, WlrLayerShellState,
 };
 use crate::launcher::Launcher;
-use crate::layout::{Layout, Rect};
+use crate::layout::{Layout, LayoutMode, Rect};
 use crate::powermenu::{PowerAction, PowerMenu};
 use crate::wallpaper_chooser::WallpaperChooser;
 use crate::{input::InputCmd, sink::Frame};
@@ -314,8 +314,10 @@ pub struct WsSlide {
 impl Monitor {
     /// A monitor's `pointer_pos`, `layout`, and `layout_rects` all start
     /// empty/default; workspace 0 (workspace "1") starts active, same as
-    /// the old flat `State` defaults did.
-    fn new(width: u32, height: u32, origin_x: i32) -> Self {
+    /// the old flat `State` defaults did. Every workspace begins in
+    /// `mode` (the `default_layout` config key).
+    fn new(width: u32, height: u32, origin_x: i32, mode: LayoutMode) -> Self {
+        let layout = Layout { mode, ..Layout::default() };
         Self {
             rect: Rect {
                 x: origin_x,
@@ -327,8 +329,8 @@ impl Monitor {
             output_h: height,
             pointer_pos: (0.0, 0.0),
             fullscreen: None,
-            layout: Layout::default(),
-            workspace_layouts: Default::default(),
+            layout,
+            workspace_layouts: [layout; veil_config::WORKSPACE_COUNT as usize],
             active_workspace: 0,
             layout_rects: Vec::new(),
             bar_hitboxes: Vec::new(),
@@ -428,6 +430,8 @@ pub struct State {
     pub shell_started: bool,
     /// wlr-output-management state (heads/modes snapshot + bound clients).
     pub(crate) output_mgmt: crate::output_management::OutputManagement,
+    /// `wlr-screencopy` requests waiting on a frame (see `screencopy`).
+    pub(crate) screencopy: crate::screencopy::Screencopy,
     /// ext-idle-notify listeners + idle-inhibit tracking.
     pub(crate) idle_notify: crate::idle_notify::IdleNotify,
     /// ext-background-effect-v1 tracking.
@@ -504,8 +508,15 @@ pub struct State {
     pub blur_cfg: veil_config::BlurConfig,
     /// `idle = { ... }` — see `veil_config::IdleConfig`.
     pub idle_cfg: veil_config::IdleConfig,
+    /// `default_layout` — the layout a newly created monitor's workspaces
+    /// start in. Existing monitors keep whatever layout each workspace is
+    /// in now (a reload must not flip tiled windows under the user).
+    pub default_layout: LayoutMode,
     pub dpms_active: Arc<AtomicBool>,
     pub idle_locked: bool,
+    /// ext-session-lock host state (see `session_lock`).
+    pub lock: crate::session_lock::LockController,
+    pub session_lock_state: smithay::wayland::session_lock::SessionLockManagerState,
     pub idle_suspended: bool,
     /// Work buffers for the blur pass, reused every frame.
     pub blur_scratch: crate::blur::BlurScratch,
@@ -658,13 +669,15 @@ impl State {
         });
         mark_dirty_full(self);
     }
-    fn next_serial(&mut self) -> Serial {
+    pub(crate) fn next_serial(&mut self) -> Serial {
         self.serial_counter = self.serial_counter.wrapping_add(1);
         Serial::from(self.serial_counter)
     }
 
-    pub fn request_lock(&mut self) {
-        tracing::info!("[idle/session] lock requested (lock client pending implementation)");
+    /// Lock the session. False when there is no lock client to hold it.
+    pub fn request_lock(&mut self) -> bool {
+        tracing::info!("[idle/session] lock requested");
+        crate::session_lock::request(self)
     }
 
     pub fn request_suspend(&mut self) {
@@ -1067,7 +1080,7 @@ impl XdgShellHandler for State {
         // resolve the display for fullscreen / scale and back out of it.
         self.output.enter(&wl);
         // An exclusive layer grab (launcher, lock) keeps the keyboard.
-        if exclusive_grab_surface(self).is_none() {
+        if exclusive_grab_surface(self).is_none() && !self.lock.is_active() {
             let serial = self.next_serial();
             let kb = self.keyboard.clone();
             kb.set_focus(self, Some(wl), serial);
@@ -2499,7 +2512,7 @@ fn shm_to_rgba_into(
 /// Alpha-over blit `src` onto `back` at `(x, y)`, limited to `clip` (and to
 /// the back buffer, whatever `clip` says). Damage-limited compositing passes
 /// the frame's damage rect here, so pixels outside it are never touched.
-fn blit(back: &mut [u8], back_w: u32, back_h: u32, src: &SurfaceBuf, x: i32, y: i32, clip: Rect) {
+pub(crate) fn blit(back: &mut [u8], back_w: u32, back_h: u32, src: &SurfaceBuf, x: i32, y: i32, clip: Rect) {
     let r = Rect { x, y, w: src.w, h: src.h }.intersect(&clip.clamp_to(back_w, back_h));
     if r.is_empty() {
         return;
@@ -2590,7 +2603,7 @@ fn blit_with_global_alpha(
 /// wrong size mid-resize) into `buf`, inside `r` only. `r` must already be
 /// clamped to the `w`-wide buffer. A full-output `r` is the old whole-buffer
 /// fill; a smaller one restores just the damaged region.
-fn fill_background(buf: &mut [u8], wallpaper: Option<&[u8]>, bg: [u8; 4], w: u32, r: Rect) {
+pub(crate) fn fill_background(buf: &mut [u8], wallpaper: Option<&[u8]>, bg: [u8; 4], w: u32, r: Rect) {
     if r.is_empty() {
         return;
     }
@@ -2884,6 +2897,7 @@ pub fn reload_config(state: &mut State) {
     }
     state.blur_cfg = new_cfg.blur;
     state.idle_cfg = new_cfg.idle;
+    state.default_layout = new_cfg.default_layout.into();
     state.osd_cfg = new_cfg.osd;
     state.notify = new_cfg.notify;
     state.bar = new_cfg.bar;
@@ -2929,7 +2943,7 @@ pub fn reload_config(state: &mut State) {
 /// (shouldn't happen — `pointer_global` is clamped to the combined
 /// bounding box wherever it's written — but a safe default beats a panic
 /// if some future caller ever writes an out-of-range value).
-fn active_monitor_idx(state: &State) -> usize {
+pub(crate) fn active_monitor_idx(state: &State) -> usize {
     let (gx, gy) = state.pointer_global;
     state
         .monitors
@@ -3630,7 +3644,7 @@ fn draw_border(back: &mut [u8], w: u32, h: u32, r: Rect, t: u32, c: [u8; 4], cli
 
 /// Blend `c` over the pixels of `r` at `alpha` (`r` already inside the
 /// `w`-wide buffer). At 1.0 it is a plain fill.
-fn blend_rect(back: &mut [u8], w: u32, r: Rect, c: [u8; 4], alpha: f32) {
+pub(crate) fn blend_rect(back: &mut [u8], w: u32, r: Rect, c: [u8; 4], alpha: f32) {
     if r.is_empty() {
         return;
     }
@@ -3690,7 +3704,11 @@ fn draw_border_alpha(
 
 /// Point the keyboard at whichever live toplevel is currently focused (or
 /// nothing, if there are no windows left).
-fn refocus_keyboard(state: &mut State) {
+pub(crate) fn refocus_keyboard(state: &mut State) {
+    // A locked session keeps the keyboard on the lock surface, never a window.
+    if state.lock.is_active() {
+        return;
+    }
     let idx = active_monitor_idx(state);
     let ws = state.monitors[idx].active_workspace;
     // An exclusive layer grab outranks every window.
@@ -3766,7 +3784,7 @@ fn dismiss_popup_grabs_on_press(state: &mut State, clicked: Option<WlSurface>) {
 /// has no way to know which monitor(s) it actually affects, so marking all
 /// of them is the only safe choice — same reasoning as before this had more
 /// than one monitor to worry about, just applied to each of them now.
-fn mark_dirty_full(state: &mut State) {
+pub(crate) fn mark_dirty_full(state: &mut State) {
     state.dirty = true;
     for m in state.monitors.iter_mut() {
         let full = Rect {
@@ -3998,7 +4016,8 @@ fn composite_one_monitor(
         || state.window_fades.values().any(|f| f.is_busy(fade_now))
         || state.border_fades.values().any(|f| f.is_busy(fade_now))
         || m.ws_slide.as_ref().is_some_and(|s| s.anim.is_busy(fade_now));
-    let unclipped_overlay = legacy_bar
+    let unclipped_overlay = state.lock.is_active()
+        || legacy_bar
         || fading
         || state.osd.is_some()
         || (idx == active_idx
@@ -4036,6 +4055,14 @@ fn composite_one_monitor(
     // Every draw below is limited to this. On a full repaint it is the whole
     // output, which clips nothing.
     let clip = frame_damage;
+
+    // Session locked: the desktop is not drawn at all. Only the dimmed
+    // wallpaper and the lock surface, on a full repaint (forced above).
+    if state.lock.is_active() {
+        crate::session_lock::paint(state, idx, w, h, clip);
+        ship_frame(state, idx, needed, reused, frame_damage, w, h);
+        return;
+    }
 
     // Background: wallpaper (or solid colour) restored inside the damage only.
     // A full-output damage rect is the old whole-buffer fill.
@@ -4451,6 +4478,12 @@ fn composite_one_monitor(
         }
     }
 
+    ship_frame(state, idx, needed, reused, frame_damage, w, h);
+}
+
+/// Hand one monitor's finished frame to the render thread and set up the
+/// buffer for the next one.
+fn ship_frame(state: &mut State, idx: usize, needed: usize, reused: bool, frame_damage: Rect, w: u32, h: u32) {
     state.frame_serial = state.frame_serial.wrapping_add(1);
 
     // Zero-copy dispatch: swap this monitor's composite_buf out, wrap in
@@ -4477,6 +4510,9 @@ fn composite_one_monitor(
         _ => Vec::with_capacity(needed),
     };
     m.prev_frame = Some(outgoing.clone());
+    // Serve screencopy requests that were waiting on this frame (cheap
+    // `Arc` clone, and only when someone is waiting).
+    let for_capture = state.screencopy.has_pending().then(|| outgoing.clone());
     let _ = state.frame_tx.send(crate::sink::Frame {
         rgba: outgoing,
         width: w,
@@ -4485,6 +4521,9 @@ fn composite_one_monitor(
         serial: state.frame_serial,
         damage: frame_damage,
     });
+    if let Some(frame) = for_capture {
+        crate::screencopy::on_frame_shipped(state, idx, &frame, w, h);
+    }
 }
 
 /// Composite every monitor + ship each one's frame. Called from the
@@ -4562,6 +4601,9 @@ fn composite_and_send(state: &mut State) {
         );
     }
 
+    // The lock is confirmed once a frame with no desktop in it went out.
+    crate::session_lock::after_composite(state);
+
     // Fire frame callbacks now that we've consumed and displayed every
     // monitor's frame this tick. Chromium uses these as vsync: it won't
     // submit the next buffer until it receives one. Firing here (after all
@@ -4570,24 +4612,32 @@ fn composite_and_send(state: &mut State) {
     // client's surface belongs to exactly one monitor, but there's no
     // reason to fire its callback more than once per tick regardless.
     let time = state.start_time.elapsed().as_millis() as u32;
+    let locked = state.lock.is_active();
     let surfaces: Vec<WlSurface> = state
         .toplevels
         .iter()
-        .filter(|t| t.alive())
+        .filter(|t| t.alive() && !locked)
         .filter_map(|t| t.wl_surface())
         .chain(
             state
                 .floating
                 .iter()
-                .filter(|f| f.alive())
+                .filter(|f| f.alive() && !locked)
                 .filter_map(|f| f.wl_surface()),
         )
         // Layer surfaces (bar etc.) need callbacks too or they never redraw.
         .chain(state.layer_outputs.iter().flat_map(|o| {
+            // Locked: the bar and friends are not shown, so they get no
+            // callbacks (their clocks would keep the compositor repainting).
+            if locked {
+                return Vec::new();
+            }
             let map = layer_map_for_output(o);
             let v: Vec<WlSurface> = map.layers().map(|l| l.wl_surface().clone()).collect();
             v
         }))
+        // Lock surfaces, while locked.
+        .chain(crate::session_lock::surfaces(state))
         .collect();
     let now = monotonic_now();
     let seq = state.frame_serial;
@@ -5458,6 +5508,17 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
         }
     }
 
+    // Locked: the lock screen takes the keyboard only. Pointer, buttons and
+    // scroll reach nobody (no window, bar or layer is shown to aim at).
+    if state.lock.is_active()
+        && matches!(
+            cmd,
+            InputCmd::PointerMotionAbs { .. } | InputCmd::PointerButton { .. } | InputCmd::Scroll { .. }
+        )
+    {
+        return;
+    }
+
     match cmd {
         InputCmd::Key {
             keycode, pressed, ..
@@ -5481,6 +5542,13 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                 |st, mods: &ModifiersState, keysym: KeysymHandle<'_>| {
                     if suppress_release {
                         return FilterResult::Intercept(());
+                    }
+                    // Locked: no keybind, launcher or media key runs. Keys go
+                    // to the keyboard focus, which is the lock surface.
+                    // (VT switching is handled below this layer, in the evdev
+                    // reader, and stays available.)
+                    if st.lock.is_active() {
+                        return FilterResult::Forward;
                     }
                     // Launcher modal: swallow ALL key input while it's open
                     // (typed query text, arrow-key selection, Enter/Escape),
@@ -5979,7 +6047,7 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                     // Genuinely new monitor — nothing was ever tiled on it
                     // (it didn't exist until this call), so a fresh default
                     // Monitor is exactly correct, not a discard of anything.
-                    None => state.monitors.push(Monitor::new(w, h, origin_x)),
+                    None => state.monitors.push(Monitor::new(w, h, origin_x, state.default_layout)),
                 }
                 origin_x += w as i32;
             }
@@ -6122,8 +6190,15 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                         state.request_suspend();
                     }
                     veil_config::LidAction::LockSuspend => {
-                        state.request_lock();
-                        state.request_suspend();
+                        // Suspend only once the lock is in place, so waking
+                        // up shows the lock, not the desktop. With no lock
+                        // client available there is nothing to wait for.
+                        if state.request_lock() {
+                            state.lock.suspend_when_locked = true;
+                        } else {
+                            tracing::warn!("[idle/session] lid closed: no lock client, suspending unlocked");
+                            state.request_suspend();
+                        }
                     }
                 }
             } else {
@@ -6814,6 +6889,7 @@ pub fn run(
     osd_cfg: veil_config::OsdConfig,
     blur_cfg: veil_config::BlurConfig,
     idle_cfg: veil_config::IdleConfig,
+    default_layout: veil_config::DefaultLayout,
     shell_opts: crate::ShellOptions,
 ) -> io::Result<()> {
     let composite_interval = composite_interval_for(fps, 60_000);
@@ -6885,6 +6961,7 @@ pub fn run(
     let _pointer_constraints = PointerConstraintsState::new::<State>(&dh);
     let _relative_pointer = RelativePointerManagerState::new::<State>(&dh);
     let _idle_inhibit = IdleInhibitManagerState::new::<State>(&dh);
+    let (session_lock_state, lock) = crate::session_lock::init(&dh);
     let _kb_inhibit = KeyboardShortcutsInhibitState::new::<State>(&dh);
     let _tablet = TabletManagerState::new::<State>(&dh);
     let mut seat_state = SeatState::<State>::new();
@@ -6991,6 +7068,7 @@ pub fn run(
         pointer,
         layer_outputs: vec![output.clone()],
         output_mgmt: Default::default(),
+        screencopy: crate::screencopy::Screencopy::new(&dh),
         idle_notify: crate::idle_notify::IdleNotify::new(&dh),
         background_effect: {
             crate::background_effect::BackgroundEffectState::register_global(&dh);
@@ -7009,7 +7087,7 @@ pub fn run(
         // `InputCmd::SetMonitors` once main.rs's output detection
         // completes (that happens after Host::spawn, so this can't just
         // be sized correctly from the start).
-        monitors: vec![Monitor::new(width, height, 0)],
+        monitors: vec![Monitor::new(width, height, 0, default_layout.into())],
         pointer_global: (width as f64 / 2.0, height as f64 / 2.0),
         toplevels: Vec::new(),
         floating: Vec::new(),
@@ -7035,8 +7113,11 @@ pub fn run(
         osd_cfg,
         blur_cfg,
         idle_cfg,
+        default_layout: default_layout.into(),
         dpms_active: dpms,
         idle_locked: false,
+        lock,
+        session_lock_state,
         idle_suspended: false,
         blur_scratch: Default::default(),
         osd_started: false,
@@ -7393,6 +7474,7 @@ pub fn run(
             wallpaper_tick(&mut data.state);
             media_tick(&mut data.state);
             idle_tick(&mut data.state, now);
+            crate::session_lock::tick(&mut data.state, now);
             // Sector 2: advance layer map/unmap fades and drain finished ones.
             // While any is running the tick stays at full rate (N11).
             if layer_fade_tick(&mut data.state) {
