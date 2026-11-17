@@ -1,0 +1,16 @@
+[package]
+name        = "veil-screenshot"
+version     = "0.1.0"
+edition     = "2021"
+description = "One-shot screenshot wrapper (grim + slurp + wl-copy) for Veil"
+
+[dependencies]
+veil-config = { path = "../veil-config" }
+veil-ipc    = { path = "../veil-ipc" }
+serde_json  = { workspace = true }
+chrono      = { workspace = true }
+zbus        = { workspace = true }
+futures-lite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

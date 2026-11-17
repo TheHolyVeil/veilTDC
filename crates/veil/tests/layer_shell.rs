@@ -1285,3 +1285,27 @@ fn grim_captures_the_whole_output_and_a_region() {
     assert_eq!((rw, rh), (50, 40));
     assert_eq!(rpx.len(), 50 * 40 * 3);
 }
+
+#[test]
+fn veil_shell_screenshot_full_saves_a_png() {
+    let Some(env) = start(false, &[]) else { return };
+    if std::process::Command::new("grim").arg("-h").output().is_err() {
+        eprintln!("skipping: grim is not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_veil"))
+        .args(["shell", "screenshot", "full", "--no-copy", "--no-notify"])
+        .env("WAYLAND_DISPLAY", &env.wayland_socket)
+        .env_remove("WAYLAND_SOCKET")
+        .env("VEIL_SCREENSHOT_DIR", dir.path())
+        .output()
+        .expect("run veil shell screenshot");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let path = std::path::PathBuf::from(&printed);
+    assert!(path.starts_with(dir.path()), "saved outside the override dir: {printed}");
+    let png = std::fs::read(&path).expect("the printed path exists");
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+}

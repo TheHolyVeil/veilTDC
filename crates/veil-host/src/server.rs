@@ -2767,6 +2767,43 @@ fn spawn_command(socket_name: &str, exec: &str) {
     }
 }
 
+/// The chord whose exact modifiers and key match this key press, if any.
+/// Key names are resolved against XKB case-insensitively; the press is
+/// compared on its unmodified keysyms so `Shift+Print` still matches `Print`.
+fn matching_chord(
+    binds: &veil_config::Keybinds,
+    mods: &ModifiersState,
+    keysym: &KeysymHandle<'_>,
+) -> Option<veil_config::ChordAction> {
+    use smithay::input::keyboard::xkb;
+    binds.chords.iter().find_map(|(c, action)| {
+        if c.ctrl != mods.ctrl || c.alt != mods.alt || c.shift != mods.shift || c.logo != mods.logo {
+            return None;
+        }
+        let want = xkb::keysym_from_name(&c.key, xkb::KEYSYM_CASE_INSENSITIVE).raw();
+        (want != 0 && keysym.raw_syms().iter().any(|s| s.raw() == want)).then_some(*action)
+    })
+}
+
+fn run_chord(state: &mut State, action: veil_config::ChordAction) {
+    match action {
+        veil_config::ChordAction::Screenshot(kind) => {
+            // The component is this same binary; use its own path so the key
+            // works without `veil` being on PATH.
+            let exe = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "veil".into());
+            let exec = format!("{} shell screenshot {}", sh_quote(&exe), kind.as_str());
+            spawn_command(&state.socket_name, &exec);
+        }
+    }
+}
+
+/// Single-quote `s` for `sh -c`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 fn draw_osd_overlay(osd: &OsdNotification, ts: &mut veil_text::TextSystem, back: &mut [u8], w: u32, h: u32) {
     use crate::font5x7::fill_rect;
     use veil_text::Role;
@@ -5580,6 +5617,13 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                         return FilterResult::Forward;
                     }
 
+                    // Named-key chords (`Ctrl+Print`, ...): exact modifiers,
+                    // any XKB key name. Checked before the mod+char binds.
+                    if let Some(action) = matching_chord(&st.keybinds, mods, &keysym) {
+                        run_chord(st, action);
+                        return FilterResult::Intercept(());
+                    }
+
                     // Multimedia keys (volume, brightness, player)
                     let sym = keysym.modified_sym().raw();
                     match sym {
@@ -6665,6 +6709,25 @@ fn ipc_command(
         }
         // Not in the doc's command list; handy for scripts and debugging.
         "palette.get" => Ok(Some(crate::palette::to_json(&state.palette))),
+        // Focused window's rectangle in global pixels (layout rects are
+        // monitor-local, so add the monitor's x origin). Used by
+        // `veil shell screenshot window`.
+        "window.focused" => {
+            let surface = state
+                .keyboard
+                .current_focus()
+                .ok_or_else(|| "no focused window".to_string())?;
+            let (mon, r) = toplevel_rect_for(state, &surface)
+                .ok_or_else(|| "the focused window is not on screen".to_string())?;
+            let origin = state.monitors[mon].rect.x;
+            Ok(Some(serde_json::json!({
+                "title": focused_title(state),
+                "x": origin + r.x,
+                "y": r.y,
+                "w": r.w,
+                "h": r.h,
+            })))
+        }
         "layers.list" => Ok(Some(layers_json(state))),
         "component.status" => Ok(Some(serde_json::Value::Array(
             state

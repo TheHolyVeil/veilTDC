@@ -1,4 +1,4 @@
-use mlua::Lua;
+use toml::{Table, Value};
 use std::path::{Path, PathBuf};
 
 /// Which GPU the frame encoder asks for (`gpu_power` in config.lua).
@@ -53,6 +53,134 @@ impl DefaultLayout {
         match self {
             Self::Dwindle => "dwindle",
             Self::Scroller => "scroller",
+        }
+    }
+}
+
+/// What a screenshot captures (`veil shell screenshot <kind>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenshotKind {
+    Full,
+    Area,
+    Window,
+}
+
+impl ScreenshotKind {
+    pub const ALL: [ScreenshotKind; 3] = [Self::Full, Self::Area, Self::Window];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Area => "area",
+            Self::Window => "window",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+}
+
+/// A key chord: modifiers plus exactly one key, written like `Ctrl+Print` or
+/// `Ctrl+Shift+F12`. The key is an XKB keysym name, resolved by the
+/// compositor against the active keymap; modifiers must match exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chord {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub logo: bool,
+    pub key: String,
+}
+
+impl Chord {
+    pub fn parse(s: &str) -> Result<Chord, String> {
+        let mut chord = Chord { ctrl: false, alt: false, shift: false, logo: false, key: String::new() };
+        for part in s.split('+').map(str::trim) {
+            match part.to_ascii_lowercase().as_str() {
+                "" => return Err(format!("empty part in `{s}`")),
+                "ctrl" | "control" => chord.ctrl = true,
+                "alt" => chord.alt = true,
+                "shift" => chord.shift = true,
+                "super" | "logo" | "mod4" => chord.logo = true,
+                _ if chord.key.is_empty() => chord.key = part.to_string(),
+                _ => return Err(format!("`{s}` names more than one key; a chord is modifiers plus one key")),
+            }
+        }
+        if chord.key.is_empty() {
+            return Err(format!("`{s}` has modifiers but no key"));
+        }
+        Ok(chord)
+    }
+}
+
+/// What a chord does when pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChordAction {
+    Screenshot(ScreenshotKind),
+}
+
+/// One screenshot kind's settings (`screenshot.full`, `.area`, `.window`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenshotMode {
+    /// Key chord that takes this kind of screenshot; `None` = unbound.
+    pub keys: Option<Chord>,
+    pub save: bool,
+    pub copy: bool,
+}
+
+/// `screenshot` table in config.lua. The keys are opt-in: Veil only grabs
+/// them when the table exists (an empty `screenshot = {}` is enough, and then
+/// each kind has the default chord shown in `Default`); without it, only
+/// `veil shell screenshot <kind>` runs, from a launcher or a script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenshotConfig {
+    /// `false`: Veil binds no screenshot keys and `veil shell screenshot` is
+    /// left to whatever tool you run instead.
+    pub shell: bool,
+    /// Where files go; `None` = `~/Pictures/Screenshots`.
+    pub dir: Option<String>,
+    /// Show a "Screenshot captured" notification.
+    pub notify: bool,
+    pub full: ScreenshotMode,
+    pub area: ScreenshotMode,
+    pub window: ScreenshotMode,
+}
+
+impl ScreenshotConfig {
+    pub fn mode(&self, kind: ScreenshotKind) -> &ScreenshotMode {
+        match kind {
+            ScreenshotKind::Full => &self.full,
+            ScreenshotKind::Area => &self.area,
+            ScreenshotKind::Window => &self.window,
+        }
+    }
+
+    /// Key chords this config asks the compositor to grab. Empty when the
+    /// screenshot component is turned off.
+    pub fn chords(&self) -> Vec<(Chord, ChordAction)> {
+        if !self.shell {
+            return Vec::new();
+        }
+        ScreenshotKind::ALL
+            .into_iter()
+            .filter_map(|k| Some((self.mode(k).keys.clone()?, ChordAction::Screenshot(k))))
+            .collect()
+    }
+}
+
+impl Default for ScreenshotConfig {
+    fn default() -> Self {
+        let mode = |keys: &str| ScreenshotMode { keys: Chord::parse(keys).ok(), save: true, copy: true };
+        Self {
+            shell: true,
+            dir: None,
+            notify: true,
+            full: mode("Print"),
+            area: mode("Shift+Print"),
+            // Not Alt+Print: Print is SysRq on most keyboards, and with
+            // `kernel.sysrq = 1` Alt+SysRq+<key> is a kernel command.
+            window: mode("Ctrl+Print"),
         }
     }
 }
@@ -323,6 +451,9 @@ const SHIFTED_DIGIT_SYMBOLS: [char; 9] = ['!', '@', '#', '$', '%', '^', '&', '*'
 pub struct Keybinds {
     pub mod_key: ModKey,
     pub binds: Vec<(char, Action)>,
+    /// Named-key chords (`Ctrl+Print`, ...) with exact modifiers. Filled from
+    /// the `screenshot` table; see `ScreenshotConfig::chords`.
+    pub chords: Vec<(Chord, ChordAction)>,
 }
 
 impl Keybinds {
@@ -338,6 +469,9 @@ impl Default for Keybinds {
     fn default() -> Self {
         Self {
             mod_key: ModKey::Super,
+            // Screenshot keys are opt-in: they are only added when config.lua
+            // has a `screenshot` table.
+            chords: Vec::new(),
             binds: vec![
                 ('h', Action::FocusLeft),
                 ('l', Action::FocusRight),
@@ -410,28 +544,23 @@ const KEYBIND_FIELDS: [(&str, Action); 19] = [
     ("brightness_down", Action::BrightnessDown),
 ];
 
-fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
+fn parse_keybinds(root: &Table) -> Keybinds {
     let default = Keybinds::default();
-    // No `keybinds` table: fall back to the globals table itself, so a bare
-    // top-level `apps = {..}` still works (it was silently ignored before).
-    let t = gl
-        .get::<mlua::Table>("keybinds")
-        .unwrap_or_else(|_| gl.clone());
+    // No `[keybinds]` table: read the root table itself, so a bare top-level
+    // `apps = [..]` still works.
+    let t = tbl(root, "keybinds").unwrap_or(root);
 
-    let mod_key = t
-        .get::<String>("mod_key")
+    let mod_key = string(t, "mod_key")
         .map(|s| ModKey::from_str(&s))
         .unwrap_or(default.mod_key);
 
     let mut binds: Vec<(char, Action)> = KEYBIND_FIELDS
         .iter()
         .filter_map(|(field, action)| {
-            let key = match t.get::<mlua::Value>(*field) {
+            let key = match t.get(*field) {
                 // `field = false` or `field = ""` unbinds the action.
-                Ok(mlua::Value::Boolean(false)) => return None,
-                Ok(mlua::Value::String(s)) => {
-                    s.to_string_lossy().chars().next()?.to_ascii_lowercase()
-                }
+                Some(Value::Boolean(false)) => return None,
+                Some(Value::String(s)) => s.chars().next()?.to_ascii_lowercase(),
                 // Absent (or not a string): the default key, if it has one.
                 _ => default
                     .binds
@@ -444,11 +573,11 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
         .collect();
 
     // Super+1..9 workspace switch and Super+Shift+1..9 move-to-workspace —
-    // not in FIELDS above (no natural single Lua field name for eighteen
-    // keys), so seeded straight from the defaults rather than looped
-    // per-field. Still user-overridable: the `apps` loop below runs after
-    // this and will happily replace either if someone wants those keys for
-    // something else instead.
+    // not in FIELDS above (no natural single field name for eighteen keys),
+    // so seeded straight from the defaults rather than looped per-field.
+    // Still user-overridable: the `apps` loop below runs after this and will
+    // happily replace either if someone wants those keys for something else
+    // instead.
     binds.extend(
         default
             .binds
@@ -458,41 +587,53 @@ fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
     );
 
     // App keybinds, from `keybinds.apps` or a top-level `apps`. Two forms:
-    //   ordered:  apps = { { "enter", "kitty" }, { key = "b", exec = "helium-browser" } }
-    //   map:      apps = { b = "helium-browser" }   (applied in key order)
+    //   ordered:  apps = [["enter", "kitty"], { key = "b", exec = "helium-browser" }]
+    //   map:      [keybinds.apps]
+    //             b = "helium-browser"      (applied in key order)
     // Each Launch bind also becomes a bar tile, in this order, so the ordered
-    // form is what gives a stable bar layout (Lua map iteration order isn't).
-    let app_table = t
-        .get::<mlua::Table>("apps")
-        .or_else(|_| gl.get::<mlua::Table>("apps"));
-
-    if let Ok(apps) = app_table {
-        let mut entries: Vec<(String, String)> = Vec::new();
-        for v in apps.sequence_values::<mlua::Table>().flatten() {
-            let key = v.get::<String>("key").or_else(|_| v.get::<String>(1));
-            let exec = v.get::<String>("exec").or_else(|_| v.get::<String>(2));
-            if let (Ok(k), Ok(e)) = (key, exec) {
-                entries.push((k, e));
+    // form is what gives a stable bar layout.
+    let mut entries: Vec<(String, String)> = Vec::new();
+    match t.get("apps").or_else(|| root.get("apps")) {
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item {
+                    Value::Table(v) => {
+                        if let (Some(k), Some(e)) = (string(v, "key"), string(v, "exec")) {
+                            entries.push((k, e));
+                        }
+                    }
+                    Value::Array(pair) => {
+                        if let [Value::String(k), Value::String(e)] = pair.as_slice() {
+                            entries.push((k.clone(), e.clone()));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        let mut map: Vec<(String, String)> = apps.pairs::<String, String>().flatten().collect();
-        map.sort();
-        entries.extend(map);
+        Some(Value::Table(map)) => {
+            entries.extend(
+                map.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned()))),
+            );
+            entries.sort();
+        }
+        _ => {}
+    }
 
-        for (key_str, cmd) in entries {
-            if let Some(ch) = bind_key(&key_str) {
-                if !cmd.trim().is_empty() {
-                    if let Some(existing) = binds.iter_mut().find(|(k, _)| *k == ch) {
-                        existing.1 = Action::Launch(cmd);
-                    } else {
-                        binds.push((ch, Action::Launch(cmd)));
-                    }
+    for (key_str, cmd) in entries {
+        if let Some(ch) = bind_key(&key_str) {
+            if !cmd.trim().is_empty() {
+                if let Some(existing) = binds.iter_mut().find(|(k, _)| *k == ch) {
+                    existing.1 = Action::Launch(cmd);
+                } else {
+                    binds.push((ch, Action::Launch(cmd)));
                 }
             }
         }
     }
 
-    Keybinds { mod_key, binds }
+    Keybinds { mod_key, binds, chords: Vec::new() }
 }
 
 /// Which built-in color preset `theme = "..."` in config.lua selects.
@@ -1017,34 +1158,24 @@ fn expand_home(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn parse_wallpaper(gl: &mlua::Table) -> Option<WallpaperConfig> {
-    let v = gl.get::<mlua::Value>("wallpaper").ok()?;
-    let (paths, interval_secs, shuffle, fit) = match v {
-        mlua::Value::String(s) => (
-            vec![expand_home(&s.to_string_lossy())],
-            0,
-            false,
-            WallpaperFit::Fill,
-        ),
-        mlua::Value::Table(t) => {
-            if let Ok(engine) = t.get::<String>("engine") {
+fn parse_wallpaper(root: &Table) -> Option<WallpaperConfig> {
+    let (paths, interval_secs, shuffle, fit) = match root.get("wallpaper")? {
+        Value::String(s) => (vec![expand_home(s)], 0, false, WallpaperFit::Fill),
+        Value::Table(t) => {
+            if let Some(engine) = string(t, "engine") {
                 if !engine.eq_ignore_ascii_case("static") {
                     eprintln!("[config] wallpaper.engine = {engine:?} is not supported (only \"static\")");
                     return None;
                 }
             }
-            // `paths = {..}`, a single `path = ".."`, or the bare sequence.
-            let mut raw: Vec<String> = t.get::<Vec<String>>("paths").unwrap_or_default();
-            if let Ok(p) = t.get::<String>("path") {
-                raw.push(p);
-            }
-            raw.extend(t.sequence_values::<String>().filter_map(Result::ok));
+            // `paths = [..]` and/or a single `path = ".."`.
+            let mut raw: Vec<String> = strings(t, "paths").unwrap_or_default();
+            raw.extend(string(t, "path"));
             (
                 raw.iter().map(|p| expand_home(p)).collect(),
-                t.get::<u64>("interval").unwrap_or(0),
-                get_bool(&t, "shuffle", false),
-                t.get::<String>("fit")
-                    .map_or(WallpaperFit::Fill, |f| WallpaperFit::parse_str(&f)),
+                uint(t, "interval").unwrap_or(0),
+                get_bool(t, "shuffle", false),
+                string(t, "fit").map_or(WallpaperFit::Fill, |f| WallpaperFit::parse_str(&f)),
             )
         }
         _ => return None,
@@ -1097,29 +1228,29 @@ impl FontWeight {
 }
 
 /// `font = "Inter"` is shorthand for `font = { family = "Inter" }`.
-fn parse_font(gl: &mlua::Table, default: &FontSettings) -> FontSettings {
+fn parse_font(root: &Table, default: &FontSettings) -> FontSettings {
     let non_empty = |s: String| Some(s).filter(|s| !s.trim().is_empty());
-    match gl.get::<mlua::Value>("font") {
-        Ok(mlua::Value::String(s)) => FontSettings {
-            family: s.to_str().ok().and_then(|s| non_empty(s.to_string())),
+    match root.get("font") {
+        Some(Value::String(s)) => FontSettings {
+            family: non_empty(s.clone()),
             ..default.clone()
         },
-        Ok(mlua::Value::Table(t)) => {
-            let get = |key: &str| t.get::<String>(key).ok().and_then(non_empty);
+        Some(Value::Table(t)) => {
+            let get = |key: &str| string(t, key).and_then(non_empty);
             FontSettings {
                 family: get("family"),
                 mono: get("mono"),
                 icons: get("icons"),
-                fallback: t
-                    .get::<Vec<String>>("fallback")
+                fallback: strings(t, "fallback")
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(non_empty)
                     .collect(),
                 // Clamp so a typo ("size = 400") can't make the UI unusable.
-                size: t.get::<f32>("size").ok().filter(|s| *s > 0.0).map(|s| s.clamp(8.0, 48.0)),
-                weight: t
-                    .get::<String>("weight")
+                size: float(t, "size")
+                    .filter(|s| *s > 0.0)
+                    .map(|s| (s as f32).clamp(8.0, 48.0)),
+                weight: string(t, "weight")
                     .map(|s| FontWeight::from_str(&s))
                     .unwrap_or(default.weight),
             }
@@ -1128,153 +1259,166 @@ fn parse_font(gl: &mlua::Table, default: &FontSettings) -> FontSettings {
     }
 }
 
-fn parse_notify(gl: &mlua::Table, default: &NotifyConfig) -> NotifyConfig {
-    let Ok(nt) = gl.get::<mlua::Table>("notify") else {
+fn parse_notify(root: &Table, default: &NotifyConfig) -> NotifyConfig {
+    let Some(nt) = tbl(root, "notify") else {
         return default.clone();
     };
-    let shell = get_bool(&nt, "shell", default.shell);
-    let dnd_critical = get_bool(&nt, "dnd_critical", default.dnd_critical);
-    let timeout = match nt.get::<mlua::Value>("timeout") {
-        Ok(mlua::Value::Integer(n)) if n >= 0 => n as u64,
-        Ok(mlua::Value::Number(n)) if n >= 0.0 => n as u64,
-        _ => u64::from(default.timeout_ms),
-    };
+    let shell = get_bool(nt, "shell", default.shell);
+    let dnd_critical = get_bool(nt, "dnd_critical", default.dnd_critical);
+    let timeout = uint(nt, "timeout").unwrap_or(u64::from(default.timeout_ms));
     let timeout_ms = if timeout == 0 { 0 } else { timeout.clamp(500, 3_600_000) as u32 };
-    let max_visible = match nt.get::<mlua::Value>("max_visible") {
-        Ok(mlua::Value::Integer(n)) if n > 0 => (n as u64).min(10) as u32,
-        Ok(mlua::Value::Number(n)) if n >= 1.0 => (n as u64).min(10) as u32,
-        _ => default.max_visible,
-    };
+    let max_visible = uint(nt, "max_visible")
+        .filter(|n| *n > 0)
+        .map_or(default.max_visible, |n| n.min(10) as u32);
     NotifyConfig { shell, timeout_ms, max_visible: max_visible.clamp(1, 10), dnd_critical }
 }
 
-fn parse_osd(gl: &mlua::Table, default: &OsdConfig) -> OsdConfig {
-    let Ok(ot) = gl.get::<mlua::Table>("osd") else {
+fn parse_osd(root: &Table, default: &OsdConfig) -> OsdConfig {
+    let Some(ot) = tbl(root, "osd") else {
         return default.clone();
     };
-    OsdConfig { shell: get_bool(&ot, "shell", default.shell) }
+    OsdConfig { shell: get_bool(ot, "shell", default.shell) }
 }
 
-fn parse_blur(gl: &mlua::Table, default: &BlurConfig) -> BlurConfig {
-    let Ok(bt) = gl.get::<mlua::Table>("blur") else {
+fn parse_blur(root: &Table, default: &BlurConfig) -> BlurConfig {
+    let Some(bt) = tbl(root, "blur") else {
         return default.clone();
     };
-    let radius = match bt.get::<mlua::Value>("radius") {
-        Ok(mlua::Value::Integer(n)) if n > 0 => (n as u64).min(32) as u32,
-        Ok(mlua::Value::Number(n)) if n >= 1.0 => (n as u64).min(32) as u32,
-        _ => default.radius,
-    };
+    let radius = uint(bt, "radius")
+        .filter(|n| *n > 0)
+        .map_or(default.radius, |n| n.min(32) as u32);
     let mut namespaces = default.namespaces.clone();
-    if let Ok(t) = bt.get::<mlua::Table>("namespaces") {
-        for (name, on) in t.pairs::<String, mlua::Value>().flatten() {
-            if let mlua::Value::Boolean(b) = on {
-                namespaces.insert(name, b);
+    if let Some(t) = tbl(bt, "namespaces") {
+        for (name, on) in t {
+            if let Value::Boolean(b) = on {
+                namespaces.insert(name.clone(), *b);
             }
         }
     }
     BlurConfig {
-        enabled: get_bool(&bt, "enabled", default.enabled),
+        enabled: get_bool(bt, "enabled", default.enabled),
         radius,
-        windows: get_bool(&bt, "windows", default.windows),
+        windows: get_bool(bt, "windows", default.windows),
         namespaces,
     }
 }
 
-fn parse_idle(gl: &mlua::Table, default: &IdleConfig) -> IdleConfig {
-    let Ok(it) = gl.get::<mlua::Table>("idle") else {
+fn parse_idle(root: &Table, default: &IdleConfig) -> IdleConfig {
+    let Some(it) = tbl(root, "idle") else {
         return default.clone();
     };
-    let lock_timeout = match it.get::<mlua::Value>("lock_timeout") {
-        Ok(mlua::Value::Integer(n)) if n >= 0 => n as u32,
-        Ok(mlua::Value::Number(n)) if n >= 0.0 => n as u32,
-        _ => default.lock_timeout,
-    };
-    let dpms_timeout = match it.get::<mlua::Value>("dpms_timeout") {
-        Ok(mlua::Value::Integer(n)) if n >= 0 => n as u32,
-        Ok(mlua::Value::Number(n)) if n >= 0.0 => n as u32,
-        _ => default.dpms_timeout,
-    };
-    let suspend_timeout = match it.get::<mlua::Value>("suspend_timeout") {
-        Ok(mlua::Value::Integer(n)) if n >= 0 => n as u32,
-        Ok(mlua::Value::Number(n)) if n >= 0.0 => n as u32,
-        _ => default.suspend_timeout,
-    };
-    let lid_action = it
-        .get::<String>("lid_action")
+    let lid_action = string(it, "lid_action")
         .map(|s| LidAction::parse_str(&s))
         .unwrap_or(default.lid_action);
 
     IdleConfig {
-        enabled: get_bool(&it, "enabled", default.enabled),
-        lock_timeout,
-        dpms_timeout,
-        suspend_timeout,
+        enabled: get_bool(it, "enabled", default.enabled),
+        lock_timeout: uint32(it, "lock_timeout").unwrap_or(default.lock_timeout),
+        dpms_timeout: uint32(it, "dpms_timeout").unwrap_or(default.dpms_timeout),
+        suspend_timeout: uint32(it, "suspend_timeout").unwrap_or(default.suspend_timeout),
         lid_action,
     }
 }
 
-fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
-    let Ok(bt) = gl.get::<mlua::Table>("bar") else {
+fn parse_screenshot_mode(parent: &Table, kind: ScreenshotKind, default: &ScreenshotMode) -> ScreenshotMode {
+    let Some(t) = tbl(parent, kind.as_str()) else {
         return default.clone();
     };
-    let enabled = get_bool(&bt, "enabled", default.enabled);
-    let position = bt
-        .get::<String>("position")
+    // `keys = "Ctrl+Print"` binds, `keys = ""` unbinds, and a chord that does
+    // not parse keeps the default (with a warning). TOML has no `false`-as-
+    // absent trick, so `keys = false` also unbinds.
+    let keys = match t.get("keys") {
+        Some(Value::String(s)) => {
+            if s.trim().is_empty() {
+                None
+            } else {
+                match Chord::parse(s) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        eprintln!("[config] screenshot.{}.keys: {e}; keeping the default", kind.as_str());
+                        default.keys.clone()
+                    }
+                }
+            }
+        }
+        Some(Value::Boolean(false)) => None,
+        _ => default.keys.clone(),
+    };
+    ScreenshotMode {
+        keys,
+        save: get_bool(t, "save", default.save),
+        copy: get_bool(t, "copy", default.copy),
+    }
+}
+
+fn parse_screenshot(root: &Table, default: &ScreenshotConfig) -> ScreenshotConfig {
+    let Some(t) = tbl(root, "screenshot") else {
+        return default.clone();
+    };
+    ScreenshotConfig {
+        shell: get_bool(t, "shell", default.shell),
+        dir: string(t, "dir")
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .or_else(|| default.dir.clone()),
+        notify: get_bool(t, "notify", default.notify),
+        full: parse_screenshot_mode(t, ScreenshotKind::Full, &default.full),
+        area: parse_screenshot_mode(t, ScreenshotKind::Area, &default.area),
+        window: parse_screenshot_mode(t, ScreenshotKind::Window, &default.window),
+    }
+}
+
+fn parse_bar(root: &Table, default: &BarConfig) -> BarConfig {
+    let Some(bt) = tbl(root, "bar") else {
+        return default.clone();
+    };
+    let enabled = get_bool(bt, "enabled", default.enabled);
+    let position = string(bt, "position")
         .map(|s| BarPosition::from_str(&s))
         .unwrap_or(default.position);
-    let shell = get_bool(&bt, "shell", default.shell);
+    let shell = get_bool(bt, "shell", default.shell);
 
-    let height = match bt.get::<mlua::Value>("height") {
-        Ok(mlua::Value::Integer(n)) if n > 0 => n as u32,
-        Ok(mlua::Value::Number(n)) if n > 0.0 => n as u32,
-        _ => default.height,
-    };
+    let height = uint32(bt, "height").filter(|h| *h > 0).unwrap_or(default.height);
     let list = |key: &str, d: &Vec<String>| -> Vec<String> {
-        match bt.get::<mlua::Value>(key) {
-            Ok(mlua::Value::Table(t)) => t
-                .sequence_values::<String>()
-                .filter_map(Result::ok)
-                .collect(),
+        match bt.get(key) {
+            Some(Value::Array(_)) => strings(bt, key).unwrap_or_default(),
             _ => d.clone(),
         }
     };
 
-    // Per-widget options live under `bar.widgets`, so the sections stay a
+    // Per-widget options live under `[bar.widgets.*]`, so the sections stay a
     // plain list of names.
-    let widgets = bt.get::<mlua::Table>("widgets").ok();
-    let sub = |name: &str| widgets.as_ref().and_then(|w| w.get::<mlua::Table>(name).ok());
-    let text = |t: &Option<mlua::Table>, key: &str| -> Option<String> {
-        t.as_ref().and_then(|t| t.get::<String>(key).ok()).filter(|s| !s.trim().is_empty())
+    let widgets = tbl(bt, "widgets");
+    let sub = |name: &str| widgets.and_then(|w| tbl(w, name));
+    let text = |t: Option<&Table>, key: &str| -> Option<String> {
+        t.and_then(|t| string(t, key)).filter(|s| !s.trim().is_empty())
     };
 
-    let clock_format = text(&sub("clock"), "format").unwrap_or_else(|| default.clock_format.clone());
-    let disk_mount = text(&sub("disk"), "mount").unwrap_or_else(|| default.disk_mount.clone());
+    let clock_format = text(sub("clock"), "format").unwrap_or_else(|| default.clock_format.clone());
+    let disk_mount = text(sub("disk"), "mount").unwrap_or_else(|| default.disk_mount.clone());
 
     let weather = match sub("weather") {
-        Some(w) => match (w.get::<f64>("lat"), w.get::<f64>("lon")) {
-            (Ok(lat), Ok(lon)) => Some(BarWeather {
+        Some(w) => match (float(w, "lat"), float(w, "lon")) {
+            (Some(lat), Some(lon)) => Some(BarWeather {
                 lat,
                 lon,
-                units: text(&Some(w.clone()), "units").unwrap_or_else(|| "metric".into()),
+                units: text(Some(w), "units").unwrap_or_else(|| "metric".into()),
             }),
             _ => default.weather.clone(),
         },
         None => default.weather.clone(),
     };
 
-    // `custom = { uptime = { command = "uptime -p", interval = 30 } }`. Lua
-    // map order is unspecified, so sort by name for a stable bar.
+    // `[bar.widgets.custom.uptime]` with `command = "uptime -p"` and
+    // `interval = 30`. Sorted by name so the bar is stable however the file
+    // is ordered.
     let mut custom: Vec<BarCustom> = Vec::new();
     if let Some(ct) = sub("custom") {
-        for pair in ct.pairs::<String, mlua::Table>().filter_map(Result::ok) {
-            let (name, t) = pair;
-            let Ok(command) = t.get::<String>("command") else { continue };
-            let interval = match t.get::<mlua::Value>("interval") {
-                Ok(mlua::Value::Integer(n)) if n > 0 => n as u32,
-                Ok(mlua::Value::Number(n)) if n >= 1.0 => n as u32,
-                _ => 10,
-            };
-            custom.push(BarCustom { name, command, interval });
+        for (name, v) in ct {
+            let Some(t) = v.as_table() else { continue };
+            let Some(command) = string(t, "command") else { continue };
+            let interval = uint32(t, "interval").filter(|n| *n > 0).unwrap_or(10);
+            custom.push(BarCustom { name: name.clone(), command, interval });
         }
         custom.sort_by(|a, b| a.name.cmp(&b.name));
     } else {
@@ -1296,13 +1440,55 @@ fn parse_bar(gl: &mlua::Table, default: &BarConfig) -> BarConfig {
     }
 }
 
-/// A Lua boolean field with a default. `get::<bool>` alone is a trap: mlua
-/// turns a missing (nil) field into `false`, so a `true` default was ignored.
-fn get_bool(t: &mlua::Table, key: &str, default: bool) -> bool {
-    match t.get::<mlua::Value>(key) {
-        Ok(mlua::Value::Boolean(b)) => b,
-        _ => default,
+// ── TOML access helpers ─────────────────────────────────────────────────────
+//
+// Every section is read key by key, so one wrong-typed value falls back to its
+// own default instead of discarding the whole file.
+
+fn tbl<'a>(t: &'a Table, key: &str) -> Option<&'a Table> {
+    t.get(key)?.as_table()
+}
+
+fn string(t: &Table, key: &str) -> Option<String> {
+    t.get(key)?.as_str().map(str::to_owned)
+}
+
+/// A boolean with a default: absent or wrong-typed keeps the default.
+fn get_bool(t: &Table, key: &str, default: bool) -> bool {
+    t.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+/// A non-negative number (integer or float), truncated. Callers apply their
+/// own minimum, maximum and fallback.
+fn uint(t: &Table, key: &str) -> Option<u64> {
+    match t.get(key)? {
+        Value::Integer(n) if *n >= 0 => Some(*n as u64),
+        Value::Float(f) if *f >= 0.0 => Some(*f as u64),
+        _ => None,
     }
+}
+
+fn uint32(t: &Table, key: &str) -> Option<u32> {
+    u32::try_from(uint(t, key)?).ok()
+}
+
+fn float(t: &Table, key: &str) -> Option<f64> {
+    match t.get(key)? {
+        Value::Integer(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// The string elements of an array (elements of other types are skipped).
+fn strings(t: &Table, key: &str) -> Option<Vec<String>> {
+    Some(
+        t.get(key)?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1354,6 +1540,7 @@ pub struct VeilConfig {
     pub blur: BlurConfig,
     /// `idle = { ... }` config — see `IdleConfig`.
     pub idle: IdleConfig,
+    pub screenshot: ScreenshotConfig,
     /// Static wallpaper, if configured.
     pub wallpaper: Option<WallpaperConfig>,
 }
@@ -1383,6 +1570,7 @@ impl Default for VeilConfig {
             osd: OsdConfig::default(),
             blur: BlurConfig::default(),
             idle: IdleConfig::default(),
+            screenshot: ScreenshotConfig::default(),
             wallpaper: None,
         }
     }
@@ -1395,7 +1583,7 @@ impl Default for VeilConfig {
 
 const TOP_KEYS: &[&str] = &[
     "quality", "fps", "clipboard_sync", "refresh", "cage_timeout_secs", "input",
-    "gpu_render", "gpu_power", "default_layout", "output", "background", "theme", "theme_mode",
+    "gpu_render", "gpu_power", "default_layout", "screenshot", "output", "background", "theme", "theme_mode",
     "keybinds", "apps", "font", "bar", "notify", "osd", "wallpaper", "blur", "idle",
 ];
 const FONT_KEYS: &[&str] = &["family", "mono", "icons", "fallback", "size", "weight"];
@@ -1408,6 +1596,8 @@ const NOTIFY_KEYS: &[&str] = &["shell", "timeout", "max_visible", "dnd_critical"
 const OSD_KEYS: &[&str] = &["shell"];
 const BLUR_KEYS: &[&str] = &["enabled", "radius", "windows", "namespaces"];
 const IDLE_KEYS: &[&str] = &["enabled", "lock_timeout", "dpms_timeout", "suspend_timeout", "lid_action"];
+const SCREENSHOT_KEYS: &[&str] = &["shell", "dir", "notify", "full", "area", "window"];
+const SCREENSHOT_MODE_KEYS: &[&str] = &["keys", "save", "copy"];
 
 /// Keys a `keybinds` table accepts (also valid at top level when there is no
 /// `keybinds` table, because the parser falls back to the globals).
@@ -1415,13 +1605,6 @@ fn keybind_keys() -> Vec<&'static str> {
     ["mod_key", "apps"]
         .into_iter()
         .chain(KEYBIND_FIELDS.iter().map(|(f, _)| *f))
-        .collect()
-}
-
-fn global_names(gl: &mlua::Table) -> std::collections::HashSet<String> {
-    gl.pairs::<String, mlua::Value>()
-        .flatten()
-        .map(|(k, _)| k)
         .collect()
 }
 
@@ -1525,6 +1708,14 @@ fn lint_config(gl: &mlua::Table, builtin: &std::collections::HashSet<String>) ->
     }
     if let Ok(t) = gl.get::<mlua::Table>("idle") {
         lint_table("idle", &t, IDLE_KEYS, &mut out);
+    }
+    if let Ok(t) = gl.get::<mlua::Table>("screenshot") {
+        lint_table("screenshot", &t, SCREENSHOT_KEYS, &mut out);
+        for kind in ScreenshotKind::ALL {
+            if let Ok(m) = t.get::<mlua::Table>(kind.as_str()) {
+                lint_table(&format!("screenshot.{}", kind.as_str()), &m, SCREENSHOT_MODE_KEYS, &mut out);
+            }
+        }
     }
     if let Ok(bar) = gl.get::<mlua::Table>("bar") {
         lint_table("bar", &bar, BAR_KEYS, &mut out);
@@ -1641,6 +1832,13 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
         .unwrap_or(d.theme_name);
     let theme = Theme::for_name(theme_name);
 
+    let screenshot = parse_screenshot(&gl, &d.screenshot);
+    let mut keybinds = parse_keybinds(&gl);
+    // Opt-in: no `screenshot` table, no keys grabbed. With one, every kind
+    // gets its default chord unless the table unbinds or replaces it.
+    if gl.get::<mlua::Table>("screenshot").is_ok() {
+        keybinds.chords = screenshot.chords();
+    }
     Ok(VeilConfig {
         quality: gl
             .get::<String>("quality")
@@ -1665,7 +1863,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
             .get::<String>("default_layout")
             .map(|s| DefaultLayout::parse_str(&s))
             .unwrap_or(d.default_layout),
-        keybinds: parse_keybinds(&gl),
+        keybinds,
         output: gl
             .get::<String>("output")
             .map(|s| OutputPref::from_str(&s))
@@ -1686,6 +1884,7 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
         osd: parse_osd(&gl, &d.osd),
         blur: parse_blur(&gl, &d.blur),
         idle: parse_idle(&gl, &d.idle),
+        screenshot,
         font: parse_font(&gl, &d.font),
         wallpaper: parse_wallpaper(&gl),
     })
@@ -1840,6 +2039,73 @@ mod app_bind_tests {
         // A normal override still works, and untouched actions keep defaults.
         assert_eq!(kb.action_for('x'), Some(Action::Close));
         assert_eq!(kb.action_for('l'), Some(Action::FocusRight));
+    }
+
+    #[test]
+    fn chord_parse_reads_modifiers_and_one_key() {
+        let c = Chord::parse("Alt+Print").unwrap();
+        assert_eq!((c.alt, c.ctrl, c.shift, c.logo, c.key.as_str()), (true, false, false, false, "Print"));
+        let c = Chord::parse("ctrl + shift + F12").unwrap();
+        assert_eq!((c.alt, c.ctrl, c.shift, c.logo, c.key.as_str()), (false, true, true, false, "F12"));
+        assert!(Chord::parse("Super+s").unwrap().logo);
+        assert_eq!(Chord::parse("Print").unwrap().key, "Print");
+    }
+
+    #[test]
+    fn chord_parse_rejects_bad_input() {
+        assert!(Chord::parse("").is_err());
+        assert!(Chord::parse("Alt+").is_err());
+        assert!(Chord::parse("Alt+Shift").is_err()); // modifiers only
+        assert!(Chord::parse("Alt+Print+C").is_err()); // two keys
+    }
+
+    #[test]
+    fn screenshot_keys_are_opt_in() {
+        // No `screenshot` table: nothing is grabbed, but the defaults for
+        // save/copy/notify still apply to `veil shell screenshot`.
+        let c = load_str("ss-default", "fps = 0");
+        assert!(c.screenshot.shell && c.screenshot.notify);
+        assert_eq!(c.screenshot.dir, None);
+        assert!(c.keybinds.chords.is_empty());
+        // An empty `screenshot` table opts in with the default chords. Window
+        // is Ctrl+Print, never Alt+Print (Alt+SysRq is a kernel command).
+        let c = load_str("ss-optin", "screenshot = {}");
+        assert_eq!(c.keybinds.chords.len(), 3);
+        assert!(c.keybinds.chords.contains(&(
+            Chord::parse("Ctrl+Print").unwrap(),
+            ChordAction::Screenshot(ScreenshotKind::Window)
+        )));
+        assert!(!c.keybinds.chords.iter().any(|(ch, _)| ch.alt));
+    }
+
+    #[test]
+    fn screenshot_table_overrides_per_kind() {
+        let c = load_str(
+            "ss-custom",
+            r#"screenshot = {
+                dir = "/tmp/shots",
+                notify = false,
+                area = { keys = "Ctrl+Print", copy = false },
+                window = { keys = false },
+            }"#,
+        );
+        let s = &c.screenshot;
+        assert_eq!(s.dir.as_deref(), Some("/tmp/shots"));
+        assert!(!s.notify);
+        assert_eq!(s.area.keys, Some(Chord::parse("Ctrl+Print").unwrap()));
+        assert!(s.area.save && !s.area.copy);
+        assert_eq!(s.window.keys, None);
+        assert_eq!(s.full.keys, Some(Chord::parse("Print").unwrap())); // untouched
+        // Unbound kinds grab no key.
+        assert_eq!(c.keybinds.chords.len(), 2);
+    }
+
+    #[test]
+    fn screenshot_shell_false_grabs_no_keys_and_bad_chord_keeps_default() {
+        let c = load_str("ss-off", "screenshot = { shell = false }");
+        assert!(c.keybinds.chords.is_empty());
+        let c = load_str("ss-bad", r#"screenshot = { full = { keys = "Alt+Print+C" } }"#);
+        assert_eq!(c.screenshot.full.keys, Some(Chord::parse("Print").unwrap()));
     }
 
     #[test]

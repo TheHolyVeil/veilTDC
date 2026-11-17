@@ -4,4 +4,4 @@ version = "1.2.0"
 edition = "2021"
 
 [dependencies]
-mlua = { workspace = true }
+toml = { workspace = true }
