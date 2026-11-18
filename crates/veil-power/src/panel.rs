@@ -242,7 +242,8 @@ impl Panel {
         (false, None)
     }
 
-    /// Render panel returning BGRA bytes for wl_shm Argb8888 and click zones.
+    /// Render panel returning premultiplied RGBA bytes (modal.rs handles the
+    /// Argb8888 channel swap) and click zones.
     pub fn render(&mut self, w: u32, h: u32) -> (Vec<u8>, Vec<ClickZone>) {
         let mut pm = Pixmap::new(w, h).unwrap();
 
@@ -261,16 +262,10 @@ impl Panel {
             Screen::Confirm(action) => self.draw_confirm(&mut pm, w, h, action, &mut zones),
         }
 
-        // Convert Premultiplied RGBA from tiny-skia to Argb8888 (BGRA order)
-        let data = pm.data();
-        let mut out = Vec::with_capacity(data.len());
-        for chunk in data.as_chunks::<4>().0 {
-            out.push(chunk[2]); // B
-            out.push(chunk[1]); // G
-            out.push(chunk[0]); // R
-            out.push(chunk[3]); // A
-        }
-        (out, zones)
+        // Return raw premultiplied RGBA — modal.rs does the single Argb8888
+        // channel swap. The old code did a manual BGRA swap here too, which
+        // combined with modal.rs's swap produced a double-swap (red ↔ blue).
+        (pm.take(), zones)
     }
 
     fn draw_main(&mut self, pm: &mut Pixmap, sw: u32, sh: u32, zones: &mut Vec<ClickZone>) {
@@ -326,8 +321,9 @@ impl Panel {
             fill_circle(pm, cx, cy, btn_radius, bg);
 
             // Border / selection ring
-            let border_color = if selected && action == Action::Shutdown {
-                Color::from_rgba8(self.tokens.err[0], self.tokens.err[1], self.tokens.err[2], 255)
+            let border_color = if action == Action::Shutdown {
+                // Always use err (red) for the shutdown button border to signal danger
+                Color::from_rgba8(self.tokens.err[0], self.tokens.err[1], self.tokens.err[2], if selected { 255 } else { 180 })
             } else if selected {
                 Color::from_rgba8(
                     self.tokens.accent[0],
@@ -376,7 +372,9 @@ impl Panel {
             // Label below button
             let label = action.label();
             let (lw, _) = self.text_system.measure(label, Role::UI, 13.0);
-            let label_col = if selected {
+            let label_col = if selected && action == Action::Shutdown {
+                Color::from_rgba8(self.tokens.err[0], self.tokens.err[1], self.tokens.err[2], 255)
+            } else if selected {
                 Color::from_rgba8(self.tokens.accent[0], self.tokens.accent[1], self.tokens.accent[2], 255)
             } else {
                 Color::from_rgba8(self.tokens.text[0], self.tokens.text[1], self.tokens.text[2], 255)
@@ -423,12 +421,21 @@ impl Panel {
         );
         fill_rounded_rect(pm, dx, dy, dialog_w, dialog_h, 14.0, card_bg);
 
-        let border_col = Color::from_rgba8(
-            self.tokens.accent[0],
-            self.tokens.accent[1],
-            self.tokens.accent[2],
-            220,
-        );
+        let border_col = if action == Action::Shutdown {
+            Color::from_rgba8(
+                self.tokens.err[0],
+                self.tokens.err[1],
+                self.tokens.err[2],
+                220,
+            )
+        } else {
+            Color::from_rgba8(
+                self.tokens.accent[0],
+                self.tokens.accent[1],
+                self.tokens.accent[2],
+                220,
+            )
+        };
         stroke_rounded_rect(pm, dx, dy, dialog_w, dialog_h, 14.0, border_col, 1.5);
 
         // Icon
@@ -511,7 +518,12 @@ impl Panel {
             Color::from_rgba8(self.tokens.surface_hi[0], self.tokens.surface_hi[1], self.tokens.surface_hi[2], 200)
         };
         fill_rounded_rect(pm, confirm_x, btn_y, btn_w, btn_h, 8.0, ok_bg);
-        stroke_rounded_rect(pm, confirm_x, btn_y, btn_w, btn_h, 8.0, border_col, if ok_sel { 2.0 } else { 1.0 });
+        let confirm_border = if action == Action::Shutdown {
+            Color::from_rgba8(self.tokens.err[0], self.tokens.err[1], self.tokens.err[2], 220)
+        } else {
+            border_col
+        };
+        stroke_rounded_rect(pm, confirm_x, btn_y, btn_w, btn_h, 8.0, confirm_border, if ok_sel { 2.0 } else { 1.0 });
 
         let (ow, _) = self.text_system.measure(action.label(), Role::UI, 14.0);
         let confirm_text_col = if ok_sel {

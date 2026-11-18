@@ -87,7 +87,7 @@ impl Widget for MemoryWidget {
             theme.text_dim
         };
 
-        let icon = "󰍛 ";
+        let icon = "\u{efc5} ";  // nf-fa-memory (RAM stick)
         let label = format!("{icon}{:.0}%", self.pct);
         crate::util::label(pixmap, text, m, x, y, h, &label, color)
     }
