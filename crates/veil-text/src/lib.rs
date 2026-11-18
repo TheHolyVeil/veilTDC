@@ -49,7 +49,7 @@ struct CachedGlyph {
     fixed: bool,
 }
 
-/// What the user configured (`font = { ... }` in config.lua).
+/// What the user configured (`[font]` in config.toml).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FontConfig {
     pub family: Option<String>,

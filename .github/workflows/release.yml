@@ -65,12 +65,14 @@ jobs:
               mv "$f" release/
             fi
           done
-          cp config.lua release/config.lua
+          cp config.toml release/config.toml
       - name: Create tar.gz (raw binaries)
         run: |
           cd release
-          for f in veil-host-*; do
-            tar -czf "${f}.tar.gz" "$f"
+          for f in veil-host-x86_64-* veil-host-aarch64-*; do
+            if [ -f "$f" ]; then
+              tar -czf "${f}.tar.gz" "$f"
+            fi
           done
       - name: Create .deb packages (simple dpkg-deb)
         env:
@@ -79,7 +81,7 @@ jobs:
           set -e
           DEB_VERSION="${VERSION#v}"
           cd release
-          for f in veil-host-*; do
+          for f in veil-host-x86_64-* veil-host-aarch64-*; do
             if [ -f "$f" ]; then
               case "$f" in
                 *x86_64*) arch=amd64; deb_arch=amd64;;
@@ -87,10 +89,19 @@ jobs:
                 *) arch=all; deb_arch=all;;
               esac
               pkgdir="pkg_${arch}"
-              mkdir -p "${pkgdir}/DEBIAN" "${pkgdir}/usr/local/bin" "${pkgdir}/usr/share/veil-host"
+              rm -rf "${pkgdir}"
+              mkdir -p "${pkgdir}/DEBIAN" "${pkgdir}/usr/local/bin" "${pkgdir}/usr/share/veil-host" "${pkgdir}/usr/share/wayland-sessions"
               cp "$f" "${pkgdir}/usr/local/bin/veil-host"
               chmod 755 "${pkgdir}/usr/local/bin/veil-host"
-              cp config.lua "${pkgdir}/usr/share/veil-host/config.lua"
+              if [ -f ../dist/veil-session ]; then
+                cp ../dist/veil-session "${pkgdir}/usr/local/bin/veil-session"
+                chmod 755 "${pkgdir}/usr/local/bin/veil-session"
+              fi
+              if [ -f ../dist/veil.desktop ]; then
+                cp ../dist/veil.desktop "${pkgdir}/usr/share/wayland-sessions/veil.desktop"
+                chmod 644 "${pkgdir}/usr/share/wayland-sessions/veil.desktop"
+              fi
+              cp config.toml "${pkgdir}/usr/share/veil-host/config.toml"
               printf "%s\n" \
                 "Package: veil-host" \
                 "Version: ${DEB_VERSION}" \
@@ -98,10 +109,11 @@ jobs:
                 "Priority: optional" \
                 "Architecture: ${deb_arch}" \
                 "Maintainer: ${GITHUB_ACTOR} <>" \
-                "Description: veil-host binary" \
-                "Depends: libseat-dev" \
+                "Description: veil-host binary and session" \
+                "Depends: libseat1 | libseat-dev" \
                 > "${pkgdir}/DEBIAN/control"
               dpkg-deb --build "${pkgdir}" "veil-host_${VERSION}_${deb_arch}.deb"
+              rm -rf "${pkgdir}"
             fi
           done
       - name: Upload release artifacts
@@ -111,7 +123,7 @@ jobs:
           path: |
             release/veil-host-x86_64-unknown-linux-gnu
             release/veil-host-aarch64-unknown-linux-gnu
-            release/config.lua
+            release/config.toml
             release/*.tar.gz
             release/*.deb
   release:
@@ -132,6 +144,6 @@ jobs:
           files: |
             release/veil-host-x86_64-unknown-linux-gnu
             release/veil-host-aarch64-unknown-linux-gnu
-            release/config.lua
+            release/config.toml
             release/*.tar.gz
             release/*.deb

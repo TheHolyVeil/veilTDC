@@ -59,7 +59,7 @@ impl GpuEncoder {
     /// CPU path (`veil_render::rgba_to_halfblocks` / `compute_luma`) doesn't
     /// pay. Returning `None` here means the caller falls back to that CPU
     /// path automatically, which is strictly faster in that situation.
-    /// `low_power` (config.lua `gpu_power = "low"`) prefers the integrated GPU.
+    /// `low_power` (config.toml `gpu_power = "low"`) prefers the integrated GPU.
     pub fn new(low_power: bool) -> Option<Self> {
         pollster::block_on(Self::init(low_power))
     }
@@ -73,7 +73,7 @@ impl GpuEncoder {
             display: None,
         });
 
-        // G4: adapter choice comes from config.lua's `gpu_power`. High (the
+        // G4: adapter choice comes from config.toml's `gpu_power`. High (the
         // default) takes the fastest adapter; low prefers the integrated one,
         // for hybrid laptops where waking the discrete GPU costs battery.
         let power_preference = if low_power {

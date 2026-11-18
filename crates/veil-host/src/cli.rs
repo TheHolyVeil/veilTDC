@@ -19,7 +19,7 @@ use std::time::Duration;
 // without the auto-tuning pathology. Since the two hot alloc/free paths are
 // now reuse-in-place instead (see server.rs), this is a smaller win than it
 // would've been on its own, but still real for anything still churning
-// (Lua allocations, wayland-server internals, etc).
+// (wayland-server internals, allocator churn, etc).
 use veil_config::detect_quality;
 use crate::input_backend::{self, InputCtx, InputGeometry};
 use crate::{Host, HostConfig};
@@ -85,7 +85,7 @@ fn print_help() {
     println!("  veil-host list-modes");
     println!();
     println!("CONFIG");
-    println!("  Place config.lua at ./config.lua or ~/.config/veil/config.lua");
+    println!("  Place config.toml at ./config.toml or ~/.config/veil/config.toml");
     println!("    quality = \"auto\"   -- auto | kitty | pixel | pixel256 | pixel16 | ascii | ascii_edge");
     println!("    fps     = 60       -- compositor frame rate cap (0 = match the display)");
     println!("    refresh = \"max\"   -- DRM mode: preferred | max | <Hz>");
@@ -232,7 +232,7 @@ pub fn run_cli() -> std::io::Result<()> {
 
     cfg.spawn = if is_start { None } else { Some(spawn) };
 
-    // Load config.lua (see `config_path()`) for keybinds + output pref etc.
+    // Load config.toml (see `config_path()`) for keybinds + output pref etc.
     // Falls back to defaults if no config file is found or it fails to parse.
     let vcfg = load_veil_config();
     cfg.keybinds = vcfg.keybinds.clone();
@@ -680,7 +680,7 @@ fn cmd_list_modes() {
         println!();
     }
 
-    println!("Set one with `quality = \"...\"` in config.lua (default \"auto\").");
+    println!("Set one with `quality = \"...\"` in config.toml (default \"auto\").");
     println!("Output backend auto-detects based on environment (terminal vs DRM/KMS).");
 }
 
@@ -712,7 +712,7 @@ fn cmd_probe() -> std::io::Result<()> {
     let compositor_mode = wayland != "unset" || display != "unset";
 
     // Mirrors `output::detect`'s actual precedence — VEIL_OUTPUT > nested
-    // compositor check > config.lua `output` pref > SSH session > try DRM.
+    // compositor check > config.toml `output` pref > SSH session > try DRM.
     // Keep this in sync with that function; probe is only useful if it tells
     // you the truth about what `run` will actually pick.
     let veil_output_env = std::env::var("VEIL_OUTPUT").ok();
@@ -721,8 +721,8 @@ fn cmd_probe() -> std::io::Result<()> {
         Some("terminal") | Some("term") => "terminal (VEIL_OUTPUT forces it)",
         _ if compositor_mode => "terminal (nested compositor detected)",
         _ => match vcfg.output {
-            veil_config::OutputPref::Terminal => "terminal (config.lua output=terminal)",
-            veil_config::OutputPref::Drm => "DRM/KMS (config.lua output=drm, forced)",
+            veil_config::OutputPref::Terminal => "terminal (config.toml output=terminal)",
+            veil_config::OutputPref::Drm => "DRM/KMS (config.toml output=drm, forced)",
             veil_config::OutputPref::Auto if ssh_mode => "terminal (SSH session)",
             veil_config::OutputPref::Auto => "DRM/KMS (if available), else terminal",
         },

@@ -1,6 +1,6 @@
 //! Bar settings as they travel over IPC.
 //!
-//! The compositor reads `bar = { ... }` from Lua; components never link Lua
+//! The compositor reads the `[bar]` table of config.toml; components never parse it
 //! (section 8), so the bar receives this typed form in the `hello` reply and
 //! in `config` events. Every field has a default, so a partial or older
 //! payload still deserialises, and [`BarSettings::sanitized`] puts values

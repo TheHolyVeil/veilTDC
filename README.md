@@ -19,7 +19,7 @@ Veil is designed to be:
 - embedded
 - device-variable
 
-This project is still in active development. The README is a current snapshot of the architecture and direction. May not have up-to-date information. Such as the config and how to edit it. Pray for yourself that the default config.lua has everything in it.
+This project is still in active development. The README is a current snapshot of the architecture and direction. May not have up-to-date information. Such as the config and how to edit it. Pray for yourself that the default config.toml has everything in it.
 
 ##  Installation
 
@@ -28,13 +28,13 @@ This project is still in active development. The README is a current snapshot of
 Install `veil-host` using the installer script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/viewerofall/veilTDC/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TheHolyVeil/veilTDC/main/install.sh | bash
 ```
 
 Or with `wget`:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/viewerofall/veilTDC/main/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/TheHolyVeil/veilTDC/main/install.sh | bash
 ```
 
 *Default install path:* `/usr/local/bin/veil-host` (or set `INSTALL_DIR=~/.local/bin` for non-root install).
@@ -44,7 +44,7 @@ wget -qO- https://raw.githubusercontent.com/viewerofall/veilTDC/main/install.sh 
 **Abyss** (package `velogin`) is a lightweight graphical TTY login manager designed for Veil and Void/Linux systems. It provides PAM authentication, session selection, avatar/wallpaper support, and boots straight into Veil on DRM/KMS hardware.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/viewerofall/veilTDC/main/veil-login/dist/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/TheHolyVeil/veilTDC/main/veil-login/dist/install.sh | sudo bash
 ```
 
 After installation, enable `velogin`:
@@ -53,21 +53,6 @@ After installation, enable `velogin`:
 sudo systemctl disable getty@tty1.service
 sudo systemctl enable velogin.service
 sudo reboot
-```
-
-### 3. Build from Source
-
-Requirements: Rust stable & Vulkan/DRM development headers (`libseat`, `libpam`, `libgbm`).
-
-```bash
-git clone https://github.com/viewerofall/veilTDC.git
-cd veilTDC
-
-# Build all workspace crates in release mode
-cargo build --release
-
-# Install veil-host binary
-sudo install -Dm755 target/release/veil-host /usr/local/bin/veil-host
 ```
 
 ---
@@ -101,7 +86,7 @@ veil-host list-modes
 
 ## Keybindings Reference
 
-Default modifier key is `Super` (configurable to `Alt`, `Ctrl`, or `Shift` in `config.lua`). Press **`Super+/`** inside Veil anytime to open the live shortcut reference overlay.
+Default modifier key is `Super` (configurable to `Alt`, `Ctrl`, or `Shift` in `config.toml`). Press **`Super+/`** inside Veil anytime to open the live shortcut reference overlay.
 
 | Category | Action | Keybinding |
 |---|---|---|
@@ -110,84 +95,88 @@ Default modifier key is `Super` (configurable to `Alt`, `Ctrl`, or `Shift` in `c
 | | Rotate split axis | `Super + r` |
 | | Toggle Layout (Dwindle ↔ Scroll) | `Super + w` |
 | | Grow / Shrink primary pane | `Super + =` / `Super + -` |
-| | Toggle Fullscreen | `Super + f` |
+| | Toggle Fullscreen | `Super + g` |
 | | Close focused window | `Super + q` |
 | **Workspaces** | Switch to Workspace 1 – 9 | `Super + 1` .. `9` |
 | | Move window to Workspace 1 – 9 & Follow | `Super + Shift + 1` .. `9` |
 | **DE Tools** | App Launcher (Fuzzy search / Command box) | `Super + d` |
 | | Power Menu (Poweroff / Reboot / Logout) | `Super + p` |
 | | Live Help Overlay | `Super + /` |
-| | Reload Lua Configuration | `Super + c` |
+| | Reload Configuration | `Super + ;` |
 | | Graceful Desktop Exit | `Shift + Alt + E` (or `veil-host stop`) |
 
 ---
 
-## Configuration (`config.lua`)
+## Configuration (`config.toml`)
 
-Place your configuration file at `~/.config/veil/config.lua` or `./config.lua`.
+Place your configuration file at `~/.config/veil/config.toml` or `./config.toml`.
 
-```lua
--- Quality / Render mode: auto | pixel | ascii | ascii_edge | kitty
+```toml
+# Quality / Render mode: auto | kitty | pixel | pixel256 | pixel16 | ascii | ascii_edge
 quality = "auto"
 
--- Target framerate cap
-fps = 60
+# Target framerate cap (0 = match display)
+fps = 0
 
--- Output backend preference: auto | drm | terminal
+# Output backend preference: auto | drm | terminal
 output = "auto"
 
--- Enable GPU compute acceleration (wgpu Vulkan)
+# Enable GPU compute acceleration (wgpu Vulkan)
 gpu_render = true
 
--- gpu power for laptops and such. Low for hybrids.
+# GPU power preference: high | low (low prefers integrated GPU on hybrid laptops)
 gpu_power = "high"
 
--- Desired refresh rate (up to what your monitor supports)
-refresh = 60
+# Desired refresh rate: preferred | max | <Hz>
+refresh = "max"
 
--- Desktop Color Theme
--- Options: default | nord | dracula | catppuccin | gruvbox | everforest
---          tokyonight | solarized | rosepine | monokai | onedark | deepsage
+# Desktop Color Theme
+# Options: default | nord | dracula | catppuccin | gruvbox | everforest
+#          tokyonight | solarized | rosepine | monokai | onedark | deepsage | wallpaper
 theme = "deepsage"
+theme_mode = "dark" # dark | light | auto (used by theme = "wallpaper")
 
--- Background void-fill color (hex string)
-background = "#232b26"
+# Background void-fill color (hex string)
+# background = "#232b26"
 
--- Desktop Status Bar Configuration
-bar = {
-  enabled = true,
-  position = "bottom" -- "top" | "bottom"
-}
+# Desktop Status Bar Configuration
+[bar]
+enabled = true
+position = "top" # top | bottom
+shell = true
 
--- Keybindings Configuration
-keybinds = {
-  mod_key = "super", -- "super" | "alt" | "ctrl" | "shift"
+# Keybindings Configuration
+[keybinds]
+mod_key = "super" # super | alt | ctrl | shift
 
-  focus_left    = "h",
-  focus_right   = "l",
-  focus_up      = "k",
-  focus_down    = "j",
-  swap          = "s",
-  rotate        = "r",
-  close         = "q",
-  toggle_layout = "w",
-  fullscreen    = "f",
-  reload_config = "c",
-  resize_grow   = "=",
-  resize_shrink = "-",
-}
+focus_left      = "h"
+focus_right     = "l"
+focus_up        = "k"
+focus_down      = "j"
+swap            = "s"
+rotate          = "r"
+close           = "q"
+toggle_layout   = "w"
+fullscreen      = "g"
+fake_fullscreen = "f"
+reload_config   = ";"
+resize_grow     = "="
+resize_shrink   = "-"
 
-  -- Direct Application Launchers (<mod_key> + key)
-  -- Apps defined here are automatically added to the status bar shortcuts!
-  apps = {
-    { "b", "firefox" },
-    { "t", "kitty" },
-  }
-  
--- Wallpaper recommend config 
-wallpaper = { engine = "static", paths = { "/home/abyss/Pictures/Wallpapers" },
-              interval = 600, shuffle = true, fit = "fill" }
+# Direct Application Launchers (<mod_key> + key)
+# Apps defined here are automatically added to the status bar shortcuts!
+apps = [
+  ["b", "firefox"],
+  ["t", "kitty"],
+]
 
+# Static wallpaper (optional)
+# [wallpaper]
+# engine = "static"
+# paths = ["~/Pictures/Wallpapers"]
+# interval = 600
+# shuffle = true
+# fit = "fill"
 ```
 
 ---
@@ -418,7 +407,7 @@ The repository already includes a substantial set of desktop features and system
 
 ### Configurability
 - hot-reloadable config
-- Lua config file support
+- TOML config file support
 - per-user desktop customization
 - environment tuning without rebuilding the whole system
 
@@ -445,17 +434,23 @@ This repository is a Rust workspace with a modular layout:
 ```text
 veilTDC/
 ├── Cargo.toml
-├── config.lua
+├── Cargo.lock
+├── config.toml
 ├── install.sh
-├── pkg.sh
-├── render_real_font.py
-├── test-braille.sh
 ├── README.md
 ├── .cargo/
 ├── .github/
 ├── dist/
-├── veil-config/
-├── veil-host/
-├── veil-login/
-├── veil-render/
+├── crates/
+│   ├── veil/             # Main multicall binary
+│   ├── veil-config/      # TOML config parsing and validation
+│   ├── veil-host/        # Wayland compositor core
+│   ├── veil-bar/         # Status bar
+│   ├── veil-notify/      # Notification daemon
+│   ├── veil-launch/      # App launcher & calculator
+│   ├── veil-osd/         # On-screen display overlay
+│   ├── veil-power/       # Power menu
+│   ├── veil-lock/        # Lock screen
+│   ├── veil-screenshot/  # Screenshot capture client
+│   └── ...
 └── ...

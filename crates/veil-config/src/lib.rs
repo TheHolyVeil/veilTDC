@@ -1,7 +1,7 @@
 use toml::{Table, Value};
 use std::path::{Path, PathBuf};
 
-/// Which GPU the frame encoder asks for (`gpu_power` in config.lua).
+/// Which GPU the frame encoder asks for (`gpu_power` in config.toml).
 /// `High` is the default: fastest adapter, never a surprise slowdown on
 /// weak hardware. `Low` prefers the integrated GPU, so a hybrid-graphics
 /// laptop doesn't wake the discrete one for two tiny compute shaders.
@@ -29,7 +29,7 @@ impl GpuPower {
 }
 
 /// Which tiling layout every workspace starts in (`default_layout` in
-/// config.lua). The `ToggleLayout` action still flips a workspace at
+/// config.toml). The `ToggleLayout` action still flips a workspace at
 /// runtime; this only sets the layout fresh workspaces begin in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DefaultLayout {
@@ -129,7 +129,7 @@ pub struct ScreenshotMode {
     pub copy: bool,
 }
 
-/// `screenshot` table in config.lua. The keys are opt-in: Veil only grabs
+/// `screenshot` table in config.toml. The keys are opt-in: Veil only grabs
 /// them when the table exists (an empty `screenshot = {}` is enough, and then
 /// each kind has the default chord shown in `Default`); without it, only
 /// `veil shell screenshot <kind>` runs, from a launcher or a script.
@@ -185,7 +185,7 @@ impl Default for ScreenshotConfig {
     }
 }
 
-/// Render quality ladder (`quality` in config.lua), best to last resort:
+/// Render quality ladder (`quality` in config.toml), best to last resort:
 /// Kitty graphics, then halfblock in truecolor / 256 / 16 colours, then ASCII.
 /// `Sixel` parses but is not implemented; it resolves like `Auto`.
 #[derive(Debug, Clone, PartialEq)]
@@ -230,7 +230,7 @@ impl Quality {
 }
 
 /// Detect the best supported render mode from the process environment.
-/// The one resolver: `config.lua`'s `quality = "auto"` and the terminal
+/// The one resolver: `config.toml`'s `quality = "auto"` and the terminal
 /// backend both go through it. Never returns `Auto` or `Sixel`.
 pub fn detect_quality() -> Quality {
     detect_quality_with(|k| std::env::var(k).ok())
@@ -284,7 +284,7 @@ pub fn detect_quality_with(env: impl Fn(&str) -> Option<String>) -> Quality {
     Quality::AsciiLuma
 }
 
-/// Output backend preference (`output` in Lua). `Auto` keeps the existing
+/// Output backend preference (`output` in config.toml). `Auto` keeps the existing
 /// env-based heuristic (WAYLAND_DISPLAY/DISPLAY/SSH_* → terminal, else try
 /// DRM/KMS). `Drm` skips the heuristic entirely and always goes straight for
 /// DRM/KMS on `run` — for a bare-TTY daily driver with real GPU hardware,
@@ -307,7 +307,7 @@ impl OutputPref {
     }
 }
 
-/// Which display mode the DRM backend drives (`refresh` in Lua). The
+/// Which display mode the DRM backend drives (`refresh` in config.toml). The
 /// resolution is always the connector's preferred mode's; this only picks the
 /// refresh rate among modes of that size. `Preferred` is the EDID's first
 /// mode, which many high-refresh panels advertise at 60 Hz.
@@ -330,7 +330,7 @@ impl RefreshPref {
     }
 }
 
-/// The modifier held down with a tiling keybind (`keybinds.mod_key` in Lua).
+/// The modifier held down with a tiling keybind (`keybinds.mod_key` in config.toml).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModKey {
     Super,
@@ -469,7 +469,7 @@ impl Default for Keybinds {
     fn default() -> Self {
         Self {
             mod_key: ModKey::Super,
-            // Screenshot keys are opt-in: they are only added when config.lua
+            // Screenshot keys are opt-in: they are only added when config.toml
             // has a `screenshot` table.
             chords: Vec::new(),
             binds: vec![
@@ -521,7 +521,7 @@ fn bind_key(s: &str) -> Option<char> {
     }
 }
 
-/// (Lua field name, Action): order here is the help-menu display order.
+/// (config key, Action): order here is the help-menu display order.
 const KEYBIND_FIELDS: [(&str, Action); 19] = [
     ("focus_left", Action::FocusLeft),
     ("focus_right", Action::FocusRight),
@@ -636,8 +636,8 @@ fn parse_keybinds(root: &Table) -> Keybinds {
     Keybinds { mod_key, binds, chords: Vec::new() }
 }
 
-/// Which built-in color preset `theme = "..."` in config.lua selects.
-/// `Default` is the original hardcoded amethyst/purple look — a config.lua
+/// Which built-in color preset `theme = "..."` in config.toml selects.
+/// `Default` is the original hardcoded amethyst/purple look — a config.toml
 /// with no `theme` key resolves here, so existing configs render unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeName {
@@ -705,7 +705,7 @@ impl ThemeName {
 pub struct Theme {
     /// Void-fill color shown wherever no window covers (RGB, no alpha).
     /// This is only the *preset's* default value — an explicit
-    /// `background = "#RRGGBB"` in config.lua still overrides it, same
+    /// `background = "#RRGGBB"` in config.toml still overrides it, same
     /// precedence `background` always had, theme or not.
     pub background: [u8; 3],
     pub panel_bg: [u8; 4],
@@ -900,7 +900,7 @@ impl BarPosition {
     }
 }
 
-/// `bar = { ... }` in config.lua. Only what's configurable about the bar —
+/// the `[bar]` table of config.toml. Only what's configurable about the bar —
 /// tile rendering (workspace widget, clock, app shortcuts) is a fixed
 /// three-column layout in veil-host, not something exposed here. Notably
 /// NOT configured here: which apps show up as shortcuts — those are
@@ -965,7 +965,7 @@ impl Default for BarConfig {
     }
 }
 
-/// `notify = { ... }` — the supervised notification daemon (`veil shell notify`).
+/// The `[notify]` table — the supervised notification daemon (`veil shell notify`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct NotifyConfig {
     /// Start the supervised `veil shell notify` with the session. Turn it off
@@ -988,7 +988,7 @@ impl Default for NotifyConfig {
     }
 }
 
-/// `osd = { ... }` — the supervised on-screen display (`veil shell osd`).
+/// The `[osd]` table — the supervised on-screen display (`veil shell osd`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct OsdConfig {
     /// Start the supervised `veil shell osd` with the session. Off, or while
@@ -1002,12 +1002,15 @@ impl Default for OsdConfig {
     }
 }
 
-/// `blur = { ... }` — background blur behind surfaces that ask for it
+/// The `[blur]` table — background blur behind surfaces that ask for it
 /// (`ext-background-effect`).
 ///
-/// ```lua
-/// blur = { enabled = true, radius = 8, windows = true,
-///          namespaces = { ["veil-bar"] = false } }
+/// ```toml
+/// [blur]
+/// enabled = true
+/// radius = 8
+/// windows = true
+/// namespaces = { "veil-bar" = false }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlurConfig {
@@ -1035,7 +1038,7 @@ impl BlurConfig {
     }
 }
 
-/// Action to take when laptop lid is closed (`lid_action` in Lua).
+/// Action to take when laptop lid is closed (`lid_action` in config.toml).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LidAction {
     #[default]
@@ -1074,16 +1077,15 @@ impl LidAction {
     }
 }
 
-/// `idle = { ... }` — idle timers, screen blanking (DPMS), and power management.
+/// The `[idle]` table — idle timers, screen blanking (DPMS), and power management.
 ///
-/// ```lua
-/// idle = {
-///     enabled = true,
-///     lock_timeout = 300,        -- seconds to auto-lock (0 = disabled)
-///     dpms_timeout = 600,        -- seconds to blank display (0 = disabled)
-///     suspend_timeout = 1800,    -- seconds to auto-suspend (0 = disabled)
-///     lid_action = "lock+suspend", -- "nothing" | "lock" | "suspend" | "lock+suspend"
-/// }
+/// ```toml
+/// [idle]
+/// enabled = true
+/// lock_timeout = 300          # seconds to auto-lock (0 = disabled)
+/// dpms_timeout = 600          # seconds to blank display (0 = disabled)
+/// suspend_timeout = 1800      # seconds to auto-suspend (0 = disabled)
+/// lid_action = "lock+suspend" # "nothing" | "lock" | "suspend" | "lock+suspend"
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdleConfig {
@@ -1111,7 +1113,7 @@ impl Default for IdleConfig {
     }
 }
 
-/// How a wallpaper is fitted to the output (`fit` in Lua).
+/// How a wallpaper is fitted to the output (`fit` in config.toml).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WallpaperFit {
     /// Cover the output, cropping the overflow from the centre (default).
@@ -1132,14 +1134,18 @@ impl WallpaperFit {
     }
 }
 
-/// Static-image wallpaper (`wallpaper` in Lua). A path may be a file or a
+/// Static-image wallpaper (`wallpaper` in config.toml). A path may be a file or a
 /// directory (its images are used, non-recursive).
 ///
-/// ```lua
-/// wallpaper = "~/Pictures/a.png"
-/// wallpaper = { engine = "static", paths = { "~/a.png", "~/walls" },
-///               interval = 600,   -- seconds between images; 0 = pick once
-///               shuffle = true, fit = "fill" }
+/// ```toml
+/// wallpaper = "~/Pictures/a.png"        # or a table:
+///
+/// [wallpaper]
+/// engine = "static"
+/// paths = ["~/a.png", "~/walls"]
+/// interval = 600     # seconds between images; 0 = pick once
+/// shuffle = true
+/// fit = "fill"
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WallpaperConfig {
@@ -1188,7 +1194,7 @@ fn parse_wallpaper(root: &Table) -> Option<WallpaperConfig> {
     })
 }
 
-/// `font = { ... }`: the one place fonts are chosen. Every Veil surface (the
+/// The `[font]` table: the one place fonts are chosen. Every Veil surface (the
 /// bar, the launcher, the help overlay, ...) reads this, and editing it takes
 /// effect live. All fields are optional; unset ones fall back to a sensible
 /// installed font. A family can be a name ("Inter") or an absolute path.
@@ -1491,35 +1497,41 @@ fn strings(t: &Table, key: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Parse TOML test input into a root table.
+#[cfg(test)]
+fn test_root(src: &str) -> Table {
+    src.parse().expect("test config is valid TOML")
+}
+
 #[derive(Debug, Clone)]
 pub struct VeilConfig {
     pub quality: Quality,
     /// Compositor frame-rate cap. `0` = match the display's refresh rate.
     pub fps: u32,
     /// Offer the host compositor's clipboard to clients inside Veil, and push
-    /// their copies back out (`clipboard_sync` in Lua). Turn off for privacy.
+    /// their copies back out (`clipboard_sync` in config.toml). Turn off for privacy.
     pub clipboard_sync: bool,
-    /// DRM display-mode refresh selection (`refresh` in Lua).
+    /// DRM display-mode refresh selection (`refresh` in config.toml).
     pub refresh: RefreshPref,
     pub cage_timeout_secs: u32,
     pub input: bool,
     /// Whether to use GPU compute shaders for frame encoding (halfblock/luma).
-    /// Defaults to true. Set `gpu_render = false` in config.lua to disable.
+    /// Defaults to true. Set `gpu_render = false` in config.toml to disable.
     pub gpu_render: bool,
     /// Which GPU to prefer when `gpu_render` is on: "high" (default) or "low".
     pub gpu_power: GpuPower,
     /// Layout every workspace starts in (`default_layout = "dwindle" |
-    /// "scroller"` in Lua). Default `Dwindle`.
+    /// "scroller"` in config.toml). Default `Dwindle`.
     pub default_layout: DefaultLayout,
     pub keybinds: Keybinds,
     pub output: OutputPref,
     /// Bare background color (RGB), shown wherever no window covers —
     /// otherwise it's plain black, an actual void with zero windows open
     /// (which now happens on purpose, since Alt+D lets you get there).
-    /// `background = "#RRGGBB"` in Lua. Defaults to a cement grey.
+    /// `background = "#RRGGBB"`in config.toml. Defaults to a cement grey.
     pub background: [u8; 3],
     /// Resolved color set for launcher/help/sidebar chrome. `theme = "..."`
-    /// in config.lua selects the preset; `background` above already carries
+    /// in config.toml selects the preset; `background` above already carries
     /// the resolved override precedence (preset default, unless overridden).
     pub theme: Theme,
     /// Which preset `theme` came from — kept alongside the resolved colors
@@ -1528,17 +1540,17 @@ pub struct VeilConfig {
     pub theme_name: ThemeName,
     /// `theme_mode` — only meaningful for `theme = "wallpaper"`.
     pub theme_mode: ThemeMode,
-    /// `font = { ... }` — see [`FontSettings`].
+    /// The `[font]` table — see [`FontSettings`].
     pub font: FontSettings,
-    /// `bar = { ... }` config — see `BarConfig`.
+    /// The `[bar]` table — see `BarConfig`.
     pub bar: BarConfig,
-    /// `notify = { ... }` config — see `NotifyConfig`.
+    /// The `[notify]` table — see `NotifyConfig`.
     pub notify: NotifyConfig,
-    /// `osd = { ... }` config — see `OsdConfig`.
+    /// The `[osd]` table — see `OsdConfig`.
     pub osd: OsdConfig,
-    /// `blur = { ... }` config — see `BlurConfig`.
+    /// The `[blur]` table — see `BlurConfig`.
     pub blur: BlurConfig,
-    /// `idle = { ... }` config — see `IdleConfig`.
+    /// The `[idle]` table — see `IdleConfig`.
     pub idle: IdleConfig,
     pub screenshot: ScreenshotConfig,
     /// Static wallpaper, if configured.
@@ -1632,7 +1644,7 @@ fn closest<'a>(name: &str, known: &[&'a str]) -> Option<&'a str> {
         .map(|(_, k)| k)
 }
 
-/// Keys that parse fine in Lua but that no code ever read, with what to do.
+/// Keys that parse fine but that no code ever read, with what to do.
 fn dead_key_hint(full: &str) -> Option<&'static str> {
     match full {
         "bar.apps" => Some("bar tiles come from the Launch binds in `apps`"),
@@ -1651,93 +1663,75 @@ fn unknown_key_message(path: &str, name: &str, known: &[&str]) -> String {
     }
 }
 
-/// Warn about named keys of `t` that are not in `known`. Positional entries
-/// (integer keys, like `wallpaper = { "a", "b" }`) are not names, so skipped.
-fn lint_table(path: &str, t: &mlua::Table, known: &[&str], out: &mut Vec<String>) {
-    let mut names: Vec<String> = t
-        .pairs::<mlua::Value, mlua::Value>()
-        .flatten()
-        .filter_map(|(k, _)| match k {
-            mlua::Value::String(s) => Some(s.to_string_lossy().to_string()),
-            _ => None,
-        })
-        .filter(|n| !known.contains(&n.as_str()))
-        .collect();
+/// Warn about keys of `t` that are not in `known`.
+fn lint_table(path: &str, t: &Table, known: &[&str], out: &mut Vec<String>) {
+    let mut names: Vec<&String> = t.keys().filter(|n| !known.contains(&n.as_str())).collect();
     names.sort();
     out.extend(names.iter().map(|n| unknown_key_message(path, n, known)));
 }
 
-/// Every warning for a loaded config. `builtin` is the set of globals that
-/// existed before the user's script ran (the Lua stdlib), so only keys the
-/// script itself defined are checked. Helper functions are left alone.
-fn lint_config(gl: &mlua::Table, builtin: &std::collections::HashSet<String>) -> Vec<String> {
+/// Every warning for a parsed config file.
+fn lint_config(root: &Table) -> Vec<String> {
     let mut out = Vec::new();
-    let kb = gl.get::<mlua::Table>("keybinds").ok();
+    let kb = tbl(root, "keybinds");
     let mut top_known: Vec<&str> = TOP_KEYS.to_vec();
     if kb.is_none() {
         top_known.extend(keybind_keys());
     }
 
-    let mut user: Vec<String> = gl
-        .pairs::<String, mlua::Value>()
-        .flatten()
-        .filter(|(k, v)| !builtin.contains(k) && !matches!(v, mlua::Value::Function(_)))
-        .map(|(k, _)| k)
+    let mut user: Vec<&String> = root
+        .keys()
         .filter(|k| !top_known.contains(&k.as_str()))
         .collect();
     user.sort();
     out.extend(user.iter().map(|k| unknown_key_message("", k, &top_known)));
 
-    if let Some(kb) = &kb {
+    if let Some(kb) = kb {
         lint_table("keybinds", kb, &keybind_keys(), &mut out);
     }
-    if let Ok(t) = gl.get::<mlua::Table>("font") {
-        lint_table("font", &t, FONT_KEYS, &mut out);
+    for (name, known) in [
+        ("font", FONT_KEYS),
+        ("wallpaper", WALLPAPER_KEYS),
+        ("notify", NOTIFY_KEYS),
+        ("osd", OSD_KEYS),
+        ("blur", BLUR_KEYS),
+        ("idle", IDLE_KEYS),
+    ] {
+        if let Some(t) = tbl(root, name) {
+            lint_table(name, t, known, &mut out);
+        }
     }
-    if let Ok(t) = gl.get::<mlua::Table>("wallpaper") {
-        lint_table("wallpaper", &t, WALLPAPER_KEYS, &mut out);
-    }
-    if let Ok(t) = gl.get::<mlua::Table>("notify") {
-        lint_table("notify", &t, NOTIFY_KEYS, &mut out);
-    }
-    if let Ok(t) = gl.get::<mlua::Table>("osd") {
-        lint_table("osd", &t, OSD_KEYS, &mut out);
-    }
-    if let Ok(t) = gl.get::<mlua::Table>("blur") {
-        lint_table("blur", &t, BLUR_KEYS, &mut out);
-    }
-    if let Ok(t) = gl.get::<mlua::Table>("idle") {
-        lint_table("idle", &t, IDLE_KEYS, &mut out);
-    }
-    if let Ok(t) = gl.get::<mlua::Table>("screenshot") {
-        lint_table("screenshot", &t, SCREENSHOT_KEYS, &mut out);
+    if let Some(t) = tbl(root, "screenshot") {
+        lint_table("screenshot", t, SCREENSHOT_KEYS, &mut out);
         for kind in ScreenshotKind::ALL {
-            if let Ok(m) = t.get::<mlua::Table>(kind.as_str()) {
-                lint_table(&format!("screenshot.{}", kind.as_str()), &m, SCREENSHOT_MODE_KEYS, &mut out);
+            if let Some(m) = tbl(t, kind.as_str()) {
+                lint_table(&format!("screenshot.{}", kind.as_str()), m, SCREENSHOT_MODE_KEYS, &mut out);
             }
         }
     }
-    if let Ok(bar) = gl.get::<mlua::Table>("bar") {
-        lint_table("bar", &bar, BAR_KEYS, &mut out);
-        if let Ok(w) = bar.get::<mlua::Table>("widgets") {
-            lint_table("bar.widgets", &w, WIDGET_KEYS, &mut out);
+    if let Some(bar) = tbl(root, "bar") {
+        lint_table("bar", bar, BAR_KEYS, &mut out);
+        if let Some(w) = tbl(bar, "widgets") {
+            lint_table("bar.widgets", w, WIDGET_KEYS, &mut out);
             for (name, keys) in [
                 ("clock", &["format"][..]),
                 ("disk", &["mount"][..]),
                 ("weather", &["lat", "lon", "units"][..]),
             ] {
-                if let Ok(t) = w.get::<mlua::Table>(name) {
-                    lint_table(&format!("bar.widgets.{name}"), &t, keys, &mut out);
+                if let Some(t) = tbl(w, name) {
+                    lint_table(&format!("bar.widgets.{name}"), t, keys, &mut out);
                 }
             }
-            if let Ok(c) = w.get::<mlua::Table>("custom") {
-                for (name, t) in c.pairs::<String, mlua::Table>().flatten() {
-                    lint_table(
-                        &format!("bar.widgets.custom.{name}"),
-                        &t,
-                        &["command", "interval"],
-                        &mut out,
-                    );
+            if let Some(c) = tbl(w, "custom") {
+                for (name, v) in c {
+                    if let Some(t) = v.as_table() {
+                        lint_table(
+                            &format!("bar.widgets.custom.{name}"),
+                            t,
+                            &["command", "interval"],
+                            &mut out,
+                        );
+                    }
                 }
             }
         }
@@ -1784,12 +1778,17 @@ fn dirs_config() -> std::path::PathBuf {
         .join("veil")
 }
 
-/// Resolve the canonical config file path. Checks cwd `./config.lua` first,
-/// then `$XDG_CONFIG_HOME/veil/config.lua` (or `~/.config/veil/config.lua`).
+/// Resolve the canonical config file path. Precedence:
+/// 1. Current working directory `./config.toml`
+/// 2. User personal `$XDG_CONFIG_HOME/veil/config.toml` (or `~/.config/veil/config.toml`)
+/// 3. System-wide `/etc/veil/config.toml`
+/// 4. Distro/package fallback `/usr/share/veil-host/config.toml`
 pub fn config_path() -> Option<std::path::PathBuf> {
     [
-        std::path::PathBuf::from("config.lua"),
-        dirs_config().join("config.lua"),
+        std::path::PathBuf::from("config.toml"),
+        dirs_config().join("config.toml"),
+        std::path::PathBuf::from("/etc/veil/config.toml"),
+        std::path::PathBuf::from("/usr/share/veil-host/config.toml"),
     ]
     .into_iter()
     .find(|p| p.exists())
@@ -1810,83 +1809,72 @@ pub fn try_load(path: &Path) -> Result<VeilConfig, String> {
         Ok(s) => s,
         Err(e) => return Err(format!("Read error: {e}")),
     };
+    parse_config(&src)
+}
 
-    let lua = Lua::new();
-    let builtin = global_names(&lua.globals());
-    if let Err(e) = lua.load(&src).exec() {
-        return Err(format!("{e}"));
-    }
-    for w in lint_config(&lua.globals(), &builtin) {
+/// Parse config text. A syntax error is an `Err` (with line and column from
+/// the TOML parser); everything else is lenient, key by key.
+pub fn parse_config(src: &str) -> Result<VeilConfig, String> {
+    let root: Table = src.parse().map_err(|e| format!("{e}"))?;
+    for w in lint_config(&root) {
         eprintln!("{w}");
     }
 
     let d = VeilConfig::default();
-    let gl = lua.globals();
 
     // Theme resolves first: it supplies the *default* background, which an
     // explicit `background = "#RRGGBB"` key then overrides — same
     // precedence `background` always had, theme or not.
-    let theme_name = gl
-        .get::<String>("theme")
+    let theme_name = string(&root, "theme")
         .map(|s| ThemeName::from_str(&s))
         .unwrap_or(d.theme_name);
     let theme = Theme::for_name(theme_name);
 
-    let screenshot = parse_screenshot(&gl, &d.screenshot);
-    let mut keybinds = parse_keybinds(&gl);
-    // Opt-in: no `screenshot` table, no keys grabbed. With one, every kind
+    let screenshot = parse_screenshot(&root, &d.screenshot);
+    let mut keybinds = parse_keybinds(&root);
+    // Opt-in: no `[screenshot]` table, no keys grabbed. With one, every kind
     // gets its default chord unless the table unbinds or replaces it.
-    if gl.get::<mlua::Table>("screenshot").is_ok() {
+    if tbl(&root, "screenshot").is_some() {
         keybinds.chords = screenshot.chords();
     }
     Ok(VeilConfig {
-        quality: gl
-            .get::<String>("quality")
+        quality: string(&root, "quality")
             .map(|s| Quality::parse_str(&s))
             .unwrap_or(d.quality),
-        fps: gl.get::<u32>("fps").unwrap_or(d.fps),
-        clipboard_sync: get_bool(&gl, "clipboard_sync", d.clipboard_sync),
-        refresh: gl
-            .get::<String>("refresh")
+        fps: uint32(&root, "fps").unwrap_or(d.fps),
+        clipboard_sync: get_bool(&root, "clipboard_sync", d.clipboard_sync),
+        refresh: string(&root, "refresh")
             .map(|s| RefreshPref::parse_str(&s))
             .unwrap_or(d.refresh),
-        cage_timeout_secs: gl
-            .get::<u32>("cage_timeout_secs")
-            .unwrap_or(d.cage_timeout_secs),
-        input: get_bool(&gl, "input", d.input),
-        gpu_render: get_bool(&gl, "gpu_render", d.gpu_render),
-        gpu_power: gl
-            .get::<String>("gpu_power")
+        cage_timeout_secs: uint32(&root, "cage_timeout_secs").unwrap_or(d.cage_timeout_secs),
+        input: get_bool(&root, "input", d.input),
+        gpu_render: get_bool(&root, "gpu_render", d.gpu_render),
+        gpu_power: string(&root, "gpu_power")
             .map(|s| GpuPower::parse_str(&s))
             .unwrap_or(d.gpu_power),
-        default_layout: gl
-            .get::<String>("default_layout")
+        default_layout: string(&root, "default_layout")
             .map(|s| DefaultLayout::parse_str(&s))
             .unwrap_or(d.default_layout),
         keybinds,
-        output: gl
-            .get::<String>("output")
+        output: string(&root, "output")
             .map(|s| OutputPref::from_str(&s))
             .unwrap_or(d.output),
-        background: gl
-            .get::<String>("background")
-            .ok()
+        background: string(&root, "background")
             .and_then(|s| parse_hex_color(&s))
             .unwrap_or(theme.background),
         theme,
         theme_name,
-        theme_mode: gl
-            .get::<String>("theme_mode")
+        theme_mode: string(&root, "theme_mode")
             .map(|s| ThemeMode::from_str(&s))
             .unwrap_or(d.theme_mode),
-        bar: parse_bar(&gl, &d.bar),
-        notify: parse_notify(&gl, &d.notify),
-        osd: parse_osd(&gl, &d.osd),
-        blur: parse_blur(&gl, &d.blur),
-        idle: parse_idle(&gl, &d.idle),
+        bar: parse_bar(&root, &d.bar),
+        notify: parse_notify(&root, &d.notify),
+        osd: parse_osd(&root, &d.osd),
+        blur: parse_blur(&root, &d.blur),
+        idle: parse_idle(&root, &d.idle),
         screenshot,
-        font: parse_font(&gl, &d.font),
-        wallpaper: parse_wallpaper(&gl),
+        font: parse_font(&root, &d.font),
+        wallpaper: parse_wallpaper(&root),
     })
 }
 
@@ -1986,18 +1974,13 @@ mod tests {
 
     #[test]
     fn parse_custom_reload_keybind() {
-        let lua = Lua::new();
-        lua.load(
+        let kb = parse_keybinds(&test_root(
             r#"
-            keybinds = {
-                mod_key = "alt",
-                reload_config = "x",
-            }
+            [keybinds]
+            mod_key = "alt"
+            reload_config = "x"
         "#,
-        )
-        .exec()
-        .unwrap();
-        let kb = parse_keybinds(&lua.globals());
+        ));
         assert_eq!(kb.mod_key, ModKey::Alt);
         assert_eq!(kb.action_for('x'), Some(Action::ReloadConfig));
     }
@@ -2007,12 +1990,8 @@ mod tests {
 mod app_bind_tests {
     use super::*;
 
-    fn load_str(name: &str, lua: &str) -> VeilConfig {
-        let p = std::env::temp_dir().join(format!("veil-cfg-{name}-{}.lua", std::process::id()));
-        std::fs::write(&p, lua).unwrap();
-        let cfg = try_load(&p).unwrap();
-        let _ = std::fs::remove_file(&p);
-        cfg
+    fn load_str(_name: &str, src: &str) -> VeilConfig {
+        parse_config(src).unwrap()
     }
 
     fn launches(cfg: &VeilConfig) -> Vec<(char, String)> {
@@ -2082,12 +2061,11 @@ mod app_bind_tests {
     fn screenshot_table_overrides_per_kind() {
         let c = load_str(
             "ss-custom",
-            r#"screenshot = {
-                dir = "/tmp/shots",
-                notify = false,
-                area = { keys = "Ctrl+Print", copy = false },
-                window = { keys = false },
-            }"#,
+            r#"[screenshot]
+                dir = "/tmp/shots"
+                notify = false
+                area = { keys = "Ctrl+Print", copy = false }
+                window = { keys = false }"#,
         );
         let s = &c.screenshot;
         assert_eq!(s.dir.as_deref(), Some("/tmp/shots"));
@@ -2138,7 +2116,7 @@ mod app_bind_tests {
 
     #[test]
     fn missing_booleans_keep_their_true_defaults() {
-        // mlua reads a nil field as `false`; absent keys must keep defaults.
+        // An absent key must keep its (true) default, not read as false.
         let c = load_str("bools-absent", "fps = 0");
         assert!(c.input && c.gpu_render && c.clipboard_sync);
         let c = load_str("bools-off", "input = false\ngpu_render = false");
@@ -2161,7 +2139,7 @@ mod app_bind_tests {
     fn ordered_apps_keep_declared_order_and_enter_maps_to_cr() {
         let cfg = load_str(
             "ordered",
-            r#"apps = { { "enter", "kitty" }, { key = "b", exec = "helium-browser" }, { "e", "dolphin" } }"#,
+            r#"apps = [["enter", "kitty"], { key = "b", exec = "helium-browser" }, ["e", "dolphin"]]"#,
         );
         assert_eq!(
             launches(&cfg),
@@ -2185,6 +2163,24 @@ mod app_bind_tests {
             vec![('b', "firefox".into()), ('t', "foot".into())]
         );
     }
+
+    #[test]
+    fn apps_work_as_a_table_under_keybinds_too() {
+        let cfg = load_str("map-table", "[keybinds.apps]\nt = \"foot\"\n\"=\" = \"calc\"\n");
+        assert_eq!(launches(&cfg), vec![('=', "calc".into()), ('t', "foot".into())]);
+    }
+
+    #[test]
+    fn syntax_errors_are_reported_with_a_position() {
+        let err = parse_config("fps = 90\nbar = {\n").unwrap_err();
+        assert!(err.contains("line 2") || err.contains(":2"), "{err}");
+        // A wrong-typed value is not a syntax error: it keeps the default.
+        assert_eq!(parse_config("fps = \"fast\"").unwrap().fps, 0);
+        // One bad section does not take the rest down with it.
+        let cfg = parse_config("notify = 5\n[keybinds]\nclose = \"x\"\n").unwrap();
+        assert_eq!(cfg.keybinds.action_for('x'), Some(Action::Close));
+        assert_eq!(cfg.notify, NotifyConfig::default());
+    }
 }
 
 #[cfg(test)]
@@ -2192,9 +2188,7 @@ mod font_tests {
     use super::*;
 
     fn parse(src: &str) -> FontSettings {
-        let lua = mlua::Lua::new();
-        lua.load(src).exec().unwrap();
-        parse_font(&lua.globals(), &FontSettings::default())
+        parse_font(&test_root(src), &FontSettings::default())
     }
 
     #[test]
@@ -2206,7 +2200,7 @@ mod font_tests {
 
     #[test]
     fn table_form_reads_every_field() {
-        let f = parse(r#"font = { family = "Inter", mono = "JetBrains Mono", icons = "Symbols Nerd Font", fallback = { "Noto Sans CJK JP", "Noto Color Emoji" }, size = 15, weight = "bold" }"#);
+        let f = parse(r#"font = { family = "Inter", mono = "JetBrains Mono", icons = "Symbols Nerd Font", fallback = ["Noto Sans CJK JP", "Noto Color Emoji"], size = 15, weight = "bold" }"#);
         assert_eq!(f.family.as_deref(), Some("Inter"));
         assert_eq!(f.mono.as_deref(), Some("JetBrains Mono"));
         assert_eq!(f.icons.as_deref(), Some("Symbols Nerd Font"));
@@ -2235,9 +2229,7 @@ mod bar_tests {
     use super::*;
 
     fn parse(src: &str) -> BarConfig {
-        let lua = mlua::Lua::new();
-        lua.load(src).exec().unwrap();
-        parse_bar(&lua.globals(), &BarConfig::default())
+        parse_bar(&test_root(src), &BarConfig::default())
     }
 
     #[test]
@@ -2248,8 +2240,12 @@ mod bar_tests {
     #[test]
     fn sections_height_and_position() {
         let b = parse(
-            r#"bar = { position = "top", height = 40,
-                left = { "activities", "workspaces" }, center = {}, right = { "cpu", "clock" } }"#,
+            r#"[bar]
+               position = "top"
+               height = 40
+               left = ["activities", "workspaces"]
+               center = []
+               right = ["cpu", "clock"]"#,
         );
         assert_eq!(b.position, BarPosition::Top);
         assert_eq!(b.height, 40);
@@ -2261,18 +2257,20 @@ mod bar_tests {
     #[test]
     fn widget_options() {
         let b = parse(
-            r#"bar = { widgets = {
-                clock = { format = "%H:%M" },
-                disk = { mount = "/home" },
-                weather = { lat = 48.1, lon = 11.5, units = "imperial" },
-                custom = { zeta = { command = "echo z" }, alpha = { command = "uptime -p", interval = 30 } },
-            } }"#,
+            r#"[bar.widgets]
+               clock = { format = "%H:%M" }
+               disk = { mount = "/home" }
+               weather = { lat = 48.1, lon = 11.5, units = "imperial" }
+
+               [bar.widgets.custom]
+               zeta = { command = "echo z" }
+               alpha = { command = "uptime -p", interval = 30 }"#,
         );
         assert_eq!(b.clock_format, "%H:%M");
         assert_eq!(b.disk_mount, "/home");
         assert_eq!(b.weather, Some(BarWeather { lat: 48.1, lon: 11.5, units: "imperial".into() }));
         let names: Vec<_> = b.custom.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["alpha", "zeta"], "sorted by name, not Lua map order");
+        assert_eq!(names, ["alpha", "zeta"], "sorted by name, not file order");
         assert_eq!(b.custom[0].interval, 30);
         assert_eq!(b.custom[1].interval, 10, "default interval");
     }
@@ -2295,10 +2293,7 @@ mod lint_tests {
     use super::*;
 
     fn lint(src: &str) -> Vec<String> {
-        let lua = Lua::new();
-        let builtin = global_names(&lua.globals());
-        lua.load(src).exec().unwrap();
-        lint_config(&lua.globals(), &builtin)
+        lint_config(&test_root(src))
     }
 
     #[test]
@@ -2312,7 +2307,7 @@ mod lint_tests {
 
     #[test]
     fn the_old_bar_apps_list_gets_a_pointer_not_a_guess() {
-        let w = lint(r#"bar = { apps = { { name = "x", exec = "x" } } }"#);
+        let w = lint(r#"bar = { apps = [{ name = "x", exec = "x" }] }"#);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("not read") && w[0].contains("`apps`"), "{w:?}");
     }
@@ -2321,8 +2316,14 @@ mod lint_tests {
     fn nested_widget_and_font_keys_are_checked() {
         let w = lint(
             r#"font = { famly = "x" }
-               bar = { widgets = { weather = { lat = 1, lon = 2, unit = "metric" },
-                                   custom = { up = { cmd = "uptime" } } } }"#,
+
+               [bar.widgets.weather]
+               lat = 1
+               lon = 2
+               unit = "metric"
+
+               [bar.widgets.custom.up]
+               cmd = "uptime""#,
         );
         let joined = w.join("\n");
         assert!(joined.contains("font.famly") && joined.contains("`family`"), "{w:?}");
@@ -2332,20 +2333,31 @@ mod lint_tests {
 
     #[test]
     fn valid_shapes_stay_quiet() {
-        // top-level keybind keys (no `keybinds` table), positional wallpaper
-        // entries, helper functions and locals are all fine
-        assert!(lint(r#"mod_key = "alt"
-                         focus_left = "h"
-                         wallpaper = { "a.png", "b.png", shuffle = true }
-                         function helper() end"#).is_empty());
-        assert!(lint(r#"keybinds = { mod_key = "alt", fullscreen = "f", apps = { { "enter", "kitty" } } }
-                         font = "Inter""#).is_empty());
+        // top-level keybind keys (no `[keybinds]` table) are fine
+        assert!(lint(
+            r#"mod_key = "alt"
+               focus_left = "h"
+
+               [wallpaper]
+               paths = ["a.png", "b.png"]
+               shuffle = true"#
+        )
+        .is_empty());
+        assert!(lint(
+            r#"font = "Inter"
+
+               [keybinds]
+               mod_key = "alt"
+               fullscreen = "f"
+               apps = [["enter", "kitty"]]"#
+        )
+        .is_empty());
     }
 
     #[test]
     fn the_shipped_config_has_no_warnings() {
-        // keeps ./config.lua honest as the parser grows
-        assert_eq!(lint(include_str!("../../../config.lua")), Vec::<String>::new());
+        // keeps ./config.toml honest as the parser grows
+        assert_eq!(lint(include_str!("../../../config.toml")), Vec::<String>::new());
     }
 
     #[test]
@@ -2362,9 +2374,7 @@ mod notify_tests {
     use super::*;
 
     fn parse(src: &str) -> NotifyConfig {
-        let lua = mlua::Lua::new();
-        lua.load(src).exec().unwrap();
-        parse_notify(&lua.globals(), &NotifyConfig::default())
+        parse_notify(&test_root(src), &NotifyConfig::default())
     }
 
     #[test]
@@ -2414,9 +2424,7 @@ mod osd_tests {
     use super::*;
 
     fn parse(src: &str) -> OsdConfig {
-        let lua = mlua::Lua::new();
-        lua.load(src).exec().unwrap();
-        parse_osd(&lua.globals(), &OsdConfig::default())
+        parse_osd(&test_root(src), &OsdConfig::default())
     }
 
     #[test]
@@ -2438,9 +2446,7 @@ mod blur_tests {
     use super::*;
 
     fn parse(src: &str) -> BlurConfig {
-        let lua = mlua::Lua::new();
-        lua.load(src).exec().unwrap();
-        parse_blur(&lua.globals(), &BlurConfig::default())
+        parse_blur(&test_root(src), &BlurConfig::default())
     }
 
     #[test]
@@ -2460,7 +2466,7 @@ mod blur_tests {
 
     #[test]
     fn namespace_override_beats_the_default() {
-        let c = parse(r#"blur = { namespaces = { ["veil-bar"] = false, ["veil-osd"] = true, junk = 3 } }"#);
+        let c = parse(r#"blur = { namespaces = { "veil-bar" = false, "veil-osd" = true, junk = 3 } }"#);
         assert!(!c.layer_allowed("veil-bar"));
         assert!(c.layer_allowed("veil-osd"));
         assert!(c.layer_allowed("veil-notify"));
@@ -2473,9 +2479,7 @@ mod idle_tests {
     use super::*;
 
     fn parse(src: &str) -> IdleConfig {
-        let lua = mlua::Lua::new();
-        lua.load(src).exec().unwrap();
-        parse_idle(&lua.globals(), &IdleConfig::default())
+        parse_idle(&test_root(src), &IdleConfig::default())
     }
 
     #[test]

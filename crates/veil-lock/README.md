@@ -6,7 +6,7 @@ The Veil lock screen. An `ext-session-lock-v1` client run by the compositor as `
 
 - **The compositor locks, this client unlocks.** While the session is locked the compositor draws only the dimmed wallpaper and the lock surfaces, runs no keybinds, and sends the keyboard only to a lock surface (see `veil-host/src/session_lock.rs`).
 - **The lock outlives this client.** If `veil-lock` crashes or is killed the session stays locked and the compositor starts it again. Only an `unlock_and_destroy` from the client that holds the lock ends the lock.
-- **Triggers:** `veil ctl session.lock`, the power menu, the idle timeout, and the lid action (`idle = { ... }` in `config.lua`). With `lid_action = "lock+suspend"` the machine suspends only after the lock is in place.
+- **Triggers:** `veil ctl session.lock`, the power menu, the idle timeout, and the lid action (`[idle]` in `config.toml`). With `lid_action = "lock+suspend"` the machine suspends only after the lock is in place.
 
 ## Authentication
 

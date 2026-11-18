@@ -189,7 +189,7 @@ pub fn is_bare_tty() -> bool {
     false
 }
 
-/// Terminal-backend settings from config.lua, passed as one value so adding a
+/// Terminal-backend settings from config.toml, passed as one value so adding a
 /// setting doesn't grow `detect`'s signature.
 #[derive(Clone)]
 pub struct TerminalOpts {
@@ -208,7 +208,7 @@ pub struct TerminalOpts {
 /// silently falling back; `VEIL_OUTPUT=terminal` forces terminal the same
 /// way. Both are an explicit one-off override and win over everything else.
 ///
-/// `pref` is config.lua's `output` field. Unlike the env var, `pref ==
+/// `pref` is config.toml's `output` field. Unlike the env var, `pref ==
 /// OutputPref::Drm` does NOT override the nested-compositor check below —
 /// it only replaces the SSH-session check with an unconditional DRM/KMS
 /// attempt on what still looks like a bare TTY. It's a persistent "trust
@@ -263,12 +263,12 @@ pub fn detect(
     }
 
     if pref == veil_config::OutputPref::Terminal {
-        eprintln!("[veil-host] config.lua output=terminal → terminal output");
+        eprintln!("[veil-host] config.toml output=terminal → terminal output");
         return Ok(Box::new(TerminalOutput::new(opts.clone())?));
     }
 
     if pref == veil_config::OutputPref::Drm {
-        eprintln!("[veil-host] config.lua output=drm → forcing DRM/KMS (bare TTY assumed)");
+        eprintln!("[veil-host] config.toml output=drm → forcing DRM/KMS (bare TTY assumed)");
         return Ok(Box::new(DrmOutput::new(refresh)?));
     }
 

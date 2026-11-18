@@ -101,7 +101,7 @@ fn handle_ctl(args: &[String]) -> std::io::Result<()> {
         println!();
         println!("COMMANDS:");
         println!("  ping                    Send ping to compositor");
-        println!("  reload                  Reload config.lua");
+        println!("  reload                  Reload config.toml");
         println!("  restart <component>     Restart a supervised component");
         println!("  workspace <num>         Switch to workspace number");
         println!("  wallpaper <file>        Show this image as the wallpaper (until the next config reload)");

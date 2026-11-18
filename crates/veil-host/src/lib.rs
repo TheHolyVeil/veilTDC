@@ -80,7 +80,7 @@ pub struct HostConfig {
     pub blur: veil_config::BlurConfig,
     /// `idle = { ... }` — see `veil_config::IdleConfig`.
     pub idle: veil_config::IdleConfig,
-    /// Layout fresh workspaces start in (`default_layout` in Lua).
+    /// Layout fresh workspaces start in (`default_layout` in config.toml).
     pub default_layout: veil_config::DefaultLayout,
     pub shell: ShellOptions,
 }

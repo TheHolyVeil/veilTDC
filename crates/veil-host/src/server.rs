@@ -625,7 +625,7 @@ pub struct State {
     /// `fps` as configured (0 = follow the display); kept so the interval can
     /// be recomputed when the real refresh becomes known or config reloads.
     pub fps_cfg: u32,
-    /// `clipboard_sync` from config.lua (see N9).
+    /// `clipboard_sync` from config.toml (see N9).
     pub clipboard_sync: bool,
     pub wallpaper: crate::wallpaper::WallpaperEngine,
     /// On-Screen Display (OSD) popup notification overlay.
@@ -2947,7 +2947,7 @@ pub fn reload_config(state: &mut State) {
         let name = p
             .file_name()
             .and_then(|f| f.to_str())
-            .unwrap_or("config.lua");
+            .unwrap_or("config.toml");
         state.show_osd(
             "CONFIG RELOADED",
             format!("Applied {name}"),
@@ -2962,7 +2962,7 @@ pub fn reload_config(state: &mut State) {
             None,
             Duration::from_secs(2),
         );
-        eprintln!("[veil-host] reloaded default config (no config.lua found)");
+        eprintln!("[veil-host] reloaded default config (no config.toml found)");
     }
     mark_dirty_full(state);
 }
@@ -4716,8 +4716,8 @@ fn request_wallpaper(state: &mut State) {
     }
 }
 
-/// config.lua's `font = { ... }` as the text engine's own config type.
-/// The shell bar's settings as they go over IPC. Components never link Lua,
+/// config.toml's `[font]` table as the text engine's own config type.
+/// The shell bar's settings as they go over IPC. Components never parse the config file,
 /// so this typed form is all the bar ever sees of `bar = { ... }`.
 /// What `veil shell notify` needs from the `notify` section; `shell` is the
 /// host's own business and is not sent.
@@ -6685,7 +6685,7 @@ fn ipc_command(
         }
         c::WALLPAPER_SET => {
             // Runtime override: lasts until the next config reload, which puts
-            // back whatever config.lua says.
+            // back whatever config.toml says.
             let path = std::path::PathBuf::from(
                 str_arg("path").ok_or("wallpaper.set needs {\"path\": \"...\"}")?,
             );
@@ -7515,7 +7515,7 @@ pub fn run(
                 }
             }
 
-            // Auto-reload config if config.lua was created or modified on disk (checked every 1s).
+            // Auto-reload config if config.toml was created or modified on disk (checked every 1s).
             let now = Instant::now();
             if now.duration_since(data.state.last_config_check) >= Duration::from_secs(1) {
                 data.state.last_config_check = now;

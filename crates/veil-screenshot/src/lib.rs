@@ -14,7 +14,7 @@
 //!   `window.focused` IPC command.
 //!
 //! What each kind saves/copies, where files go and whether a notification is
-//! shown come from the `screenshot` table in config.lua; the flags above can
+//! shown come from the `[screenshot]` table in config.toml; the flags above can
 //! only turn things off for one run. Files land in `$VEIL_SCREENSHOT_DIR`,
 //! else `screenshot.dir`, else `~/Pictures/Screenshots`. The saved path is
 //! printed on stdout. The notification goes to whatever owns

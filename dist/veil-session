@@ -18,4 +18,8 @@ export XDG_SESSION_TYPE=wayland
 # back to drawing text on the console.
 export VEIL_OUTPUT=drm
 
-exec veil start
+if command -v veil-host >/dev/null 2>&1; then
+  exec veil-host start
+else
+  exec veil start
+fi

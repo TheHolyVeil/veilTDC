@@ -59,10 +59,10 @@ pub struct TerminalOutput {
 }
 
 impl TerminalOutput {
-    /// `opts.gpu`: from config.lua. `None` (`gpu_render = false`) skips GPU
+    /// `opts.gpu`: from config.toml. `None` (`gpu_render = false`) skips GPU
     /// init outright, same effect as if no Vulkan adapter existed, and the CPU
     /// path in veil-render is used instead. `Some(power)` is `gpu_power`.
-    /// `opts.quality`: the resolved config.lua `quality`.
+    /// `opts.quality`: the resolved config.toml `quality`.
     pub fn new(opts: TerminalOpts) -> io::Result<Self> {
         let (cols, rows) = super::terminal_cells();
         let stdout = std::io::stdout();
@@ -82,11 +82,11 @@ impl TerminalOutput {
         stdout_ref.write_all(b"\x1b[?1003h\x1b[?1006h")?;
         stdout_ref.flush()?;
 
-        // Render mode comes from config.lua's `quality` (already resolved).
+        // Render mode comes from config.toml's `quality` (already resolved).
         let mode = TerminalMode::from_quality(&opts.quality);
 
         // Try to init GPU encoder (only useful for halfblock/ascii modes) —
-        // gated on config.lua's gpu_render, and skipped for Kitty mode
+        // gated on config.toml's gpu_render, and skipped for Kitty mode
         // (which never used the GPU path to begin with).
         let gpu = match opts.gpu {
             Some(power) if !matches!(mode, TerminalMode::Kitty) => {
