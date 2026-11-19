@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 
 use tiny_skia::{Color, FillRule, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Transform};
 use veil_ui::modal::Key;
-use veil_ui::{fill_circle, fill_rounded_rect, stroke_rounded_rect, FontConfig, Keysym, Role, TextSystem, Theme};
+use veil_ui::{fill_circle, fill_rounded_rect, stroke_circle, stroke_rounded_rect, FontConfig, Keysym, Role, TextSystem, Theme};
 use zeroize::Zeroizing;
+
+use crate::battery::{Battery, Reading};
 
 /// How long a failure message stays up.
 const FAILURE_SHOWN: Duration = Duration::from_secs(3);
@@ -31,6 +33,86 @@ pub enum Action {
     Redraw,
     /// Check this password. Input stays frozen until `verified` or `failed`.
     Submit(Zeroizing<String>),
+    /// Run a power action. The session stays locked; the compositor does the rest.
+    Power(PowerAction),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerAction {
+    Suspend,
+    Reboot,
+    PowerOff,
+}
+
+impl PowerAction {
+    const ALL: [PowerAction; 3] = [PowerAction::Suspend, PowerAction::Reboot, PowerAction::PowerOff];
+
+    fn label(self) -> &'static str {
+        match self {
+            PowerAction::Suspend => "Suspend",
+            PowerAction::Reboot => "Reboot",
+            PowerAction::PowerOff => "Power off",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            PowerAction::Suspend => "suspend",
+            PowerAction::Reboot => "reboot",
+            PowerAction::PowerOff => "power off",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            PowerAction::Suspend => "\u{f04b2}", // nf-md-sleep
+            PowerAction::Reboot => "\u{f0709}",  // nf-md-restart
+            PowerAction::PowerOff => "\u{f0425}", // nf-md-power
+        }
+    }
+
+    /// Suspend is harmless on a locked screen; the others take the session
+    /// down, so Enter has to be pressed twice.
+    fn needs_confirm(self) -> bool {
+        self != PowerAction::Suspend
+    }
+
+    /// The compositor command (the same ones the power menu sends).
+    pub fn ipc_cmd(self) -> &'static str {
+        match self {
+            PowerAction::Suspend => "session.suspend",
+            PowerAction::Reboot => "session.reboot",
+            PowerAction::PowerOff => "session.poweroff",
+        }
+    }
+
+    /// The `systemctl` verb, for when there is no compositor to ask.
+    pub fn systemctl(self) -> &'static str {
+        match self {
+            PowerAction::Suspend => "suspend",
+            PowerAction::Reboot => "reboot",
+            PowerAction::PowerOff => "poweroff",
+        }
+    }
+}
+
+/// The open power menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Menu {
+    sel: usize,
+    /// Enter was pressed once on a destructive action; the next Enter does it.
+    armed: bool,
+}
+
+/// Enter on the selected action: Suspend goes at once, the rest arm first.
+fn press(m: &mut Menu) -> Option<PowerAction> {
+    let a = PowerAction::ALL[m.sel];
+    if a.needs_confirm() && !m.armed {
+        m.armed = true;
+        None
+    } else {
+        Some(a)
+    }
 }
 
 pub struct LockScreen {
@@ -42,6 +124,10 @@ pub struct LockScreen {
     message: Option<String>,
     /// Profile picture, square, premultiplied; `None` shows the initial.
     avatar: Option<Pixmap>,
+    battery: Battery,
+    /// The power menu, when open (Tab).
+    menu: Option<Menu>,
+    caps: bool,
 }
 
 impl LockScreen {
@@ -58,6 +144,9 @@ impl LockScreen {
             phase: Phase::Idle,
             message: None,
             avatar,
+            battery: Battery::new(Instant::now()),
+            menu: None,
+            caps: false,
         }
     }
 
@@ -80,12 +169,21 @@ impl LockScreen {
         if self.phase == Phase::Verifying {
             return Action::None;
         }
+        if self.menu.is_some() {
+            return self.menu_key(key);
+        }
         // Typing after a failure starts over.
         if matches!(self.phase, Phase::Failed { .. }) {
             self.phase = Phase::Idle;
             self.message = None;
         }
         match key.sym {
+            Keysym::Tab | Keysym::ISO_Left_Tab => {
+                if !key.repeat {
+                    self.menu = Some(Menu { sel: 0, armed: false });
+                }
+                Action::Redraw
+            }
             Keysym::Return | Keysym::KP_Enter => {
                 if self.password.is_empty() {
                     return Action::None;
@@ -126,6 +224,58 @@ impl LockScreen {
         self.password = Zeroizing::new(String::new());
     }
 
+    /// Keys while the power menu is open. Nothing here reaches the password.
+    fn menu_key(&mut self, key: &Key) -> Action {
+        let Some(mut m) = self.menu else { return Action::None };
+        let n = PowerAction::ALL.len();
+        let text = if key.ctrl || key.alt { None } else { key.text.as_deref() };
+        let mut go = None;
+        match key.sym {
+            // Back out of a pending confirm first, then close.
+            Keysym::Escape | Keysym::Tab | Keysym::ISO_Left_Tab => {
+                if key.repeat {
+                    return Action::None;
+                }
+                if m.armed {
+                    m.armed = false;
+                } else {
+                    self.menu = None;
+                    return Action::Redraw;
+                }
+            }
+            Keysym::Left | Keysym::KP_Left => (m.sel, m.armed) = ((m.sel + n - 1) % n, false),
+            Keysym::Right | Keysym::KP_Right => (m.sel, m.armed) = ((m.sel + 1) % n, false),
+            // A held Enter must never fire a reboot.
+            Keysym::Return | Keysym::KP_Enter if key.repeat => return Action::None,
+            Keysym::Return | Keysym::KP_Enter => go = press(&mut m),
+            _ => match text {
+                Some("h") => (m.sel, m.armed) = ((m.sel + n - 1) % n, false),
+                Some("l") => (m.sel, m.armed) = ((m.sel + 1) % n, false),
+                Some(d @ ("1" | "2" | "3")) => {
+                    let i = d.as_bytes()[0] as usize - b'1' as usize;
+                    if i != m.sel {
+                        (m.sel, m.armed) = (i, false);
+                    }
+                    go = press(&mut m);
+                }
+                // Any other key cancels a pending confirm.
+                _ if m.armed => m.armed = false,
+                _ => return Action::None,
+            },
+        }
+        if let Some(a) = go {
+            self.menu = None;
+            return Action::Power(a);
+        }
+        self.menu = Some(m);
+        Action::Redraw
+    }
+
+    /// Caps Lock changed. True when the screen did.
+    pub fn set_caps(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.caps, on) != on
+    }
+
     /// The password was wrong (or PAM refused): clear the field, say why.
     pub fn failed(&mut self, message: String, now: Instant) {
         self.clear();
@@ -135,14 +285,15 @@ impl LockScreen {
 
     /// The failure message times out. True when the screen changed.
     pub fn tick(&mut self, now: Instant) -> bool {
+        let mut changed = self.battery.poll(now);
         if let Phase::Failed { until } = self.phase {
             if now >= until {
                 self.phase = Phase::Idle;
                 self.message = None;
-                return true;
+                changed = true;
             }
         }
-        false
+        changed
     }
 
     /// Premultiplied RGBA8, exactly `w * h * 4` bytes.
@@ -214,6 +365,7 @@ impl LockScreen {
         let status = match (&self.phase, &self.message) {
             (Phase::Verifying, _) => Some(("Checking...".to_string(), t.text_dim)),
             (_, Some(m)) => Some((m.clone(), t.err)),
+            _ if self.caps => Some(("Caps Lock is on".to_string(), t.warn)),
             _ => None,
         };
         if let Some((msg, color)) = status {
@@ -223,8 +375,82 @@ impl LockScreen {
             self.text.draw(&mut pm, &msg, cx - mw / 2.0, fy + fh + 18.0 * s, Role::UI, ms, color);
         }
 
+        // Battery, top right.
+        if let Some(r) = self.battery.reading() {
+            draw_battery(&mut self.text, &mut pm, t, &r, w as f32, s);
+        }
+
+        // The power menu under the field, or the hint that opens it.
+        match self.menu {
+            Some(m) => draw_menu(&mut self.text, &mut pm, t, m, cx, fy + fh + 110.0 * s, s),
+            None => {
+                let hint = "Tab  Power options";
+                let hs = 16.0 * s;
+                let (hw, hh) = self.text.measure(hint, Role::UI, hs);
+                let y = h as f32 - 36.0 * s - hh;
+                self.text.draw(&mut pm, hint, cx - hw / 2.0, y, Role::UI, hs, with_alpha(t.text_dim, 0.8));
+            }
+        }
+
         pm.take()
     }
+}
+
+/// Battery pill in the top-right corner: icon, percentage, time left.
+fn draw_battery(text: &mut TextSystem, pm: &mut Pixmap, t: &Theme, r: &Reading, w: f32, s: f32) {
+    let color = if r.plugged_in() {
+        t.ok
+    } else if r.pct <= 15 {
+        t.err
+    } else if r.pct <= 30 {
+        t.warn
+    } else {
+        t.text
+    };
+    let icon = r.icon().to_string();
+    let label = r.label();
+    let (isz, lsz) = (22.0 * s, 18.0 * s);
+    let (iw, ih) = text.measure(&icon, Role::Icons, isz);
+    let (lw, lh) = text.measure(&label, Role::UI, lsz);
+    let (padx, gap, ph) = (16.0 * s, 10.0 * s, 40.0 * s);
+    let pw = padx * 2.0 + iw + gap + lw;
+    let (x, y) = (w - 28.0 * s - pw, 28.0 * s);
+    fill_rounded_rect(pm, x, y, pw, ph, ph / 2.0, with_alpha(t.surface, 0.6));
+    text.draw(pm, &icon, x + padx, y + (ph - ih) / 2.0, Role::Icons, isz, color);
+    text.draw(pm, &label, x + padx + iw + gap, y + (ph - lh) / 2.0, Role::UI, lsz, t.text);
+}
+
+/// Three round buttons centred on (`cx`, `cy`) and a caption under them: the
+/// selected action, or what the next Enter will do.
+fn draw_menu(text: &mut TextSystem, pm: &mut Pixmap, t: &Theme, m: Menu, cx: f32, cy: f32, s: f32) {
+    let r = 30.0 * s;
+    let pitch = 2.0 * r + 28.0 * s;
+    let x0 = cx - (PowerAction::ALL.len() as f32 - 1.0) * pitch / 2.0;
+    for (i, a) in PowerAction::ALL.iter().enumerate() {
+        let x = x0 + i as f32 * pitch;
+        let on = i == m.sel;
+        let hot = if *a == PowerAction::PowerOff { t.err } else { t.accent };
+        fill_circle(pm, x, cy, r, if on { hot } else { with_alpha(t.surface, 0.85) });
+        stroke_circle(pm, x, cy, r, if on { hot } else { t.border }, 2.0 * s);
+        let isz = 26.0 * s;
+        let (iw, ih) = text.measure(a.icon(), Role::Icons, isz);
+        let ink = if on { t.accent_text } else { t.text };
+        text.draw(pm, a.icon(), x - iw / 2.0, cy - ih / 2.0, Role::Icons, isz, ink);
+    }
+    let a = PowerAction::ALL[m.sel];
+    let (cap, color) = if m.armed {
+        (format!("Press Enter again to {}", a.verb()), if a == PowerAction::PowerOff { t.err } else { t.warn })
+    } else {
+        (a.label().to_string(), t.text)
+    };
+    let cs = 20.0 * s;
+    let (cw, ch) = text.measure(&cap, Role::UI, cs);
+    let cap_y = cy + r + 16.0 * s;
+    text.draw(pm, &cap, cx - cw / 2.0, cap_y, Role::UI, cs, color);
+    let keys = "\u{2190} \u{2192}  Enter  Esc";
+    let ks = 15.0 * s;
+    let (kw, _) = text.measure(keys, Role::UI, ks);
+    text.draw(pm, keys, cx - kw / 2.0, cap_y + ch + 8.0 * s, Role::UI, ks, with_alpha(t.text_dim, 0.8));
 }
 
 /// Paint `av` as a circle of radius `r` centred on (`cx`, `cy`).
@@ -365,5 +591,109 @@ mod tests {
         let px = s.render(640, 360);
         assert_eq!(px.len(), 640 * 360 * 4);
         assert!(px.iter().any(|&b| b != 0), "the clock and field are drawn");
+    }
+
+    fn tab() -> Key {
+        key(Keysym::Tab, None)
+    }
+
+    fn enter() -> Key {
+        key(Keysym::Return, None)
+    }
+
+    #[test]
+    fn tab_opens_the_power_menu_and_nothing_in_it_types_into_the_password() {
+        let mut s = screen();
+        type_str(&mut s, "abc");
+        s.key(&tab());
+        assert!(s.menu.is_some());
+        type_str(&mut s, "xyz");
+        s.key(&key(Keysym::BackSpace, None));
+        assert_eq!(s.password.as_str(), "abc");
+        // Esc closes the menu and leaves the field alone.
+        assert_eq!(s.key(&key(Keysym::Escape, None)), Action::Redraw);
+        assert!(s.menu.is_none());
+        assert_eq!(s.password.as_str(), "abc");
+    }
+
+    #[test]
+    fn suspend_runs_at_once() {
+        let mut s = screen();
+        s.key(&tab());
+        assert_eq!(s.key(&enter()), Action::Power(PowerAction::Suspend));
+        assert!(s.menu.is_none());
+    }
+
+    #[test]
+    fn reboot_and_power_off_need_enter_twice() {
+        for (n, want) in [("2", PowerAction::Reboot), ("3", PowerAction::PowerOff)] {
+            let mut s = screen();
+            s.key(&tab());
+            assert_eq!(s.key(&key(Keysym::from_char(n.chars().next().unwrap()), Some(n))), Action::Redraw);
+            assert!(s.menu.unwrap().armed, "first press only arms");
+            assert_eq!(s.key(&enter()), Action::Power(want));
+            assert!(s.menu.is_none());
+        }
+    }
+
+    #[test]
+    fn any_other_key_or_moving_cancels_a_pending_confirm() {
+        let mut s = screen();
+        s.key(&tab());
+        s.key(&key(Keysym::Right, None));
+        s.key(&enter());
+        assert!(s.menu.unwrap().armed);
+        s.key(&key(Keysym::q, Some("q")));
+        assert!(!s.menu.unwrap().armed);
+        s.key(&enter());
+        s.key(&key(Keysym::Right, None));
+        assert!(!s.menu.unwrap().armed);
+        // Esc backs out of a confirm first, and only then closes.
+        s.key(&enter());
+        s.key(&key(Keysym::Escape, None));
+        assert!(s.menu.is_some() && !s.menu.unwrap().armed);
+        s.key(&key(Keysym::Escape, None));
+        assert!(s.menu.is_none());
+    }
+
+    #[test]
+    fn a_held_enter_never_fires_a_destructive_action() {
+        let mut s = screen();
+        s.key(&tab());
+        s.key(&key(Keysym::Right, None));
+        s.key(&enter());
+        let mut held = enter();
+        held.repeat = true;
+        assert_eq!(s.key(&held), Action::None);
+        assert!(s.menu.unwrap().armed);
+    }
+
+    #[test]
+    fn selection_wraps_in_both_directions() {
+        let mut s = screen();
+        s.key(&tab());
+        s.key(&key(Keysym::Left, None));
+        assert_eq!(s.menu.unwrap().sel, 2);
+        s.key(&key(Keysym::Right, None));
+        assert_eq!(s.menu.unwrap().sel, 0);
+    }
+
+    #[test]
+    fn caps_lock_is_reported_once_per_change() {
+        let mut s = screen();
+        assert!(s.set_caps(true));
+        assert!(!s.set_caps(true));
+        assert!(s.set_caps(false));
+    }
+
+    #[test]
+    fn rendering_with_the_menu_open_and_armed_draws_inside_the_buffer() {
+        let mut s = screen();
+        s.set_caps(true);
+        s.key(&tab());
+        s.key(&key(Keysym::Right, None));
+        s.key(&enter());
+        let px = s.render(640, 360);
+        assert_eq!(px.len(), 640 * 360 * 4);
     }
 }

@@ -26,6 +26,12 @@ The picture is the one AccountsService has for your account (`IconFile`, the sto
 
 `Enter` unlock, `Backspace` delete, `Esc` or `Ctrl+U` clear the field. Pointer and touch are ignored while locked.
 
+`Tab` opens the power menu (Suspend, Reboot, Power off): `←` `→` / `h` `l` or `1`-`3` pick, `Enter` runs it, `Esc` or `Tab` closes. Reboot and Power off ask for a second `Enter`; any other key cancels. The menu never touches the password field. Actions go to the compositor (`session.suspend`, `session.reboot`, `session.poweroff`), or to `systemctl` if there is no compositor connection.
+
+## Status
+
+Top right: battery level, with time left (discharging) or time to full (charging), read from `/sys/class/power_supply/BAT*` and smoothed. Nothing is drawn without a battery. A "Caps Lock is on" line shows under the field when Caps Lock is active.
+
 ## If the lock screen cannot start
 
 The compositor shows a notice on a dimmed screen and retries (every 2 s, then every 30 s after a crash loop). Switch to a TTY (`Ctrl+Alt+F3`), log in and run:

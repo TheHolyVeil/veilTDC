@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod avatar;
+pub mod battery;
 pub mod screen;
 mod wayland;
 
@@ -24,7 +25,9 @@ pub fn run_lock() -> Result<(), Box<dyn std::error::Error>> {
     }
     let screen = LockScreen::new(&link.tokens, link.font.as_ref(), &user, None);
     let avatar_rx = avatar::spawn_load(&user);
-    let result = wayland::run(screen, user, avatar_rx);
+    // A second handle on the compositor connection, for the power menu.
+    let ipc = link.stream.as_ref().and_then(|s| s.try_clone().ok());
+    let result = wayland::run(screen, user, avatar_rx, ipc);
     drop(link);
     result
 }

@@ -5,6 +5,7 @@
 //! (`finished`), we exit; a client that exits without unlocking leaves the
 //! session locked, and the compositor respawns it.
 
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +33,7 @@ use wayland_client::{
 use zeroize::Zeroizing;
 
 use crate::auth::{self, Outcome};
-use crate::screen::{Action, LockScreen};
+use crate::screen::{Action, LockScreen, PowerAction};
 
 /// Used until the compositor sends its own `repeat_info`.
 const DEFAULT_REPEAT: RepeatInfo =
@@ -112,6 +113,7 @@ pub fn run(
     mut screen: LockScreen,
     user: String,
     avatar_rx: Receiver<Option<tiny_skia::Pixmap>>,
+    mut ipc: Option<UnixStream>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, mut queue) = registry_queue_init::<State>(&conn)?;
@@ -182,6 +184,10 @@ pub fn run(
             match screen.key(&key) {
                 Action::None => {}
                 Action::Redraw => dirty = true,
+                Action::Power(a) => {
+                    run_power(&mut ipc, a);
+                    dirty = true;
+                }
                 Action::Submit(pw) => {
                     dirty = true;
                     if state.locked {
@@ -242,11 +248,30 @@ pub fn run(
         if screen.tick(now) {
             dirty = true;
         }
+        if screen.set_caps(state.mods.caps_lock) {
+            dirty = true;
+        }
         // The clock ticks once a second.
         if dirty || !screen.is_animating() {
             state.paint(&mut screen);
             dirty = false;
         }
+    }
+}
+
+/// Ask the compositor, like the power menu does (it suspends only once the
+/// lock is in place). With no compositor connection, use `systemctl`.
+fn run_power(ipc: &mut Option<UnixStream>, action: PowerAction) {
+    tracing::info!("lock: power action {action:?}");
+    if let Some(stream) = ipc.as_mut() {
+        if veil_ui::link::send_cmd(stream, action.ipc_cmd(), ().into()) {
+            return;
+        }
+        tracing::warn!("lock: compositor connection is gone; using systemctl");
+        *ipc = None;
+    }
+    if let Err(e) = std::process::Command::new("systemctl").arg(action.systemctl()).spawn() {
+        tracing::error!("lock: systemctl {}: {e}", action.systemctl());
     }
 }
 
