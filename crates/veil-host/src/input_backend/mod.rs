@@ -23,6 +23,7 @@ mod touchscreen;
 mod sysrq;
 
 pub use crossterm_input::CrosstermInput;
+pub use dwt::set_config as set_dwt_config;
 pub use evdev_input::EvdevInput;
 
 /// Shared, mutable view geometry used to map pointer coordinates.

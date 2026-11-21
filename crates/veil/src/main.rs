@@ -55,6 +55,13 @@ fn main() -> std::io::Result<()> {
                     }
                     return Ok(());
                 }
+                "settings" => {
+                    if let Err(e) = veil_settings::run_settings() {
+                        eprintln!("[veil shell settings] Error: {e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
                 "osd" => {
                     if let Err(e) = veil_osd::run_osd() {
                         eprintln!("[veil shell osd] Error: {e}");
@@ -71,7 +78,7 @@ fn main() -> std::io::Result<()> {
                 }
                 other => {
                     eprintln!("Unknown shell component: {other}");
-                    eprintln!("Available components: bar, notify, power, osd, launch, lock, screenshot");
+                    eprintln!("Available components: bar, notify, power, osd, launch, settings, lock, screenshot");
                     std::process::exit(1);
                 }
             }

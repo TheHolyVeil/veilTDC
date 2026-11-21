@@ -1,6 +1,10 @@
 use toml::{Table, Value};
 use std::path::{Path, PathBuf};
 
+pub mod schema;
+pub mod wire;
+pub mod writer;
+
 /// Which GPU the frame encoder asks for (`gpu_power` in config.toml).
 /// `High` is the default: fastest adapter, never a surprise slowdown on
 /// weak hardware. `Low` prefers the integrated GPU, so a hybrid-graphics
@@ -320,6 +324,15 @@ pub enum RefreshPref {
 }
 
 impl RefreshPref {
+    /// The config.toml spelling: `preferred`, `max`, or a number of Hz.
+    pub fn as_text(&self) -> String {
+        match self {
+            Self::Preferred => "preferred".to_string(),
+            Self::Max => "max".to_string(),
+            Self::Hz(n) => n.to_string(),
+        }
+    }
+
     fn parse_str(s: &str) -> Self {
         let s = s.trim().to_ascii_lowercase();
         match s.as_str() {
@@ -1132,6 +1145,15 @@ impl WallpaperFit {
             _ => Self::Fill,
         }
     }
+
+    /// The config.toml spelling.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Fill => "fill",
+            Self::Fit => "fit",
+            Self::Stretch => "stretch",
+        }
+    }
 }
 
 /// Static-image wallpaper (`wallpaper` in config.toml). A path may be a file or a
@@ -1326,6 +1348,33 @@ fn parse_idle(root: &Table, default: &IdleConfig) -> IdleConfig {
     }
 }
 
+fn parse_keyboard(root: &Table, default: &KeyboardConfig) -> KeyboardConfig {
+    let Some(kt) = tbl(root, "keyboard") else {
+        return default.clone();
+    };
+    let text = |key: &str, d: &str| {
+        string(kt, key).map(|s| s.trim().to_string()).unwrap_or_else(|| d.to_string())
+    };
+    KeyboardConfig {
+        layout: text("layout", &default.layout),
+        variant: text("variant", &default.variant),
+        options: text("options", &default.options),
+        // Clamped so a typo can't make every key repeat instantly, or never.
+        repeat_delay_ms: uint32(kt, "repeat_delay").map_or(default.repeat_delay_ms, |n| n.clamp(100, 2000)),
+        repeat_rate: uint32(kt, "repeat_rate").map_or(default.repeat_rate, |n| n.min(100)),
+    }
+}
+
+fn parse_touchpad(root: &Table, default: &TouchpadConfig) -> TouchpadConfig {
+    let Some(tt) = tbl(root, "touchpad") else {
+        return default.clone();
+    };
+    TouchpadConfig {
+        dwt: get_bool(tt, "dwt", default.dwt),
+        dwt_timeout_ms: uint32(tt, "dwt_timeout").map_or(default.dwt_timeout_ms, |n| n.clamp(50, 5000)),
+    }
+}
+
 fn parse_screenshot_mode(parent: &Table, kind: ScreenshotKind, default: &ScreenshotMode) -> ScreenshotMode {
     let Some(t) = tbl(parent, kind.as_str()) else {
         return default.clone();
@@ -1503,6 +1552,52 @@ fn test_root(src: &str) -> Table {
     src.parse().expect("test config is valid TOML")
 }
 
+/// The `[keyboard]` table: XKB layout and key repeat. Empty strings leave the
+/// choice to xkbcommon (its `XKB_DEFAULT_*` environment variables, else the
+/// built-in US layout), which is what Veil did before this table existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyboardConfig {
+    /// XKB layout name(s), e.g. `"us"` or `"us,de"`. Empty = xkbcommon default.
+    pub layout: String,
+    /// XKB variant(s), e.g. `"dvorak"`. Empty = the layout's default.
+    pub variant: String,
+    /// XKB options, e.g. `"caps:escape,grp:alt_shift_toggle"`. Empty = none.
+    pub options: String,
+    /// Milliseconds a key is held before it starts repeating.
+    pub repeat_delay_ms: u32,
+    /// Repeats per second once repeating. `0` turns key repeat off.
+    pub repeat_rate: u32,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self {
+            layout: String::new(),
+            variant: String::new(),
+            options: String::new(),
+            repeat_delay_ms: 200,
+            repeat_rate: 16,
+        }
+    }
+}
+
+/// The `[touchpad]` table. Veil reads evdev directly rather than through
+/// libinput, so only what Veil itself implements is configurable here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TouchpadConfig {
+    /// Ignore the pad for a moment after typing, so a resting palm does not
+    /// move the pointer. The `VEIL_DWT` environment variable still overrides.
+    pub dwt: bool,
+    /// How long after the last typed key the pad stays disabled.
+    pub dwt_timeout_ms: u32,
+}
+
+impl Default for TouchpadConfig {
+    fn default() -> Self {
+        Self { dwt: true, dwt_timeout_ms: 500 }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VeilConfig {
     pub quality: Quality,
@@ -1552,6 +1647,10 @@ pub struct VeilConfig {
     pub blur: BlurConfig,
     /// The `[idle]` table — see `IdleConfig`.
     pub idle: IdleConfig,
+    /// The `[keyboard]` table — see `KeyboardConfig`.
+    pub keyboard: KeyboardConfig,
+    /// The `[touchpad]` table — see `TouchpadConfig`.
+    pub touchpad: TouchpadConfig,
     pub screenshot: ScreenshotConfig,
     /// Static wallpaper, if configured.
     pub wallpaper: Option<WallpaperConfig>,
@@ -1582,6 +1681,8 @@ impl Default for VeilConfig {
             osd: OsdConfig::default(),
             blur: BlurConfig::default(),
             idle: IdleConfig::default(),
+            keyboard: KeyboardConfig::default(),
+            touchpad: TouchpadConfig::default(),
             screenshot: ScreenshotConfig::default(),
             wallpaper: None,
         }
@@ -1597,6 +1698,7 @@ const TOP_KEYS: &[&str] = &[
     "quality", "fps", "clipboard_sync", "refresh", "cage_timeout_secs", "input",
     "gpu_render", "gpu_power", "default_layout", "screenshot", "output", "background", "theme", "theme_mode",
     "keybinds", "apps", "font", "bar", "notify", "osd", "wallpaper", "blur", "idle",
+    "keyboard", "touchpad",
 ];
 const FONT_KEYS: &[&str] = &["family", "mono", "icons", "fallback", "size", "weight"];
 const WALLPAPER_KEYS: &[&str] = &["engine", "paths", "path", "interval", "shuffle", "fit"];
@@ -1608,6 +1710,8 @@ const NOTIFY_KEYS: &[&str] = &["shell", "timeout", "max_visible", "dnd_critical"
 const OSD_KEYS: &[&str] = &["shell"];
 const BLUR_KEYS: &[&str] = &["enabled", "radius", "windows", "namespaces"];
 const IDLE_KEYS: &[&str] = &["enabled", "lock_timeout", "dpms_timeout", "suspend_timeout", "lid_action"];
+const KEYBOARD_KEYS: &[&str] = &["layout", "variant", "options", "repeat_delay", "repeat_rate"];
+const TOUCHPAD_KEYS: &[&str] = &["dwt", "dwt_timeout"];
 const SCREENSHOT_KEYS: &[&str] = &["shell", "dir", "notify", "full", "area", "window"];
 const SCREENSHOT_MODE_KEYS: &[&str] = &["keys", "save", "copy"];
 
@@ -1696,6 +1800,8 @@ fn lint_config(root: &Table) -> Vec<String> {
         ("osd", OSD_KEYS),
         ("blur", BLUR_KEYS),
         ("idle", IDLE_KEYS),
+        ("keyboard", KEYBOARD_KEYS),
+        ("touchpad", TOUCHPAD_KEYS),
     ] {
         if let Some(t) = tbl(root, name) {
             lint_table(name, t, known, &mut out);
@@ -1843,8 +1949,11 @@ pub fn parse_config(src: &str) -> Result<VeilConfig, String> {
             .unwrap_or(d.quality),
         fps: uint32(&root, "fps").unwrap_or(d.fps),
         clipboard_sync: get_bool(&root, "clipboard_sync", d.clipboard_sync),
+        // The documented forms are "max", "preferred" and a bare number
+        // (`refresh = 144`); a number is not a string, so ask for it too.
         refresh: string(&root, "refresh")
             .map(|s| RefreshPref::parse_str(&s))
+            .or_else(|| uint32(&root, "refresh").filter(|hz| *hz > 0).map(RefreshPref::Hz))
             .unwrap_or(d.refresh),
         cage_timeout_secs: uint32(&root, "cage_timeout_secs").unwrap_or(d.cage_timeout_secs),
         input: get_bool(&root, "input", d.input),
@@ -1872,6 +1981,8 @@ pub fn parse_config(src: &str) -> Result<VeilConfig, String> {
         osd: parse_osd(&root, &d.osd),
         blur: parse_blur(&root, &d.blur),
         idle: parse_idle(&root, &d.idle),
+        keyboard: parse_keyboard(&root, &d.keyboard),
+        touchpad: parse_touchpad(&root, &d.touchpad),
         screenshot,
         font: parse_font(&root, &d.font),
         wallpaper: parse_wallpaper(&root),
@@ -2506,5 +2617,88 @@ mod idle_tests {
         assert_eq!(parse(r#"idle = { lid_action = "lock" }"#).lid_action, LidAction::Lock);
         assert_eq!(parse(r#"idle = { lid_action = "lock_suspend" }"#).lid_action, LidAction::LockSuspend);
         assert_eq!(parse(r#"idle = { lid_action = "lock+suspend" }"#).lid_action, LidAction::LockSuspend);
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    fn cfg(src: &str) -> VeilConfig {
+        parse_config(src).expect("valid test config")
+    }
+
+    #[test]
+    fn defaults_match_what_the_host_hard_coded_before() {
+        let c = cfg("");
+        assert_eq!(c.keyboard, KeyboardConfig::default());
+        assert_eq!((c.keyboard.repeat_delay_ms, c.keyboard.repeat_rate), (200, 16));
+        assert!(c.keyboard.layout.is_empty() && c.keyboard.variant.is_empty() && c.keyboard.options.is_empty());
+        assert_eq!(c.touchpad, TouchpadConfig { dwt: true, dwt_timeout_ms: 500 });
+    }
+
+    #[test]
+    fn refresh_accepts_a_bare_number_as_documented() {
+        assert_eq!(cfg("refresh = 144\n").refresh, RefreshPref::Hz(144));
+        assert_eq!(cfg("refresh = \"144\"\n").refresh, RefreshPref::Hz(144));
+        assert_eq!(cfg("refresh = \"max\"\n").refresh, RefreshPref::Max);
+        assert_eq!(cfg("refresh = 0\n").refresh, RefreshPref::Preferred);
+        assert_eq!(cfg("").refresh, RefreshPref::Preferred);
+        assert_eq!(RefreshPref::Hz(165).as_text(), "165");
+    }
+
+    #[test]
+    fn keyboard_keys_parse_and_clamp() {
+        let c = cfg("[keyboard]\nlayout = \" us,de \"\nvariant = \"dvorak\"\noptions = \"caps:escape\"\nrepeat_delay = 5\nrepeat_rate = 9999\n");
+        assert_eq!(c.keyboard.layout, "us,de");
+        assert_eq!(c.keyboard.variant, "dvorak");
+        assert_eq!(c.keyboard.options, "caps:escape");
+        assert_eq!(c.keyboard.repeat_delay_ms, 100);
+        assert_eq!(c.keyboard.repeat_rate, 100);
+        assert_eq!(cfg("[keyboard]\nrepeat_rate = 0\n").keyboard.repeat_rate, 0);
+    }
+
+    #[test]
+    fn touchpad_keys_parse_and_wrong_types_fall_back() {
+        let c = cfg("[touchpad]\ndwt = false\ndwt_timeout = 800\n");
+        assert!(!c.touchpad.dwt);
+        assert_eq!(c.touchpad.dwt_timeout_ms, 800);
+        let c = cfg("[touchpad]\ndwt = \"yes\"\ndwt_timeout = 1\n");
+        assert!(c.touchpad.dwt, "a wrong-typed value keeps the default");
+        assert_eq!(c.touchpad.dwt_timeout_ms, 50);
+    }
+
+    #[test]
+    fn the_new_tables_are_linted() {
+        let root = test_root("[keyboard]\nlayuot = \"us\"\n[touchpad]\ndwtt = true\n");
+        let warnings = lint_config(&root);
+        assert!(warnings.iter().any(|w| w.contains("keyboard.layuot") && w.contains("layout")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("touchpad.dwtt") && w.contains("dwt")), "{warnings:?}");
+        assert!(lint_config(&test_root("[keyboard]\nlayout = \"us\"\n[touchpad]\ndwt = true\n")).is_empty());
+    }
+
+    #[test]
+    fn every_schema_key_is_known_to_the_linter() {
+        // The schema and the lint tables are separate lists; this keeps them honest.
+        for def in schema::SETTINGS {
+            let concrete = def.path.replace('*', "name");
+            let (table, key) = concrete.rsplit_once('.').unwrap_or(("", &concrete));
+            let known: &[&str] = match table {
+                "" => TOP_KEYS,
+                "font" => FONT_KEYS,
+                "wallpaper" => WALLPAPER_KEYS,
+                "bar" => BAR_KEYS,
+                "notify" => NOTIFY_KEYS,
+                "osd" => OSD_KEYS,
+                "blur" => BLUR_KEYS,
+                "idle" => IDLE_KEYS,
+                "keyboard" => KEYBOARD_KEYS,
+                "touchpad" => TOUCHPAD_KEYS,
+                // Per-widget and per-namespace tables are checked by their own lint branches.
+                t if t.starts_with("bar.widgets") || t.starts_with("blur.namespaces") => continue,
+                t => panic!("schema path `{}` is under a table the linter does not know: `{t}`", def.path),
+            };
+            assert!(known.contains(&key), "schema key `{}` would be flagged as unknown by the linter", def.path);
+        }
     }
 }

@@ -2,12 +2,14 @@
 
 pub mod draw;
 pub mod layer;
+pub mod lineedit;
 pub mod link;
 pub mod modal;
 pub mod theme;
 pub mod widget;
 
 pub use draw::*;
+pub use lineedit::LineEdit;
 pub use layer::{LayerOptions, LayerShellClient, OutputFilter, SurfacePosition, UiInputEvent};
 // Re-exported so a client picks its anchor, layer and keyboard mode without
 // depending on smithay-client-toolkit itself.

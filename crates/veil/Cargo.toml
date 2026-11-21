@@ -15,6 +15,7 @@ veil-notify = { path = "../veil-notify", optional = true }
 veil-power  = { path = "../veil-power", optional = true }
 veil-osd    = { path = "../veil-osd", optional = true }
 veil-launch = { path = "../veil-launch", optional = true }
+veil-settings = { path = "../veil-settings", optional = true }
 veil-screenshot = { path = "../veil-screenshot", optional = true }
 veil-lock   = { path = "../veil-lock", optional = true }
 veil-ipc    = { path = "../veil-ipc" }
@@ -24,7 +25,7 @@ mimalloc    = { workspace = true }
 
 [features]
 default = ["shell"]
-shell   = ["dep:veil-bar", "dep:veil-notify", "dep:veil-power", "dep:veil-osd", "dep:veil-launch", "dep:veil-lock", "dep:veil-screenshot"]
+shell   = ["dep:veil-bar", "dep:veil-notify", "dep:veil-power", "dep:veil-osd", "dep:veil-launch", "dep:veil-settings", "dep:veil-lock", "dep:veil-screenshot"]
 
 [dev-dependencies]
 veil-ui = { path = "../veil-ui" }

@@ -14,6 +14,7 @@ pub mod anim;
 pub mod background_effect;
 pub mod blur;
 pub mod cli;
+pub mod config_set;
 pub mod detile;
 pub mod font5x7;
 pub mod idle_notify;
@@ -82,6 +83,8 @@ pub struct HostConfig {
     pub idle: veil_config::IdleConfig,
     /// Layout fresh workspaces start in (`default_layout` in config.toml).
     pub default_layout: veil_config::DefaultLayout,
+    /// `[keyboard]` — XKB layout and key repeat.
+    pub keyboard: veil_config::KeyboardConfig,
     pub shell: ShellOptions,
 }
 
@@ -112,6 +115,7 @@ impl Default for HostConfig {
             blur: veil_config::BlurConfig::default(),
             idle: veil_config::IdleConfig::default(),
             default_layout: veil_config::DefaultLayout::default(),
+            keyboard: veil_config::KeyboardConfig::default(),
             shell: ShellOptions::default(),
         }
     }
@@ -161,6 +165,7 @@ impl Host {
                     config.blur,
                     config.idle,
                     config.default_layout,
+                    config.keyboard,
                     config.shell,
                 ) {
                     eprintln!("[veil-host] server exited: {e}");

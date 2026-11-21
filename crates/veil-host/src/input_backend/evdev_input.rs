@@ -201,11 +201,13 @@ impl InputBackend for EvdevInput {
         let mut was_active = true;
         // Maps the kernel's wall-clock event timestamps onto `Instant`s.
         let clock = (std::time::Instant::now(), std::time::SystemTime::now());
-        // Disable-while-typing for the touchpad (default on; `VEIL_DWT=off`
-        // turns it off, `VEIL_DWT=<ms>` sets the timeout).
-        let mut dwt = Dwt::from_env();
+        // Disable-while-typing for the touchpad: default on, set by
+        // `[touchpad]` in config.toml (re-read live via `refresh`), and
+        // overridden by `VEIL_DWT=off` / `VEIL_DWT=<ms>` when that is set.
+        let mut dwt = Dwt::configured();
 
         while running.load(Ordering::Relaxed) {
+            dwt.refresh();
             let active = crate::seat::session_active();
             if !active && was_active {
                 eprintln!(

@@ -247,6 +247,7 @@ pub fn run_cli() -> std::io::Result<()> {
     cfg.blur = vcfg.blur.clone();
     cfg.idle = vcfg.idle.clone();
     cfg.default_layout = vcfg.default_layout;
+    cfg.keyboard = vcfg.keyboard.clone();
     cfg.fps = vcfg.fps; // 0 = match the display (resolved in SetMonitors)
     cfg.clipboard_sync = vcfg.clipboard_sync;
 
@@ -326,6 +327,7 @@ pub fn run_cli() -> std::io::Result<()> {
     // ── input thread: auto-detected backend (crossterm terminal | evdev TTY).
     //    Terminal setup is handled by TerminalOutput when in terminal mode.
     {
+        input_backend::set_dwt_config(vcfg.touchpad.dwt, vcfg.touchpad.dwt_timeout_ms);
         let backend = input_backend::detect();
         let ctx = InputCtx {
             tx: host.input_sender(),

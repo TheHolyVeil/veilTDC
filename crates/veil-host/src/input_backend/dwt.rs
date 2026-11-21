@@ -17,10 +17,30 @@
 //! Pure and unit-tested: the caller passes the time.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long after the last typed key the pad stays disabled.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The `[touchpad]` setting from config.toml, in milliseconds; 0 = off. The
+/// compositor writes it at startup and on every config reload; the input
+/// thread reads it through [`Dwt::refresh`]. (The two run on different
+/// threads and the input thread has no handle on the compositor's state.)
+static CONFIG_TIMEOUT_MS: AtomicU32 = AtomicU32::new(DEFAULT_TIMEOUT.as_millis() as u32);
+
+/// Publish the `[touchpad]` config for the input thread.
+pub fn set_config(enabled: bool, timeout_ms: u32) {
+    CONFIG_TIMEOUT_MS.store(if enabled { timeout_ms.clamp(50, 5000) } else { 0 }, Ordering::Relaxed);
+}
+
+fn config_timeout() -> Option<Duration> {
+    match CONFIG_TIMEOUT_MS.load(Ordering::Relaxed) {
+        0 => None,
+        ms => Some(Duration::from_millis(u64::from(ms))),
+    }
+}
+
 /// A non-text key held this long is held for movement, not typed.
 const GAME_HOLD: Duration = Duration::from_millis(300);
 /// This many presses in a row, all game keys and all this recent, is a game.
@@ -77,6 +97,9 @@ fn is_typing_key(code: u16) -> bool {
 pub struct Dwt {
     /// `None` = disabled.
     timeout: Option<Duration>,
+    /// `Some` when `VEIL_DWT` is set: it wins over `[touchpad]` in config.toml
+    /// and the timeout is never refreshed from the config.
+    env: Option<Option<Duration>>,
     last_typed: Option<Instant>,
     /// Typing keys currently down, and since when.
     held: Vec<(u16, Instant)>,
@@ -92,6 +115,7 @@ impl Dwt {
     pub fn new(timeout: Option<Duration>) -> Self {
         Self {
             timeout,
+            env: None,
             last_typed: None,
             held: Vec::new(),
             recent: VecDeque::with_capacity(GAME_STREAK + 1),
@@ -100,15 +124,37 @@ impl Dwt {
         }
     }
 
-    /// Default on. `VEIL_DWT` overrides: `off` / `0` / `false` / `no`
-    /// disables it, a number is the timeout in milliseconds.
-    pub fn from_env() -> Self {
-        Self::new(parse_setting(std::env::var("VEIL_DWT").ok().as_deref()))
+    /// Default on. `[touchpad]` in config.toml sets it (`dwt`, `dwt_timeout`);
+    /// `VEIL_DWT` overrides that: `off` / `0` / `false` / `no` disables it, a
+    /// number is the timeout in milliseconds.
+    pub fn configured() -> Self {
+        let env = std::env::var("VEIL_DWT")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| parse_setting(Some(&v)));
+        let mut dwt = Self::new(env.unwrap_or_else(config_timeout));
+        dwt.env = env;
+        dwt
+    }
+
+    /// Pick up a changed `[touchpad]` config (a reload). Cheap; call it
+    /// every loop. Does nothing while `VEIL_DWT` is set.
+    pub fn refresh(&mut self) {
+        if self.env.is_some() {
+            return;
+        }
+        let want = config_timeout();
+        if want != self.timeout {
+            self.timeout = want;
+            if want.is_none() {
+                self.last_typed = None;
+            }
+        }
     }
 
     /// Forget everything (session went inactive).
     pub fn reset(&mut self) {
-        *self = Self::new(self.timeout);
+        *self = Self { env: self.env, ..Self::new(self.timeout) };
     }
 
     /// A key press or release on a keyboard. Mouse and touchpad buttons
@@ -376,5 +422,50 @@ mod tests {
         assert_eq!(parse_setting(Some("5")), Some(ms(50)), "clamped up");
         assert_eq!(parse_setting(Some("99999")), Some(ms(5000)), "clamped down");
         assert_eq!(parse_setting(Some("banana")), Some(DEFAULT_TIMEOUT));
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `CONFIG_TIMEOUT_MS` is process-wide; tests that touch it take turns.
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn refresh_follows_the_published_config() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_config(true, 500);
+        let mut dwt = Dwt::new(config_timeout());
+        assert_eq!(dwt.timeout, Some(Duration::from_millis(500)));
+
+        set_config(false, 500);
+        dwt.refresh();
+        assert_eq!(dwt.timeout, None, "dwt = false turns it off live");
+
+        set_config(true, 800);
+        dwt.refresh();
+        assert_eq!(dwt.timeout, Some(Duration::from_millis(800)));
+
+        set_config(true, 1); // clamped, never a 1 ms flicker
+        dwt.refresh();
+        assert_eq!(dwt.timeout, Some(Duration::from_millis(50)));
+
+        set_config(true, 500);
+    }
+
+    #[test]
+    fn the_env_override_is_never_refreshed_away() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_config(true, 500);
+        let mut dwt = Dwt::new(Some(Duration::from_millis(900)));
+        dwt.env = Some(Some(Duration::from_millis(900)));
+        set_config(false, 500);
+        dwt.refresh();
+        assert_eq!(dwt.timeout, Some(Duration::from_millis(900)));
+        dwt.reset();
+        assert_eq!(dwt.env, Some(Some(Duration::from_millis(900))), "reset keeps the override");
+        set_config(true, 500);
     }
 }

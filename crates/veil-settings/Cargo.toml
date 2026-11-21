@@ -1,0 +1,18 @@
+[package]
+name        = "veil-settings"
+version     = "0.1.0"
+edition     = "2021"
+description = "Supervised on-demand settings app for Veil"
+
+[dependencies]
+veil-ui                = { path = "../veil-ui" }
+veil-text              = { path = "../veil-text" }
+veil-palette           = { path = "../veil-palette" }
+veil-config            = { path = "../veil-config" }
+tiny-skia              = { workspace = true }
+tracing                = { workspace = true }
+tracing-subscriber     = { workspace = true }
+serde_json             = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

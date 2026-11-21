@@ -508,6 +508,9 @@ pub struct State {
     pub blur_cfg: veil_config::BlurConfig,
     /// `idle = { ... }` — see `veil_config::IdleConfig`.
     pub idle_cfg: veil_config::IdleConfig,
+    /// `[keyboard]` as last applied, so a reload only rebuilds the keymap
+    /// (which every client then re-receives) when it actually changed.
+    pub keyboard_cfg: veil_config::KeyboardConfig,
     /// `default_layout` — the layout a newly created monitor's workspaces
     /// start in. Existing monitors keep whatever layout each workspace is
     /// in now (a reload must not flip tiled windows under the user).
@@ -2881,6 +2884,51 @@ fn draw_osd_overlay(osd: &OsdNotification, ts: &mut veil_text::TextSystem, back:
 /// Reload configuration from disk (`config_path()`), updating keybinds,
 /// background color, composite rate, etc.
 pub fn reload_config(state: &mut State) {
+    reload_config_with(state, true);
+}
+
+/// The XKB names Smithay wants, from `[keyboard]`. Empty strings leave the
+/// choice to xkbcommon (its `XKB_DEFAULT_*` env vars, else US).
+fn xkb_config(cfg: &veil_config::KeyboardConfig) -> XkbConfig<'_> {
+    XkbConfig {
+        layout: &cfg.layout,
+        variant: &cfg.variant,
+        options: (!cfg.options.is_empty()).then(|| cfg.options.clone()),
+        ..Default::default()
+    }
+}
+
+/// Apply a changed `[keyboard]` to the live seat. The keymap is only rebuilt
+/// (and re-sent to every client) when layout, variant or options changed.
+fn apply_keyboard_config(state: &mut State, new: &veil_config::KeyboardConfig) {
+    if state.keyboard_cfg == *new {
+        return;
+    }
+    let old = std::mem::replace(&mut state.keyboard_cfg, new.clone());
+    if (&old.layout, &old.variant, &old.options) != (&new.layout, &new.variant, &new.options) {
+        let keyboard = state.keyboard.clone();
+        if let Err(e) = keyboard.set_xkb_config(state, xkb_config(new)) {
+            eprintln!("[veil-host] [keyboard] layout rejected ({e}); keeping the current keymap");
+            state.show_osd(
+                "KEYBOARD",
+                "Layout not found; kept the old one",
+                None,
+                Duration::from_secs(3),
+            );
+        }
+    }
+    if (old.repeat_delay_ms, old.repeat_rate) != (new.repeat_delay_ms, new.repeat_rate) {
+        // Note the order: Smithay's `change_repeat_info` takes rate first,
+        // `add_keyboard` takes delay first.
+        state
+            .keyboard
+            .change_repeat_info(new.repeat_rate as i32, new.repeat_delay_ms as i32);
+    }
+}
+
+/// `announce = false` skips the "CONFIG RELOADED" toast. The settings app's
+/// writes use it: a toast per slider move would be noise. Errors always show.
+pub fn reload_config_with(state: &mut State, announce: bool) {
     let path = veil_config::config_path();
     let new_cfg = match path.as_ref() {
         Some(p) => match veil_config::try_load(p) {
@@ -2935,6 +2983,8 @@ pub fn reload_config(state: &mut State) {
     state.blur_cfg = new_cfg.blur;
     state.idle_cfg = new_cfg.idle;
     state.default_layout = new_cfg.default_layout.into();
+    apply_keyboard_config(state, &new_cfg.keyboard);
+    crate::input_backend::set_dwt_config(new_cfg.touchpad.dwt, new_cfg.touchpad.dwt_timeout_ms);
     state.osd_cfg = new_cfg.osd;
     state.notify = new_cfg.notify;
     state.bar = new_cfg.bar;
@@ -2948,20 +2998,24 @@ pub fn reload_config(state: &mut State) {
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("config.toml");
-        state.show_osd(
-            "CONFIG RELOADED",
-            format!("Applied {name}"),
-            None,
-            Duration::from_secs(2),
-        );
+        if announce {
+            state.show_osd(
+                "CONFIG RELOADED",
+                format!("Applied {name}"),
+                None,
+                Duration::from_secs(2),
+            );
+        }
         eprintln!("[veil-host] reloaded config from {}", p.display());
     } else {
-        state.show_osd(
-            "CONFIG RELOADED",
-            "Using default config",
-            None,
-            Duration::from_secs(2),
-        );
+        if announce {
+            state.show_osd(
+                "CONFIG RELOADED",
+                "Using default config",
+                None,
+                Duration::from_secs(2),
+            );
+        }
         eprintln!("[veil-host] reloaded default config (no config.toml found)");
     }
     mark_dirty_full(state);
@@ -4906,6 +4960,10 @@ fn next_tick_delay(fast: Duration, idle_ticks: u32) -> Duration {
     }
 }
 
+/// A compositor tick longer than this is logged as `[veil-slow]`. Normal ticks
+/// are a few ms; at 100 ms a typed key visibly waits and the pointer stutters.
+const SLOW_TICK: Duration = Duration::from_millis(100);
+
 /// How often to composite: the `fps` config value, or the display's own
 /// refresh when `fps == 0`. Deliberately 10% under the nominal period: the
 /// tick timer fires at half that period and the check is `elapsed < interval`,
@@ -5733,6 +5791,18 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                             } else if st.supervisor.toggle_component("launch", Instant::now()).is_err() {
                                 st.launcher = Some(Launcher::new());
                                 mark_dirty_full(st);
+                            }
+                            return FilterResult::Intercept(());
+                        }
+                        if ch == ',' {
+                            // Settings. Started by the supervisor on purpose: a
+                            // component launched any other way is untrusted, so
+                            // its overlay layer and exclusive keyboard are
+                            // downgraded and it never gets the keys. There is
+                            // no built-in fallback; say so if it cannot start.
+                            if let Err(e) = st.supervisor.toggle_component("settings", Instant::now()) {
+                                eprintln!("[veil-host] could not start the settings app: {e}");
+                                st.show_osd("SETTINGS", "Could not start the settings app", None, Duration::from_secs(3));
                             }
                             return FilterResult::Intercept(());
                         }
@@ -6597,6 +6667,22 @@ fn ipc_command(
             reload_config(state);
             Ok(None)
         }
+        c::CONFIG_SET => {
+            // The settings app never writes config.toml itself: it asks here,
+            // we validate against the schema, edit the file in place (comments
+            // survive), then apply it right away and quietly. Reloading now
+            // also refreshes `config_mtime`, so the 1 s poll does not fire a
+            // second, announced reload for our own write.
+            let edits = crate::config_set::edits_from_args(args)?;
+            let report = veil_config::writer::apply(&edits).map_err(|e| e.to_string())?;
+            reload_config_with(state, false);
+            Ok(Some(serde_json::json!({
+                "path": report.path.display().to_string(),
+                // Set when Veil is reading some other file (a ./config.toml
+                // in the working directory wins), so the change won't show.
+                "shadowed_by": report.shadowed_by.map(|p| p.display().to_string()),
+            })))
+        }
         c::WORKSPACE_SWITCH => {
             let n = args
                 .get("n")
@@ -6650,6 +6736,11 @@ fn ipc_command(
                     }
                     Ok(None)
                 }
+                "settings" => state
+                    .supervisor
+                    .toggle_component("settings", Instant::now())
+                    .map(|_| None)
+                    .map_err(|e| format!("could not start the settings app: {e}")),
                 // notify owns the D-Bus name: stopping it makes every sender fail.
                 "osd" => Err("osd is a persistent service and cannot be toggled".into()),
                 "notify" => Err("notify is a persistent service and cannot be toggled; use notify.panel or notify.dnd".into()),
@@ -6953,6 +7044,7 @@ pub fn run(
     blur_cfg: veil_config::BlurConfig,
     idle_cfg: veil_config::IdleConfig,
     default_layout: veil_config::DefaultLayout,
+    keyboard_cfg: veil_config::KeyboardConfig,
     shell_opts: crate::ShellOptions,
 ) -> io::Result<()> {
     let composite_interval = composite_interval_for(fps, 60_000);
@@ -7029,9 +7121,19 @@ pub fn run(
     let _tablet = TabletManagerState::new::<State>(&dh);
     let mut seat_state = SeatState::<State>::new();
     let mut seat = seat_state.new_wl_seat(&dh, "veil-seat");
-    let keyboard = seat
-        .add_keyboard(XkbConfig::default(), 200, 16)
-        .map_err(|e| io::Error::other(format!("keyboard: {e}")))?;
+    let keyboard = match seat.add_keyboard(
+        xkb_config(&keyboard_cfg),
+        keyboard_cfg.repeat_delay_ms as i32,
+        keyboard_cfg.repeat_rate as i32,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            // A typo'd layout must not stop the compositor from starting.
+            eprintln!("[veil-host] [keyboard] config rejected ({e}); using the system default layout");
+            seat.add_keyboard(XkbConfig::default(), 200, 16)
+                .map_err(|e| io::Error::other(format!("keyboard: {e}")))?
+        }
+    };
     let pointer = seat.add_pointer();
 
     let output = Output::new(
@@ -7176,6 +7278,7 @@ pub fn run(
         osd_cfg,
         blur_cfg,
         idle_cfg,
+        keyboard_cfg,
         default_layout: default_layout.into(),
         dpms_active: dpms,
         idle_locked: false,
@@ -7378,12 +7481,14 @@ pub fn run(
         eprintln!("[veil-tick] VEIL_TICK_TRACE on — phase timing every 120th tick (~1s)");
     }
     let mut tick_n: u32 = 0;
+    let mut last_slow_log: Option<Instant> = None;
     let mut idle_ticks: u32 = 0; // N11
     let (mut acc_total, mut acc_total_max, mut acc_comp, mut acc_comp_max) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let (mut acc_comp_n, mut acc_serial) = (0u32, 0u64);
     handle
         .insert_source(tick, move |_, _, data| {
             let t_start = tick_trace.then(std::time::Instant::now);
+            let slow_start = std::time::Instant::now();
             let serial_before = data.state.frame_serial;
             let mut busy = false;
             // Prune toplevels that the client has destroyed. If any closed, retile
@@ -7548,8 +7653,10 @@ pub fn run(
                 busy = true;
             }
             let t_pre_composite = tick_trace.then(std::time::Instant::now);
+            let slow_pre = std::time::Instant::now();
             composite_and_send(&mut data.state);
             let t_post_composite = tick_trace.then(std::time::Instant::now);
+            let slow_post = std::time::Instant::now();
             // N11: anything on screen changing, or still waiting to be shown,
             // keeps the tick fast.
             busy |= data.state.frame_serial != serial_before
@@ -7561,6 +7668,23 @@ pub fn run(
             // Flush outgoing wayland messages.
             let _ = data.display.flush_clients();
             let t_end = tick_trace.then(std::time::Instant::now);
+
+            // Always on, no env var: a tick that takes this long is a stall
+            // the user feels (key presses wait for the next tick, and the
+            // pointer moves with it), so say where the time went. At most one
+            // line a second, so a long stall cannot flood the log.
+            let slow_end = std::time::Instant::now();
+            let slow_total = slow_end - slow_start;
+            if slow_total >= SLOW_TICK && last_slow_log.is_none_or(|t| slow_end - t >= Duration::from_secs(1)) {
+                last_slow_log = Some(slow_end);
+                eprintln!(
+                    "[veil-slow] tick took {:.0}ms: input+housekeeping {:.0}ms, composite {:.0}ms, flush {:.0}ms",
+                    slow_total.as_secs_f64() * 1000.0,
+                    (slow_pre - slow_start).as_secs_f64() * 1000.0,
+                    (slow_post - slow_pre).as_secs_f64() * 1000.0,
+                    (slow_end - slow_post).as_secs_f64() * 1000.0,
+                );
+            }
 
             if tick_trace {
                 tick_n = tick_n.wrapping_add(1);
